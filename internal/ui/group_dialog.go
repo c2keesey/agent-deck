@@ -117,6 +117,37 @@ func (g *GroupDialog) GetValue() string {
 	return strings.TrimSpace(g.nameInput.Value())
 }
 
+// Validate checks if the dialog values are valid and returns an error message if not
+func (g *GroupDialog) Validate() string {
+	if g.mode == GroupDialogMove {
+		return "" // Move mode doesn't need validation
+	}
+
+	name := strings.TrimSpace(g.nameInput.Value())
+
+	// Check for empty name
+	if name == "" {
+		if g.mode == GroupDialogRenameSession {
+			return "Session name cannot be empty"
+		}
+		return "Group name cannot be empty"
+	}
+
+	// Check name length
+	if len(name) > 50 {
+		return "Name too long (max 50 characters)"
+	}
+
+	// Check for "/" in group names (would break path hierarchy)
+	if g.mode == GroupDialogCreate || g.mode == GroupDialogRename {
+		if strings.Contains(name, "/") {
+			return "Group name cannot contain '/' character"
+		}
+	}
+
+	return "" // Valid
+}
+
 // GetGroupPath returns the group path being edited (or parent path for subgroup creation)
 func (g *GroupDialog) GetGroupPath() string {
 	return g.groupPath

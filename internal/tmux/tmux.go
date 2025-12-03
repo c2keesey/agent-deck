@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +24,17 @@ func debugLog(format string, args ...interface{}) {
 }
 
 const SessionPrefix = "agentdeck_"
+
+// IsTmuxAvailable checks if tmux is installed and accessible
+// Returns nil if tmux is available, otherwise returns an error with details
+func IsTmuxAvailable() error {
+	cmd := exec.Command("tmux", "-V")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux not found or not working: %w (output: %s)", err, string(output))
+	}
+	return nil
+}
 
 // Tool detection patterns (used by DetectTool for initial tool identification)
 var toolDetectionPatterns = map[string][]*regexp.Regexp{
@@ -47,30 +57,14 @@ var toolDetectionPatterns = map[string][]*regexp.Regexp{
 
 // StateTracker tracks content changes for notification-style status detection
 //
-// Time-based model to prevent flickering:
-//   GREEN (active)   = Content changed recently (within activityCooldown) AND stabilized
-//   YELLOW (waiting) = No changes for activityCooldown + NOT acknowledged
-//   GRAY (idle)      = No changes for activityCooldown + acknowledged
-//
-// Key insight: AI agents output in bursts with micro-pauses between them.
-// Using a time-based cooldown instead of consecutive-change counting prevents
-// flickering during these natural pauses in output.
-//
-// The lastChangeTime tracks when content last changed:
-// - Updated whenever hash changes
-// - GREEN shown while time.Since(lastChangeTime) < activityCooldown
-// - YELLOW/GRAY shown after cooldown expires
-//
-// The stabilized flag prevents green flash on new sessions:
-// - New sessions need to "settle" before showing activity
-// - Set to true after first stable poll (content unchanged for activityCooldown)
-// - Only show GREEN after stabilization
+// StateTracker implements a simple 3-state model:
+//   GREEN (active)   = Content changed within 2 seconds
+//   YELLOW (waiting) = Content stable, user hasn't seen it
+//   GRAY (idle)      = Content stable, user has seen it
 type StateTracker struct {
-	lastHash       string    // SHA256 of last captured content
+	lastHash       string    // SHA256 of normalized content
 	lastChangeTime time.Time // When content last changed
-	acknowledged   bool      // User has seen this "stopped" state
-	stabilized     bool      // Session has had at least one stable poll (prevents green flash on new sessions)
-	lastContent    string    // Debug: previous normalized content for diff
+	acknowledged   bool      // User has seen this state (yellow vs gray)
 }
 
 // activityCooldown is how long to show GREEN after content stops changing.
@@ -86,8 +80,8 @@ type Session struct {
 	WorkDir     string
 	Command     string
 	Created     time.Time
-	lastHash    string
-	lastContent string
+	lastHash    string // Used by HasUpdated/analyzeContent (separate from StateTracker)
+	lastContent string // Used by HasUpdated/analyzeContent (separate from StateTracker)
 	// Cached tool detection (avoids re-detecting every status check)
 	detectedTool     string
 	toolDetectedAt   time.Time
@@ -107,12 +101,9 @@ type Session struct {
 func (s *Session) ensureStateTrackerLocked() {
 	if s.stateTracker == nil {
 		s.stateTracker = &StateTracker{
-			lastHash: "",
-			// Set lastChangeTime in the past so cooldown is already expired
-			// This is consistent with GetStatus initialization
+			lastHash:       "",
 			lastChangeTime: time.Now().Add(-activityCooldown),
 			acknowledged:   false,
-			stabilized:     false, // Will be set true after first stable poll
 		}
 	}
 }
@@ -164,24 +155,18 @@ func ReconnectSessionWithStatus(tmuxName, displayName, workDir, command string, 
 			lastHash:       "",                                // Will be set on first GetStatus
 			lastChangeTime: time.Now().Add(-10 * time.Second), // Cooldown expired
 			acknowledged:   true,
-			stabilized:     true,
 		}
 		sess.lastStableStatus = "idle"
 
-	case "waiting":
-		// Session was waiting for attention - restore as YELLOW
+	case "waiting", "active":
+		// Session needs attention - restore as YELLOW
+		// Active sessions will show green when content changes
 		sess.stateTracker = &StateTracker{
 			lastHash:       "",                                // Will be set on first GetStatus
 			lastChangeTime: time.Now().Add(-10 * time.Second), // Cooldown expired
-			acknowledged:   false,                             // NOT acknowledged - still needs attention
-			stabilized:     true,
+			acknowledged:   false,
 		}
 		sess.lastStableStatus = "waiting"
-
-	case "active":
-		// Session was active - let it be recalculated from actual content
-		// Don't pre-initialize tracker, let GetStatus handle it
-		sess.lastStableStatus = "waiting" // Default to waiting until we see activity
 
 	default:
 		// Unknown status - default to waiting
@@ -232,6 +217,11 @@ func (s *Session) Start(command string) error {
 		return fmt.Errorf("failed to create tmux session: %w (output: %s)", err, string(output))
 	}
 
+	// Set default window/pane styles to prevent color issues in some terminals (Warp, etc.)
+	// This ensures no unexpected background colors are applied
+	exec.Command("tmux", "set-option", "-t", s.Name, "window-style", "default").Run()
+	exec.Command("tmux", "set-option", "-t", s.Name, "window-active-style", "default").Run()
+
 	// Enable mouse mode for proper scrolling (per-session, doesn't affect user's other sessions)
 	// This allows:
 	// - Mouse wheel scrolling through terminal history
@@ -262,11 +252,39 @@ func (s *Session) Exists() bool {
 	return cmd.Run() == nil
 }
 
-// EnableMouseMode enables mouse scrolling for this session
-// Safe to call multiple times - just sets the option again
+// EnableMouseMode enables mouse scrolling, clipboard integration, and optimal settings
+// Safe to call multiple times - just sets the options again
+//
+// Enables:
+// - mouse on: Mouse wheel scrolling, text selection, pane resizing
+// - set-clipboard on: OSC 52 clipboard integration (works with modern terminals)
+// - history-limit 50000: Large scrollback buffer for AI agent output
+//
+// Note: With mouse mode on, hold Shift while selecting to use native terminal selection
+// instead of tmux's selection (useful for copying to system clipboard in some terminals)
 func (s *Session) EnableMouseMode() error {
-	cmd := exec.Command("tmux", "set-option", "-t", s.Name, "mouse", "on")
-	return cmd.Run()
+	// Enable mouse support
+	mouseCmd := exec.Command("tmux", "set-option", "-t", s.Name, "mouse", "on")
+	if err := mouseCmd.Run(); err != nil {
+		return err
+	}
+
+	// Enable OSC 52 clipboard integration
+	// This allows tmux to copy directly to system clipboard in supported terminals
+	// (iTerm2, Alacritty, kitty, Windows Terminal, etc.)
+	clipboardCmd := exec.Command("tmux", "set-option", "-t", s.Name, "set-clipboard", "on")
+	if err := clipboardCmd.Run(); err != nil {
+		// Non-fatal: older tmux versions may not support this
+	}
+
+	// Set large history limit for AI agent sessions (default is 2000)
+	// AI agents produce a lot of output, so we need more scrollback
+	historyCmd := exec.Command("tmux", "set-option", "-t", s.Name, "history-limit", "50000")
+	if err := historyCmd.Run(); err != nil {
+		// Non-fatal: history limit is a nice-to-have
+	}
+
+	return nil
 }
 
 // Kill terminates the tmux session
@@ -484,6 +502,21 @@ func (s *Session) GetStatus() (string, error) {
 		return "inactive", nil
 	}
 
+	// === BUSY INDICATOR CHECK (before hash comparison) ===
+	// If Claude shows "esc to interrupt", spinners, or "Thinking..." - it's actively working
+	// This catches cases where normalized content hash doesn't change
+	// (e.g., "Thinking... (40s)" → "Thinking... (41s)" both normalize to same hash)
+	if s.hasBusyIndicator(content) {
+		s.stateTrackerMu.Lock()
+		defer s.stateTrackerMu.Unlock()
+		s.ensureStateTrackerLocked()
+		s.stateTracker.lastChangeTime = time.Now() // Reset cooldown
+		s.stateTracker.acknowledged = false
+		s.lastStableStatus = "active"
+		debugLog("%s: BUSY INDICATOR → active", shortName)
+		return "active", nil
+	}
+
 	// Clean content: strip ANSI codes, spinner characters, normalize whitespace
 	cleanContent := s.normalizeContent(content)
 	currentHash := s.hashContent(cleanContent)
@@ -498,126 +531,67 @@ func (s *Session) GetStatus() (string, error) {
 	defer s.stateTrackerMu.Unlock()
 
 	// Initialize state tracker on first call
+	// === SIMPLIFIED STATUS LOGIC ===
+	// 0. Busy indicator present → return "active" (GREEN) - handled above
+	// 1. New session (nil tracker) → init, return "idle" (GRAY) - no yellow flash
+	// 2. Restored session (empty hash) → set hash, return "idle" (GRAY) - no yellow flash
+	// 3. Content changed → return "active" (GREEN)
+	// 4. Content same, within cooldown → return "active" (GREEN)
+	// 5. Content same, cooldown expired → return based on acknowledged
+
+	// New session - first poll: start as IDLE (gray) to avoid yellow flash
+	// Busy indicator check above will catch actively running sessions
 	if s.stateTracker == nil {
 		s.stateTracker = &StateTracker{
 			lastHash:       currentHash,
-			// Set lastChangeTime in the past so cooldown is already expired.
-			// This prevents YELLOW → GREEN flickering on session initialization.
-			// Without this, the cooldown would trigger false "active" for 2 seconds.
-			lastChangeTime: time.Now().Add(-activityCooldown),
-			acknowledged:   false,
-			stabilized:     false, // New sessions must stabilize before showing green
+			lastChangeTime: time.Now().Add(-activityCooldown), // Pre-expired
+			acknowledged:   true,                              // Start idle (gray)
 		}
-		// First poll: return "waiting" (session needs attention until user sees it)
-		s.lastStableStatus = "waiting"
-		debugLog("%s: INIT tracker hash=%s, stabilized=false → waiting", shortName, currentHash[:16])
-		return "waiting", nil
-	}
-
-	// Restored session with empty hash - initialize without triggering "active"
-	if s.stateTracker.lastHash == "" {
-		s.stateTracker.lastHash = currentHash
-		if s.stateTracker.acknowledged {
-			s.lastStableStatus = "idle"
-			debugLog("%s: empty hash restored, ack=true → idle", shortName)
-			return "idle", nil
-		}
-		s.lastStableStatus = "waiting"
-		debugLog("%s: empty hash restored, ack=false → waiting", shortName)
-		return "waiting", nil
-	}
-
-	// Check if content changed
-	if s.stateTracker.lastHash != currentHash {
-		// Content CHANGED - update hash and time, return GREEN
-		prevHash := s.stateTracker.lastHash
-
-		// Debug: Show what changed between polls
-		if debugStatusEnabled {
-			debugLog("%s: CONTENT CHANGED %s → %s", shortName, prevHash[:16], currentHash[:16])
-
-			// Show last 5 lines of new content
-			newLines := strings.Split(cleanContent, "\n")
-			start := len(newLines) - 5
-			if start < 0 {
-				start = 0
-			}
-			newLast := strings.Join(newLines[start:], " | ")
-			if len(newLast) > 200 {
-				newLast = newLast[:200] + "..."
-			}
-			debugLog("%s: NEW CONTENT (last 5 lines): %s", shortName, newLast)
-
-			// Show last 5 lines of previous content for comparison
-			if s.stateTracker.lastContent != "" {
-				oldLines := strings.Split(s.stateTracker.lastContent, "\n")
-				start := len(oldLines) - 5
-				if start < 0 {
-					start = 0
-				}
-				oldLast := strings.Join(oldLines[start:], " | ")
-				if len(oldLast) > 200 {
-					oldLast = oldLast[:200] + "..."
-				}
-				debugLog("%s: OLD CONTENT (last 5 lines): %s", shortName, oldLast)
-			}
-		}
-
-		s.stateTracker.lastHash = currentHash
-		s.stateTracker.lastContent = cleanContent // Store for next diff
-		s.stateTracker.lastChangeTime = time.Now()
-		s.stateTracker.acknowledged = false // Reset for next notification
-
-		// Only show GREEN if the session has stabilized (had at least one stable poll)
-		// This prevents green flash when new sessions are initializing
-		if s.stateTracker.stabilized {
-			s.lastStableStatus = "active"
-			debugLog("%s: CONTENT CHANGED, stabilized=true → active", shortName)
-			return "active", nil
-		}
-
-		// Not yet stabilized - content is changing during initialization
-		// Keep showing waiting (yellow) until session settles
-		s.lastStableStatus = "waiting"
-		debugLog("%s: CONTENT CHANGED, stabilized=false → waiting (initialization)", shortName)
-		return "waiting", nil
-	}
-
-	// Content STABLE - check if we're still within the cooldown period
-	timeSinceChange := time.Since(s.stateTracker.lastChangeTime)
-
-	if timeSinceChange < activityCooldown {
-		// Still within cooldown
-		// Only show GREEN if already stabilized (previous output was active)
-		if s.stateTracker.stabilized {
-			s.lastStableStatus = "active"
-			debugLog("%s: COOLDOWN ACTIVE (%.1fs < %.1fs), stabilized=true → active",
-				shortName, timeSinceChange.Seconds(), activityCooldown.Seconds())
-			return "active", nil
-		}
-		// Not yet stabilized - still in initialization phase, show waiting
-		s.lastStableStatus = "waiting"
-		debugLog("%s: COOLDOWN ACTIVE but stabilized=false → waiting",
-			shortName)
-		return "waiting", nil
-	}
-
-	// Cooldown expired - content has been stable long enough
-	// Mark session as stabilized (ready to show green on next activity)
-	if !s.stateTracker.stabilized {
-		s.stateTracker.stabilized = true
-		debugLog("%s: STABILIZED (cooldown expired with stable content)", shortName)
-	}
-
-	// Return YELLOW or GRAY based on acknowledged state
-	if s.stateTracker.acknowledged {
 		s.lastStableStatus = "idle"
-		debugLog("%s: COOLDOWN EXPIRED, ack=true → idle", shortName)
+		debugLog("%s: INIT → idle (no flash)", shortName)
 		return "idle", nil
 	}
 
+	// Restored session - set baseline hash, respect saved acknowledged state
+	// Busy indicator check above already catches actively running sessions
+	if s.stateTracker.lastHash == "" {
+		s.stateTracker.lastHash = currentHash
+		// Don't change acknowledged - respect value from ReconnectSessionWithStatus
+		if s.stateTracker.acknowledged {
+			s.lastStableStatus = "idle"
+			debugLog("%s: RESTORED ack=true → idle", shortName)
+			return "idle", nil
+		}
+		s.lastStableStatus = "waiting"
+		debugLog("%s: RESTORED ack=false → waiting", shortName)
+		return "waiting", nil
+	}
+
+	// Content changed → GREEN
+	if s.stateTracker.lastHash != currentHash {
+		s.stateTracker.lastHash = currentHash
+		s.stateTracker.lastChangeTime = time.Now()
+		s.stateTracker.acknowledged = false
+		s.lastStableStatus = "active"
+		debugLog("%s: CHANGED → active", shortName)
+		return "active", nil
+	}
+
+	// Content same - check cooldown
+	if time.Since(s.stateTracker.lastChangeTime) < activityCooldown {
+		s.lastStableStatus = "active"
+		debugLog("%s: COOLDOWN → active", shortName)
+		return "active", nil
+	}
+
+	// Cooldown expired → YELLOW or GRAY
+	if s.stateTracker.acknowledged {
+		s.lastStableStatus = "idle"
+		debugLog("%s: IDLE → idle", shortName)
+		return "idle", nil
+	}
 	s.lastStableStatus = "waiting"
-	debugLog("%s: COOLDOWN EXPIRED, ack=false → waiting", shortName)
+	debugLog("%s: WAITING → waiting", shortName)
 	return "waiting", nil
 }
 
@@ -644,43 +618,6 @@ func (s *Session) ResetAcknowledged() {
 	s.lastStableStatus = "waiting"
 }
 
-// analyzeContent checks content for updates, prompts, and busy indicators
-// Returns: (contentUpdated, hasWaitingPrompt, hasBusyIndicator)
-func (s *Session) analyzeContent() (updated bool, hasPrompt bool, isBusy bool) {
-	content, err := s.CapturePane()
-	if err != nil {
-		return false, false, false
-	}
-
-	// Ensure we have a prompt detector for current tool
-	tool := s.DetectTool()
-	if s.promptDetector == nil || s.promptDetector.tool != tool {
-		s.promptDetector = NewPromptDetector(tool)
-	}
-
-	// Check for explicit BUSY indicators (tool is actively processing)
-	// This catches cases where Claude shows "esc to interrupt" but output hasn't changed
-	isBusy = s.hasBusyIndicator(content)
-
-	// Check for tool-specific waiting prompt
-	hasPrompt = s.promptDetector.HasPrompt(content)
-
-	// Check if content changed using hash comparison
-	hash := s.hashContent(content)
-	if s.lastHash == "" {
-		s.lastHash = hash
-		s.lastContent = content
-		return true, hasPrompt, isBusy
-	}
-
-	if hash != s.lastHash {
-		s.lastHash = hash
-		s.lastContent = content
-		return true, hasPrompt, isBusy
-	}
-
-	return false, hasPrompt, isBusy
-}
 
 // hasBusyIndicator checks if the terminal shows explicit busy indicators
 // This is a quick check used in GetStatus() to detect active processing
@@ -770,40 +707,6 @@ func (s *Session) hasBusyIndicator(content string) bool {
 	return false
 }
 
-// HasUpdatedWithPrompt checks if content changed AND if a prompt is present
-// This is Claude Squad's exact HasUpdated() signature that returns (updated, hasPrompt)
-func (s *Session) HasUpdatedWithPrompt() (updated bool, hasPrompt bool) {
-	content, err := s.CapturePane()
-	if err != nil {
-		return false, false
-	}
-
-	// Ensure we have a prompt detector for current tool
-	tool := s.DetectTool()
-	if s.promptDetector == nil || s.promptDetector.tool != tool {
-		s.promptDetector = NewPromptDetector(tool)
-	}
-
-	// Check for tool-specific prompt (Claude Squad's exact logic)
-	hasPrompt = s.promptDetector.HasPrompt(content)
-
-	// Check if content changed using hash comparison
-	hash := s.hashContent(content)
-	if s.lastHash == "" {
-		s.lastHash = hash
-		s.lastContent = content
-		return true, hasPrompt
-	}
-
-	if hash != s.lastHash {
-		s.lastHash = hash
-		s.lastContent = content
-		return true, hasPrompt
-	}
-
-	return false, hasPrompt
-}
-
 // Precompiled regex patterns for dynamic content stripping
 // These are compiled once at package init for performance
 var (
@@ -889,22 +792,6 @@ func stripControlChars(content string) string {
 func (s *Session) hashContent(content string) string {
 	h := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(h[:])
-}
-
-// getWindowActivity returns the tmux window_activity timestamp (Unix time)
-// This is a fast way to check if ANY output occurred - updates on every byte written
-// Returns 0 if unable to get the timestamp
-func (s *Session) getWindowActivity() int64 {
-	cmd := exec.Command("tmux", "display-message", "-t", s.Name, "-p", "#{window_activity}")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0
-	}
-	timestamp, err := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return timestamp
 }
 
 // SendKeys sends keys to the tmux session

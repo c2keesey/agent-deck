@@ -5,10 +5,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
+
+// expandTilde expands ~ to the user's home directory
+func expandTilde(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
+}
 
 // StorageData represents the JSON structure for persistence
 type StorageData struct {
@@ -50,9 +62,10 @@ func NewStorage() (*Storage, error) {
 		return nil, err
 	}
 
-	// Ensure directory exists
+	// Ensure directory exists with secure permissions (0700 = owner only)
+	// This protects session data on shared systems
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create storage directory: %w", err)
 	}
 
@@ -67,6 +80,7 @@ func (s *Storage) Save(instances []*Instance) error {
 }
 
 // SaveWithGroups persists instances and groups to JSON file
+// Uses atomic write pattern (write to .tmp, rename) and keeps a backup (.bak)
 func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) error {
 	// Convert instances to serializable format
 	data := StorageData{
@@ -111,12 +125,46 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
 
-	// Write to file
-	if err := os.WriteFile(s.path, jsonData, 0644); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
+	// ═══════════════════════════════════════════════════════════════════
+	// ATOMIC WRITE PATTERN: Prevents data corruption on crash/power loss
+	// 1. Write to temporary file
+	// 2. Create backup of existing file
+	// 3. Atomic rename temp to final
+	// ═══════════════════════════════════════════════════════════════════
+
+	tmpPath := s.path + ".tmp"
+	bakPath := s.path + ".bak"
+
+	// Step 1: Write to temporary file
+	if err := os.WriteFile(tmpPath, jsonData, 0644); err != nil {
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+
+	// Step 2: Create backup of existing file (if it exists)
+	if _, err := os.Stat(s.path); err == nil {
+		// File exists - create backup
+		if err := copyFile(s.path, bakPath); err != nil {
+			// Non-fatal: we can still proceed without backup
+			// But log it for debugging
+			_ = err // Ignore backup errors
+		}
+	}
+
+	// Step 3: Atomic rename (this is atomic on POSIX systems)
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return fmt.Errorf("failed to finalize save: %w", err)
 	}
 
 	return nil
+}
+
+// copyFile copies a file from src to dst
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0644)
 }
 
 // Load reads instances from JSON file
@@ -171,10 +219,13 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			groupPath = extractGroupPath(instData.ProjectPath)
 		}
 
-		instances[i] = &Instance{
+		// Expand tilde in project path (handles paths like ~/project saved from UI)
+		projectPath := expandTilde(instData.ProjectPath)
+
+		inst := &Instance{
 			ID:          instData.ID,
 			Title:       instData.Title,
-			ProjectPath: instData.ProjectPath,
+			ProjectPath: projectPath,
 			GroupPath:   groupPath,
 			Command:     instData.Command,
 			Tool:        instData.Tool,
@@ -182,6 +233,14 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			CreatedAt:   instData.CreatedAt,
 			tmuxSession: tmuxSess,
 		}
+
+		// Update status immediately to prevent flickering on startup
+		// Without this, UI renders saved status, then first tick changes it
+		if tmuxSess != nil {
+			inst.UpdateStatus()
+		}
+
+		instances[i] = inst
 	}
 
 	return instances, data.Groups, nil

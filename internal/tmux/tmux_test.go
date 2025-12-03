@@ -1029,14 +1029,26 @@ func TestReconnectSessionWithStatusWaiting(t *testing.T) {
 	}
 }
 
-// TestReconnectSessionWithStatusActive verifies active sessions are recalculated
+// TestReconnectSessionWithStatusActive verifies active sessions are pre-initialized
+// to start as "waiting" and show "active" when content changes
 func TestReconnectSessionWithStatusActive(t *testing.T) {
-	// Simulate loading a session that was active - will be recalculated
+	// Simulate loading a session that was active
 	sess := ReconnectSessionWithStatus("agentdeck_test_789", "active-project", "/tmp", "claude", "active")
 
-	// Should NOT have stateTracker pre-initialized - let GetStatus handle it
-	if sess.stateTracker != nil {
-		t.Error("stateTracker should be nil for active sessions (recalculated)")
+	// stateTracker should be pre-initialized (same as "waiting")
+	// Active sessions start as "waiting" until content changes
+	if sess.stateTracker == nil {
+		t.Fatal("stateTracker should be pre-initialized for active sessions")
+	}
+
+	// Should NOT be acknowledged (will show yellow/waiting until content changes)
+	if sess.stateTracker.acknowledged {
+		t.Error("acknowledged should be false for active session")
+	}
+
+	// lastStableStatus should be waiting (will change to active when content changes)
+	if sess.lastStableStatus != "waiting" {
+		t.Errorf("lastStableStatus should be waiting, got %s", sess.lastStableStatus)
 	}
 }
 
@@ -1088,9 +1100,6 @@ func TestNewSessionsStartYellow(t *testing.T) {
 	// Verify the state matches "waiting" semantics
 	if sess.stateTracker.acknowledged {
 		t.Error("Waiting session should NOT be acknowledged")
-	}
-	if !sess.stateTracker.stabilized {
-		t.Error("Restored session should be stabilized")
 	}
 
 	// Compute status - should be waiting (yellow) since not acknowledged
@@ -1215,30 +1224,32 @@ func TestStatusFlickerOnInvisibleCharsIntegration(t *testing.T) {
 	initialContent := "Done. Ready for next command."
 	sendToPane(initialContent)
 
-	// Poll 1: Get initial status. Should be "waiting" on first poll
-	// (first poll initializes the tracker - no prior content to compare)
+	// Poll 1: Get initial status. Should be "idle" on first poll (no yellow flash)
+	// (first poll initializes the tracker - returns idle to avoid yellow flash)
 	status, err := session.GetStatus()
 	assert.NoError(t, err)
-	assert.Equal(t, "waiting", status, "Initial status should be 'waiting' (first poll - session needs attention)")
+	assert.Equal(t, "idle", status, "Initial status should be 'idle' (no yellow flash on init)")
 
-	// Manually expire the cooldown for testing (set lastChangeTime to past)
+	// Set up "needs attention" state: acknowledged=false, cooldown expired
 	session.stateTrackerMu.Lock()
 	session.stateTracker.lastChangeTime = time.Now().Add(-3 * time.Second)
+	session.stateTracker.acknowledged = false // Mark as needing attention
 	session.stateTrackerMu.Unlock()
 
-	// Poll 2: Same content, cooldown expired → "waiting" (not acknowledged)
+	// Poll 2: Same content, cooldown expired, acknowledged=false → "waiting"
 	status, err = session.GetStatus()
 	assert.NoError(t, err)
-	assert.Equal(t, "waiting", status, "Status should be 'waiting' when content unchanged and cooldown expired")
+	assert.Equal(t, "waiting", status, "Status should be 'waiting' when not acknowledged and cooldown expired")
 
 	// 3. The Flicker Test: Introduce an insignificant, non-printing character.
 	// A BEL character (\a) should be stripped by normalizeContent.
 	flickerContent := initialContent + "\a"
 	sendToPane(flickerContent)
 
-	// Expire cooldown again
+	// Expire cooldown again and ensure acknowledged stays false
 	session.stateTrackerMu.Lock()
 	session.stateTracker.lastChangeTime = time.Now().Add(-3 * time.Second)
+	session.stateTracker.acknowledged = false // Keep needing attention
 	session.stateTrackerMu.Unlock()
 
 	// Poll 3: normalizeContent should strip the BEL, so no real change detected
@@ -1392,11 +1403,11 @@ Thinking… (46s · 1234 tokens · esc to interrupt)
 >`
 
 	// Initialize tracker with first content
+	oldNormalized := session.normalizeContent(contentAt45s)
 	session.stateTracker = &StateTracker{
-		lastHash:       session.hashContent(session.normalizeContent(contentAt45s)),
+		lastHash:       session.hashContent(oldNormalized),
 		lastChangeTime: time.Now().Add(-3 * time.Second), // Cooldown expired
 		acknowledged:   false,
-		lastContent:    session.normalizeContent(contentAt45s),
 	}
 
 	// Simulate poll 1 second later with "46s" instead of "45s"
@@ -1414,7 +1425,7 @@ Thinking… (46s · 1234 tokens · esc to interrupt)
 	// but currently they don't because we don't strip time counters
 	if !hashesMatch {
 		t.Log("BUG CONFIRMED: Dynamic time counter causes hash change")
-		t.Log("OLD normalized (last 100 chars):", truncateEnd(session.stateTracker.lastContent, 100))
+		t.Log("OLD normalized (last 100 chars):", truncateEnd(oldNormalized, 100))
 		t.Log("NEW normalized (last 100 chars):", truncateEnd(newNormalized, 100))
 	}
 
@@ -1509,7 +1520,6 @@ func TestFlickeringScenarioEndToEnd(t *testing.T) {
 		lastHash:       session.hashContent(normalized),
 		lastChangeTime: time.Now(), // Just changed
 		acknowledged:   false,
-		lastContent:    normalized,
 	}
 
 	// Status should be ACTIVE (within cooldown)
@@ -1582,7 +1592,6 @@ func TestAcknowledgedShouldNotResetOnDynamicContent(t *testing.T) {
 		lastHash:       "hash1",
 		lastChangeTime: time.Now().Add(-10 * time.Second),
 		acknowledged:   true, // User has seen this
-		lastContent:    "Some content (45s · 100 tokens)",
 	}
 
 	// Current behavior: ANY hash change resets acknowledged

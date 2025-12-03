@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"regexp"
+	"log"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -15,8 +16,16 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
-// ansiRegex matches ANSI escape codes for stripping
-var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+// Terminal escape sequences for smooth transitions
+const (
+	// Synchronized output (DEC mode 2026) - batches screen updates for atomic rendering
+	// Supported by iTerm2, kitty, Alacritty, WezTerm, and other modern terminals
+	syncOutputBegin = "\x1b[?2026h"
+	syncOutputEnd   = "\x1b[?2026l"
+
+	// Screen clear + cursor home
+	clearScreen = "\033[2J\033[H"
+)
 
 // Home is the main application model
 type Home struct {
@@ -31,14 +40,24 @@ type Home struct {
 	flatItems []session.Item // Flattened view for cursor navigation
 
 	// Components
-	search      *Search
-	newDialog   *NewDialog
-	groupDialog *GroupDialog // For creating/renaming groups
+	search        *Search
+	newDialog     *NewDialog
+	groupDialog   *GroupDialog   // For creating/renaming groups
+	confirmDialog *ConfirmDialog // For confirming destructive actions
 
 	// State
-	cursor     int // Selected item index in flatItems
-	viewOffset int // First visible item index (for scrolling)
-	err        error
+	cursor      int  // Selected item index in flatItems
+	viewOffset  int  // First visible item index (for scrolling)
+	isAttaching bool // Prevents View() output during attach (fixes Bubble Tea Issue #431)
+	err         error
+
+	// Preview cache (async fetching - View() must be pure, no blocking I/O)
+	previewCache      map[string]string // sessionID -> cached preview content
+	previewCacheMu    sync.RWMutex      // Protects previewCache for thread-safety
+	previewFetchingID string            // ID currently being fetched (prevents duplicate fetches)
+
+	// Storage warning (shown if storage initialization failed)
+	storageWarning string
 
 	// Context for cleanup
 	ctx    context.Context
@@ -63,27 +82,40 @@ type statusUpdateMsg struct{} // Triggers immediate status update without reload
 
 type tickMsg time.Time
 
+// previewFetchedMsg is sent when async preview content is ready
+type previewFetchedMsg struct {
+	sessionID string
+	content   string
+	err       error
+}
+
 // NewHome creates a new home model
 func NewHome() *Home {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	var storageWarning string
 	storage, err := session.NewStorage()
 	if err != nil {
-		// Fallback to nil storage - will be handled gracefully
+		// Log the error and set warning - sessions won't persist but app will still function
+		log.Printf("Warning: failed to initialize storage, sessions won't persist: %v", err)
+		storageWarning = fmt.Sprintf("⚠ Storage unavailable: %v (sessions won't persist)", err)
 		storage = nil
 	}
 
 	return &Home{
-		storage:     storage,
-		search:      NewSearch(),
-		newDialog:   NewNewDialog(),
-		groupDialog: NewGroupDialog(),
-		cursor:      0,
-		ctx:         ctx,
-		cancel:      cancel,
-		instances:   []*session.Instance{},
-		groupTree:   session.NewGroupTree([]*session.Instance{}),
-		flatItems:   []session.Item{},
+		storage:        storage,
+		storageWarning: storageWarning,
+		search:         NewSearch(),
+		newDialog:      NewNewDialog(),
+		groupDialog:    NewGroupDialog(),
+		confirmDialog:  NewConfirmDialog(),
+		cursor:         0,
+		ctx:            ctx,
+		cancel:         cancel,
+		instances:      []*session.Instance{},
+		groupTree:      session.NewGroupTree([]*session.Instance{}),
+		flatItems:      []session.Item{},
+		previewCache:   make(map[string]string),
 	}
 }
 
@@ -172,6 +204,35 @@ func (h *Home) tick() tea.Cmd {
 	})
 }
 
+// fetchPreview returns a command that asynchronously fetches preview content
+// This keeps View() pure (no blocking I/O) as per Bubble Tea best practices
+func (h *Home) fetchPreview(inst *session.Instance) tea.Cmd {
+	if inst == nil {
+		return nil
+	}
+	sessionID := inst.ID
+	return func() tea.Msg {
+		content, err := inst.PreviewFull()
+		return previewFetchedMsg{
+			sessionID: sessionID,
+			content:   content,
+			err:       err,
+		}
+	}
+}
+
+// getSelectedSession returns the currently selected session, or nil if a group is selected
+func (h *Home) getSelectedSession() *session.Instance {
+	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
+		return nil
+	}
+	item := h.flatItems[h.cursor]
+	if item.Type == session.ItemTypeSession {
+		return item.Session
+	}
+	return nil
+}
+
 // Update handles messages
 func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -204,6 +265,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			h.rebuildFlatItems()
 			h.search.SetItems(h.instances)
+			// Trigger immediate preview fetch for initial selection
+			if selected := h.getSelectedSession(); selected != nil {
+				h.previewFetchingID = selected.ID
+				return h, h.fetchPreview(selected)
+			}
 		}
 		return h, nil
 
@@ -223,6 +289,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case sessionDeletedMsg:
+		// Report kill error if any (session may still be running in tmux)
+		if msg.killErr != nil {
+			h.err = fmt.Errorf("warning: tmux session may still be running: %w", msg.killErr)
+		}
+
 		// Find and remove from list
 		var deletedInstance *session.Instance
 		for i, s := range h.instances {
@@ -249,6 +320,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, h.loadSessions
 
 	case statusUpdateMsg:
+		// Clear attach flag - we've returned from the attached session
+		h.isAttaching = false
+
 		// Immediate status update without reloading from storage
 		// Used when returning from attached session
 		for _, inst := range h.instances {
@@ -259,6 +333,16 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Save state after returning from attached session to persist acknowledged state
 		h.saveInstances()
+		return h, nil
+
+	case previewFetchedMsg:
+		// Async preview content received - update cache
+		h.previewFetchingID = ""
+		if msg.err == nil {
+			h.previewCacheMu.Lock()
+			h.previewCache[msg.sessionID] = msg.content
+			h.previewCacheMu.Unlock()
+		}
 		return h, nil
 
 	case tickMsg:
@@ -272,7 +356,15 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		return h, h.tick()
+		// Fetch preview for currently selected session (if not already fetching)
+		var previewCmd tea.Cmd
+		if selected := h.getSelectedSession(); selected != nil {
+			if h.previewFetchingID != selected.ID {
+				h.previewFetchingID = selected.ID
+				previewCmd = h.fetchPreview(selected)
+			}
+		}
+		return h, tea.Batch(h.tick(), previewCmd)
 
 	case tea.KeyMsg:
 		// Handle overlays first
@@ -284,6 +376,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.groupDialog.IsVisible() {
 			return h.handleGroupDialogKey(msg)
+		}
+		if h.confirmDialog.IsVisible() {
+			return h.handleConfirmDialogKey(msg)
 		}
 
 		// Main view keys
@@ -322,15 +417,22 @@ func (h *Home) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
+		// Validate before creating session
+		if validationErr := h.newDialog.Validate(); validationErr != "" {
+			h.err = fmt.Errorf("validation error: %s", validationErr)
+			return h, nil
+		}
+
 		// Create session (enter works from any field)
 		name, path, command := h.newDialog.GetValues()
-		if name != "" && path != "" {
-			groupPath := h.newDialog.GetSelectedGroup()
-			h.newDialog.Hide()
-			return h, h.createSessionInGroup(name, path, command, groupPath)
-		}
+		groupPath := h.newDialog.GetSelectedGroup()
+		h.newDialog.Hide()
+		h.err = nil // Clear any previous validation error
+		return h, h.createSessionInGroup(name, path, command, groupPath)
+
 	case "esc":
 		h.newDialog.Hide()
+		h.err = nil // Clear any validation error
 		return h, nil
 	}
 
@@ -353,6 +455,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor > 0 {
 			h.cursor--
 			h.syncViewport()
+			// Trigger immediate preview fetch for new selection
+			if selected := h.getSelectedSession(); selected != nil && h.previewFetchingID != selected.ID {
+				h.previewFetchingID = selected.ID
+				return h, h.fetchPreview(selected)
+			}
 		}
 		return h, nil
 
@@ -360,6 +467,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems)-1 {
 			h.cursor++
 			h.syncViewport()
+			// Trigger immediate preview fetch for new selection
+			if selected := h.getSelectedSession(); selected != nil && h.previewFetchingID != selected.ID {
+				h.previewFetchingID = selected.ID
+				return h, h.fetchPreview(selected)
+			}
 		}
 		return h, nil
 
@@ -368,6 +480,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
 				if item.Session.Exists() {
+					h.isAttaching = true // Prevent View() output during transition
 					return h, h.attachSession(item.Session)
 				}
 			} else if item.Type == session.ItemTypeGroup {
@@ -506,16 +619,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "d":
+		// Show confirmation dialog before deletion (prevents accidental deletion)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
-				return h, h.deleteSession(item.Session)
-			} else if item.Type == session.ItemTypeGroup {
-				// Delete group (moves sessions to default)
-				h.groupTree.DeleteGroup(item.Path)
-				h.instances = h.groupTree.GetAllInstances()
-				h.rebuildFlatItems()
-				h.saveInstances()
+				h.confirmDialog.ShowDeleteSession(item.Session.ID, item.Session.Title)
+			} else if item.Type == session.ItemTypeGroup && item.Path != "default" {
+				h.confirmDialog.ShowDeleteGroup(item.Path, item.Group.Name)
 			}
 		}
 		return h, nil
@@ -530,10 +640,50 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return h, nil
 }
 
+// handleConfirmDialogKey handles keys when confirmation dialog is visible
+func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		// User confirmed - perform the deletion
+		switch h.confirmDialog.GetConfirmType() {
+		case ConfirmDeleteSession:
+			sessionID := h.confirmDialog.GetTargetID()
+			for _, inst := range h.instances {
+				if inst.ID == sessionID {
+					h.confirmDialog.Hide()
+					return h, h.deleteSession(inst)
+				}
+			}
+		case ConfirmDeleteGroup:
+			groupPath := h.confirmDialog.GetTargetID()
+			h.groupTree.DeleteGroup(groupPath)
+			h.instances = h.groupTree.GetAllInstances()
+			h.rebuildFlatItems()
+			h.saveInstances()
+		}
+		h.confirmDialog.Hide()
+		return h, nil
+
+	case "n", "N", "esc":
+		// User cancelled
+		h.confirmDialog.Hide()
+		return h, nil
+	}
+
+	return h, nil
+}
+
 // handleGroupDialogKey handles keys when group dialog is visible
 func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
+		// Validate before proceeding
+		if validationErr := h.groupDialog.Validate(); validationErr != "" {
+			h.err = fmt.Errorf("validation error: %s", validationErr)
+			return h, nil
+		}
+		h.err = nil // Clear any previous validation error
+
 		switch h.groupDialog.Mode() {
 		case GroupDialogCreate:
 			name := h.groupDialog.GetValue()
@@ -593,6 +743,7 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 	case "esc":
 		h.groupDialog.Hide()
+		h.err = nil // Clear any validation error
 		return h, nil
 	}
 
@@ -609,14 +760,14 @@ func (h *Home) saveInstances() {
 	}
 }
 
-// createSession creates a new session (deprecated, use createSessionInGroup)
-func (h *Home) createSession(name, path, command string) tea.Cmd {
-	return h.createSessionInGroup(name, path, command, "")
-}
-
 // createSessionInGroup creates a new session in a specific group
 func (h *Home) createSessionInGroup(name, path, command, groupPath string) tea.Cmd {
 	return func() tea.Msg {
+		// Check tmux availability before creating session
+		if err := tmux.IsTmuxAvailable(); err != nil {
+			return sessionCreatedMsg{err: fmt.Errorf("cannot create session: %w", err)}
+		}
+
 		var inst *session.Instance
 		if groupPath != "" {
 			inst = session.NewInstanceWithGroup(name, path, groupPath)
@@ -634,14 +785,15 @@ func (h *Home) createSessionInGroup(name, path, command, groupPath string) tea.C
 // sessionDeletedMsg signals that a session was deleted
 type sessionDeletedMsg struct {
 	deletedID string
+	killErr   error // Error from Kill() if any
 }
 
 // deleteSession deletes a session
 func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	id := inst.ID
 	return func() tea.Msg {
-		inst.Kill()
-		return sessionDeletedMsg{deletedID: id}
+		killErr := inst.Kill()
+		return sessionDeletedMsg{deletedID: id, killErr: killErr}
 	}
 }
 
@@ -652,14 +804,18 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 		return nil
 	}
 
-	// Mark session as acknowledged (user is opening it)
-	// This changes yellow (waiting) → gray (idle/seen) when they detach
-	tmuxSess.Acknowledge()
+	// NOTE: We DON'T call Acknowledge() here. Setting acknowledged=true before attach
+	// would cause brief "idle" status if a poll happens before content changes.
+	// The proper acknowledgment happens in AcknowledgeWithSnapshot() AFTER detach,
+	// which baselines the content hash the user saw.
 
 	// Use tea.Exec with a custom command that runs our Attach method
 	// On return, immediately update all session statuses (don't reload from storage
 	// which would lose the tmux session state)
 	return tea.Exec(attachCmd{session: tmuxSess}, func(err error) tea.Msg {
+		// Clear screen with synchronized output for atomic rendering
+		fmt.Print(syncOutputBegin + clearScreen + syncOutputEnd)
+
 		// Baseline the content the user just saw to avoid a green flash on return
 		tmuxSess.AcknowledgeWithSnapshot()
 		return statusUpdateMsg{}
@@ -672,6 +828,10 @@ type attachCmd struct {
 }
 
 func (a attachCmd) Run() error {
+	// Clear screen with synchronized output for atomic rendering (prevents flicker)
+	// Begin sync mode → clear screen → end sync mode ensures single-frame update
+	fmt.Print(syncOutputBegin + clearScreen + syncOutputEnd)
+
 	ctx := context.Background()
 	return a.session.Attach(ctx)
 }
@@ -715,10 +875,17 @@ func (h *Home) updateSizes() {
 	h.search.SetSize(h.width, h.height)
 	h.newDialog.SetSize(h.width, h.height)
 	h.groupDialog.SetSize(h.width, h.height)
+	h.confirmDialog.SetSize(h.width, h.height)
 }
 
 // View renders the UI
 func (h *Home) View() string {
+	// CRITICAL: Return empty during attach to prevent View() output leakage
+	// (Bubble Tea Issue #431 - View gets printed to stdout during tea.Exec)
+	if h.isAttaching {
+		return ""
+	}
+
 	if h.width == 0 {
 		return "Loading..."
 	}
@@ -732,6 +899,9 @@ func (h *Home) View() string {
 	}
 	if h.groupDialog.IsVisible() {
 		return h.groupDialog.View()
+	}
+	if h.confirmDialog.IsVisible() {
+		return h.confirmDialog.View()
 	}
 
 	var b strings.Builder
@@ -822,11 +992,18 @@ func (h *Home) View() string {
 	helpBar := h.renderHelpBar()
 	b.WriteString(helpBar)
 
-	// Error display (above help bar)
+	// Error display
 	if h.err != nil {
 		errMsg := ErrorStyle.Render("⚠ " + h.err.Error())
 		b.WriteString("\n")
 		b.WriteString(errMsg)
+	}
+
+	// Storage warning (persistent until resolved)
+	if h.storageWarning != "" {
+		warnStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+		b.WriteString("\n")
+		b.WriteString(warnStyle.Render(h.storageWarning))
 	}
 
 	return b.String()
@@ -1198,10 +1375,16 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	b.WriteString(termHeader)
 	b.WriteString("\n")
 
-	// Terminal preview
-	preview, err := selected.PreviewFull()
-	if err != nil {
-		b.WriteString(ErrorStyle.Render("⚠ " + err.Error()))
+	// Terminal preview - use cached content (async fetching keeps View() pure)
+	h.previewCacheMu.RLock()
+	preview, hasCached := h.previewCache[selected.ID]
+	h.previewCacheMu.RUnlock()
+	if !hasCached {
+		// Show loading indicator while waiting for async fetch
+		loadingStyle := lipgloss.NewStyle().
+			Foreground(ColorTextDim).
+			Italic(true)
+		b.WriteString(loadingStyle.Render("Loading preview..."))
 	} else if preview == "" {
 		emptyTerm := lipgloss.NewStyle().
 			Foreground(ColorTextDim).
@@ -1227,7 +1410,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 		for _, line := range lines {
 			// Strip ANSI codes for accurate length measurement
-			cleanLine := ansiRegex.ReplaceAllString(line, "")
+			cleanLine := tmux.StripANSI(line)
 
 			// Skip completely empty lines to reduce noise
 			trimmed := strings.TrimSpace(cleanLine)

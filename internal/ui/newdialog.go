@@ -109,8 +109,8 @@ func (d *NewDialog) IsVisible() bool {
 
 // GetValues returns the current dialog values with expanded paths
 func (d *NewDialog) GetValues() (name, path, command string) {
-	name = d.nameInput.Value()
-	path = d.pathInput.Value()
+	name = strings.TrimSpace(d.nameInput.Value())
+	path = strings.TrimSpace(d.pathInput.Value())
 
 	// Expand tilde in path
 	if strings.HasPrefix(path, "~/") {
@@ -125,10 +125,33 @@ func (d *NewDialog) GetValues() (name, path, command string) {
 		command = d.presetCommands[d.commandCursor]
 	}
 	if command == "" && d.commandInput.Value() != "" {
-		command = d.commandInput.Value()
+		command = strings.TrimSpace(d.commandInput.Value())
 	}
 
 	return name, path, command
+}
+
+// Validate checks if the dialog values are valid and returns an error message if not
+func (d *NewDialog) Validate() string {
+	name := strings.TrimSpace(d.nameInput.Value())
+	path := strings.TrimSpace(d.pathInput.Value())
+
+	// Check for empty name
+	if name == "" {
+		return "Session name cannot be empty"
+	}
+
+	// Check name length
+	if len(name) > 50 {
+		return "Session name too long (max 50 characters)"
+	}
+
+	// Check for empty path
+	if path == "" {
+		return "Project path cannot be empty"
+	}
+
+	return "" // Valid
 }
 
 // updateFocus updates which input has focus
