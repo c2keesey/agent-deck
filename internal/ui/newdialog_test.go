@@ -115,3 +115,72 @@ func TestDialogView(t *testing.T) {
 		t.Error("View should contain 'New Session' title")
 	}
 }
+
+func TestNewDialog_SetPathSuggestions(t *testing.T) {
+	d := NewNewDialog()
+
+	paths := []string{
+		"/Users/test/project1",
+		"/Users/test/project2",
+		"/Users/test/other",
+	}
+
+	d.SetPathSuggestions(paths)
+
+	if len(d.pathSuggestions) != 3 {
+		t.Errorf("expected 3 suggestions, got %d", len(d.pathSuggestions))
+	}
+
+	// Verify suggestions are set on textinput
+	available := d.pathInput.AvailableSuggestions()
+	if len(available) != 3 {
+		t.Errorf("expected 3 available suggestions on pathInput, got %d", len(available))
+	}
+}
+
+func TestNewDialog_ShowSuggestionsEnabled(t *testing.T) {
+	d := NewNewDialog()
+
+	// ShowSuggestions should be enabled by default
+	if !d.pathInput.ShowSuggestions {
+		t.Error("expected ShowSuggestions to be true on pathInput")
+	}
+}
+
+func TestNewDialog_SuggestionFiltering(t *testing.T) {
+	d := NewNewDialog()
+
+	paths := []string{
+		"/Users/test/project-alpha",
+		"/Users/test/project-beta",
+		"/Users/test/other-thing",
+	}
+
+	d.SetPathSuggestions(paths)
+
+	// Verify suggestions are available
+	available := d.pathInput.AvailableSuggestions()
+	if len(available) != 3 {
+		t.Errorf("expected 3 available suggestions, got %d", len(available))
+	}
+
+	// Verify specific suggestions are in the list
+	hasProjectAlpha := false
+	hasProjectBeta := false
+	hasOtherThing := false
+	for _, s := range available {
+		if s == "/Users/test/project-alpha" {
+			hasProjectAlpha = true
+		}
+		if s == "/Users/test/project-beta" {
+			hasProjectBeta = true
+		}
+		if s == "/Users/test/other-thing" {
+			hasOtherThing = true
+		}
+	}
+
+	if !hasProjectAlpha || !hasProjectBeta || !hasOtherThing {
+		t.Error("not all expected suggestions are available")
+	}
+}
