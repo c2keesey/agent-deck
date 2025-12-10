@@ -84,6 +84,8 @@ func (h *HelpOverlay) View() string {
 				{"R", "Rename"},
 				{"u", "Mark unread"},
 				{"K / J", "Reorder up/down"},
+				{"f", "Quick fork (Claude only)"},
+				{"F", "Fork with options (Claude only)"},
 			},
 		},
 		{
