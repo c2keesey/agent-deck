@@ -751,6 +751,223 @@ func TestSyncClaudeSessionFromDisk_NoChangeWhenCurrent(t *testing.T) {
 	}
 }
 
+// TestSyncClaudeSessionFromDisk_ForkCreatesNewSession simulates Claude Code's /fork
+// command, which creates a new session file while the original remains on disk.
+// The sync should pick up the forked (newer) session.
+func TestSyncClaudeSessionFromDisk_ForkCreatesNewSession(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/fork-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	originalID := "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	forkedID := "bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+	// Create original session file (older)
+	origPath := filepath.Join(projectDir, originalID+".jsonl")
+	if err := os.WriteFile(origPath, []byte(`{"type":"conversation"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(origPath, time.Now().Add(-30*time.Second), time.Now().Add(-30*time.Second))
+
+	// Simulate /fork: creates a new session file, original stays on disk
+	forkedPath := filepath.Join(projectDir, forkedID+".jsonl")
+	if err := os.WriteFile(forkedPath, []byte(`{"type":"conversation","parent":"`+originalID+`"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("fork-test", projectPath, "claude")
+	inst.ClaudeSessionID = originalID
+	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != forkedID {
+		t.Errorf("after /fork, ClaudeSessionID = %q, want %q", inst.ClaudeSessionID, forkedID)
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_CompactCreatesNewSession simulates Claude Code's /compact
+// command, which creates a new session file with a compacted conversation while the
+// original file remains. The sync should pick up the compacted (newer) session.
+func TestSyncClaudeSessionFromDisk_CompactCreatesNewSession(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/compact-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	originalID := "cccc1111-cccc-cccc-cccc-cccccccccccc"
+	compactedID := "dddd2222-dddd-dddd-dddd-dddddddddddd"
+
+	// Original session with lots of conversation data
+	origPath := filepath.Join(projectDir, originalID+".jsonl")
+	if err := os.WriteFile(origPath, []byte(`{"type":"conversation","messages":["many","messages"]}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(origPath, time.Now().Add(-2*time.Minute), time.Now().Add(-2*time.Minute))
+
+	// Simulate /compact: new session file with summarized context
+	compactedPath := filepath.Join(projectDir, compactedID+".jsonl")
+	if err := os.WriteFile(compactedPath, []byte(`{"type":"conversation","compacted_from":"`+originalID+`"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("compact-test", projectPath, "claude")
+	inst.ClaudeSessionID = originalID
+	inst.ClaudeDetectedAt = time.Now().Add(-3 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != compactedID {
+		t.Errorf("after /compact, ClaudeSessionID = %q, want %q", inst.ClaudeSessionID, compactedID)
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_RapidSessionChanges simulates multiple rapid session
+// changes (e.g., /clear then /fork in quick succession). The sync should always
+// converge to the most recent session file.
+func TestSyncClaudeSessionFromDisk_RapidSessionChanges(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/rapid-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	session1 := "eeee1111-eeee-eeee-eeee-eeeeeeeeeeee"
+	session2 := "ffff2222-ffff-ffff-ffff-ffffffffffff"
+	session3 := "aaaa3333-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	// Session 1: original (oldest)
+	path1 := filepath.Join(projectDir, session1+".jsonl")
+	if err := os.WriteFile(path1, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(path1, time.Now().Add(-60*time.Second), time.Now().Add(-60*time.Second))
+
+	// Session 2: after /clear (middle)
+	path2 := filepath.Join(projectDir, session2+".jsonl")
+	if err := os.WriteFile(path2, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(path2, time.Now().Add(-30*time.Second), time.Now().Add(-30*time.Second))
+
+	// Session 3: after /fork on session 2 (newest)
+	path3 := filepath.Join(projectDir, session3+".jsonl")
+	if err := os.WriteFile(path3, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("rapid-test", projectPath, "claude")
+	inst.ClaudeSessionID = session1
+	inst.ClaudeDetectedAt = time.Now().Add(-2 * time.Minute)
+
+	// First sync: should jump to session3 (newest), skipping session2
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != session3 {
+		t.Errorf("after rapid changes, ClaudeSessionID = %q, want %q (most recent)", inst.ClaudeSessionID, session3)
+	}
+
+	// Second sync: should be a no-op since we're already on the latest
+	detectedAt := inst.ClaudeDetectedAt
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != session3 {
+		t.Errorf("second sync changed session to %q, should stay %q", inst.ClaudeSessionID, session3)
+	}
+	if inst.ClaudeDetectedAt != detectedAt {
+		t.Error("second sync should not update ClaudeDetectedAt")
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_IgnoresAgentFiles verifies that agent-*.jsonl files
+// (created by Claude Code's subagent/tool-use sessions) are not picked up as the
+// active session, even when they are newer than the real session file.
+func TestSyncClaudeSessionFromDisk_IgnoresAgentFiles(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/agent-files-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	realSession := "abcd1234-abcd-abcd-abcd-abcdabcdabcd"
+	agentSession := "agent-eeee5555-eeee-eeee-eeee-eeeeeeeeeeee"
+
+	// Real session file (slightly older)
+	realPath := filepath.Join(projectDir, realSession+".jsonl")
+	if err := os.WriteFile(realPath, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(realPath, time.Now().Add(-10*time.Second), time.Now().Add(-10*time.Second))
+
+	// Agent file (newer - created by subagent during /compact or tool use)
+	agentPath := filepath.Join(projectDir, agentSession+".jsonl")
+	if err := os.WriteFile(agentPath, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("agent-files-test", projectPath, "claude")
+	inst.ClaudeSessionID = realSession
+	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	// Should stay on realSession, not pick up the agent- prefixed file
+	if inst.ClaudeSessionID != realSession {
+		t.Errorf("ClaudeSessionID = %q, want %q (agent files should be ignored)", inst.ClaudeSessionID, realSession)
+	}
+}
+
 // TestSyncClaudeSessionFromDisk_SkipsNonClaude verifies non-claude tools are no-ops.
 func TestSyncClaudeSessionFromDisk_SkipsNonClaude(t *testing.T) {
 	inst := NewInstanceWithTool("shell-test", "/tmp", "shell")
