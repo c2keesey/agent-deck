@@ -103,6 +103,11 @@ type Instance struct {
 	lastJSONLSize int64
 	lastJSONLPath string
 	cachedPrompt  string
+	cachedSlug    string // cached slug from last JSONL read
+
+	// Auto-name from Claude slug
+	slugApplied    bool // prevents re-renaming after first application
+	autoNameDirty  bool // signals that title was changed by auto-name and needs saving
 
 	// Docker sandbox support.
 	Sandbox          *SandboxConfig `json:"sandbox,omitempty"`
@@ -2011,6 +2016,7 @@ func (i *Instance) UpdateStatus() error {
 				if i.hookSessionID != i.ClaudeSessionID {
 					i.ClaudeSessionID = i.hookSessionID
 					i.ClaudeDetectedAt = time.Now()
+					i.slugApplied = false // New session → allow re-naming
 				}
 			case "codex":
 				if i.hookSessionID != i.CodexSessionID {
@@ -2108,16 +2114,25 @@ func (i *Instance) UpdateClaudeSession(excludeIDs map[string]bool) {
 				}
 			}
 			i.ClaudeSessionID = sessionID
+			i.slugApplied = false // New session → allow re-naming
 		}
 		i.ClaudeDetectedAt = time.Now()
 	}
 
-	// Update latest prompt from JSONL file (tail-read with size caching)
+	// Update latest prompt and slug from JSONL file (tail-read with size caching)
 	if i.ClaudeSessionID != "" {
 		jsonlPath := i.GetJSONLPath()
 		if jsonlPath != "" {
-			if prompt := i.readJSONLTail(jsonlPath); prompt != "" {
+			prompt, slug := i.readJSONLTail(jsonlPath)
+			if prompt != "" {
 				i.LatestPrompt = prompt
+			}
+			// Auto-name: rename session title to match Claude slug (once per session ID)
+			if slug != "" && !i.slugApplied && GetClaudeAutoName() {
+				i.Title = slug
+				i.SyncTmuxDisplayName()
+				i.slugApplied = true
+				i.autoNameDirty = true
 			}
 		}
 	}
@@ -2805,8 +2820,9 @@ func parseClaudeLastAssistantMessage(data []byte, sessionID string) (*ResponseOu
 	}, nil
 }
 
-// parseClaudeLatestUserPrompt parses a Claude JSONL file to extract the last user message
-func parseClaudeLatestUserPrompt(data []byte) (string, error) {
+// parseClaudeJSONLTail parses a Claude JSONL data chunk to extract the last user message
+// and the session slug. The slug appears on every JSONL record; we track the last non-empty one.
+func parseClaudeJSONLTail(data []byte) (prompt, slug string, err error) {
 	// JSONL record structure
 	type claudeMessage struct {
 		Role    string          `json:"role"`
@@ -2814,9 +2830,11 @@ func parseClaudeLatestUserPrompt(data []byte) (string, error) {
 	}
 	type claudeRecord struct {
 		Message json.RawMessage `json:"message"`
+		Slug    string          `json:"slug,omitempty"`
 	}
 
 	var latestPrompt string
+	var latestSlug string
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	// Handle large lines
@@ -2832,6 +2850,11 @@ func parseClaudeLatestUserPrompt(data []byte) (string, error) {
 		var record claudeRecord
 		if err := json.Unmarshal(line, &record); err != nil {
 			continue // Skip malformed lines
+		}
+
+		// Track slug from every record
+		if record.Slug != "" {
+			latestSlug = record.Slug
 		}
 
 		// Only care about messages
@@ -2879,31 +2902,31 @@ func parseClaudeLatestUserPrompt(data []byte) (string, error) {
 		}
 	}
 
-	return latestPrompt, nil
+	return latestPrompt, latestSlug, nil
 }
 
-// readJSONLTail reads the last user prompt from a JSONL file using tail-read with size caching.
+// readJSONLTail reads the last user prompt and slug from a JSONL file using tail-read with size caching.
 // Instead of reading the entire file (can be 100-800MB), it:
 // 1. Stats the file to get current size (cheap syscall)
 // 2. Skips reading entirely if size hasn't changed since last check
 // 3. Only reads the last 32KB when the file has grown
-func (i *Instance) readJSONLTail(path string) string {
+func (i *Instance) readJSONLTail(path string) (prompt, slug string) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	size := info.Size()
 
-	// If same file and same size, return cached prompt
+	// If same file and same size, return cached values
 	if path == i.lastJSONLPath && size == i.lastJSONLSize {
-		return i.cachedPrompt
+		return i.cachedPrompt, i.cachedSlug
 	}
 
 	// File changed or new file - read the tail
 	const tailSize int64 = 32 * 1024 // 32KB
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	defer f.Close()
 
@@ -2913,13 +2936,13 @@ func (i *Instance) readJSONLTail(path string) string {
 	}
 	if offset > 0 {
 		if _, err := f.Seek(offset, 0); err != nil {
-			return ""
+			return "", ""
 		}
 	}
 
 	data, err := io.ReadAll(f)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 
 	// If we seeked into the middle of the file, skip to the first complete line
@@ -2929,18 +2952,24 @@ func (i *Instance) readJSONLTail(path string) string {
 		}
 	}
 
-	prompt, err := parseClaudeLatestUserPrompt(data)
-	if err != nil || prompt == "" {
+	parsedPrompt, parsedSlug, err := parseClaudeJSONLTail(data)
+
+	// Update slug cache regardless of prompt result
+	if parsedSlug != "" {
+		i.cachedSlug = parsedSlug
+	}
+
+	if err != nil || parsedPrompt == "" {
 		// Update cache even on empty result to avoid re-reading
 		i.lastJSONLPath = path
 		i.lastJSONLSize = size
-		return i.cachedPrompt // Return previous cached value
+		return i.cachedPrompt, i.cachedSlug // Return previous cached values
 	}
 
 	i.lastJSONLPath = path
 	i.lastJSONLSize = size
-	i.cachedPrompt = prompt
-	return prompt
+	i.cachedPrompt = parsedPrompt
+	return parsedPrompt, i.cachedSlug
 }
 
 // parseGeminiLatestUserPrompt parses a Gemini JSON file to extract the last user message
@@ -3965,6 +3994,16 @@ func (i *Instance) SetAcknowledgedFromShared(ack bool) {
 	}
 
 	i.tmuxSession.Acknowledge()
+}
+
+// ConsumeAutoNameDirty atomically reads and clears the autoNameDirty flag.
+// Returns true if the title was changed by auto-naming and needs persisting.
+func (i *Instance) ConsumeAutoNameDirty() bool {
+	i.mu.Lock()
+	dirty := i.autoNameDirty
+	i.autoNameDirty = false
+	i.mu.Unlock()
+	return dirty
 }
 
 // SyncTmuxDisplayName updates the tmux status bar to reflect the current title.

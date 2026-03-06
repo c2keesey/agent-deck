@@ -2236,6 +2236,14 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 		h.statusUpdateIndex.Store(int32((idx + 1) % instanceCount))
 	}
 
+	// Check if any instance was auto-named and needs saving
+	for _, inst := range instancesCopy {
+		if inst.ConsumeAutoNameDirty() {
+			h.saveInstances()
+			break
+		}
+	}
+
 	// Only invalidate status counts cache if status actually changed
 	// This reduces View() overhead by keeping cache valid when no changes occurred
 	if statusChanged {

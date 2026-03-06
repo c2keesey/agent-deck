@@ -18,6 +18,7 @@ const (
 	SettingDefaultTool
 	SettingDangerousMode
 	SettingClaudeConfigDir
+	SettingClaudeAutoName
 	SettingGeminiYoloMode
 	SettingCodexYoloMode
 	SettingCheckForUpdates
@@ -34,7 +35,7 @@ const (
 )
 
 // Total number of navigable settings.
-const settingsCount = 17
+const settingsCount = 18
 
 // SettingsPanel displays and edits user configuration
 type SettingsPanel struct {
@@ -51,6 +52,7 @@ type SettingsPanel struct {
 	dangerousMode       bool
 	claudeConfigDir     string
 	claudeConfigIsScope bool // true = profile override, false = global [claude]
+	claudeAutoName      bool
 	geminiYoloMode      bool
 	codexYoloMode       bool
 	checkForUpdates     bool
@@ -183,6 +185,9 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 		}
 	}
 
+	// Claude auto-name
+	s.claudeAutoName = config.Claude.GetAutoName()
+
 	// Gemini settings
 	s.geminiYoloMode = config.Gemini.YoloMode
 
@@ -247,6 +252,8 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	// Claude settings
 	dangerousModeVal := s.dangerousMode
 	config.Claude.DangerousMode = &dangerousModeVal
+	autoNameVal := s.claudeAutoName
+	config.Claude.AutoName = &autoNameVal
 	if !s.claudeConfigIsScope {
 		config.Claude.ConfigDir = s.claudeConfigDir
 	}
@@ -420,6 +427,10 @@ func (s *SettingsPanel) toggleValue() bool {
 	switch setting {
 	case SettingDangerousMode:
 		s.dangerousMode = !s.dangerousMode
+		return true
+
+	case SettingClaudeAutoName:
+		s.claudeAutoName = !s.claudeAutoName
 		return true
 
 	case SettingGeminiYoloMode:
@@ -605,6 +616,13 @@ func (s *SettingsPanel) View() string {
 	if s.cursor == int(SettingClaudeConfigDir) {
 		line = highlightStyle.Render(line)
 	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	// Auto-name checkbox
+	line = s.renderCheckbox("Auto-name from slug", s.claudeAutoName) + " - Match Claude session name"
+	if s.cursor == int(SettingClaudeAutoName) {
+		line = highlightStyle.Render(line)
+	}
 	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
 
 	// GEMINI
@@ -752,19 +770,20 @@ func (s *SettingsPanel) View() string {
 			7,  // SettingDefaultTool
 			11, // SettingDangerousMode
 			12, // SettingClaudeConfigDir
-			15, // SettingGeminiYoloMode
-			18, // SettingCodexYoloMode
-			21, // SettingCheckForUpdates
-			22, // SettingAutoUpdate
-			25, // SettingLogMaxSize
-			25, // SettingLogMaxLines (shares line with LogMaxSize)
-			26, // SettingRemoveOrphans
-			29, // SettingGlobalSearchEnabled
-			30, // SettingSearchTier
-			31, // SettingRecentDays
-			34, // SettingShowOutput
-			35, // SettingShowAnalytics
-			38, // SettingMaintenanceEnabled
+			13, // SettingClaudeAutoName
+			16, // SettingGeminiYoloMode
+			19, // SettingCodexYoloMode
+			22, // SettingCheckForUpdates
+			23, // SettingAutoUpdate
+			26, // SettingLogMaxSize
+			26, // SettingLogMaxLines (shares line with LogMaxSize)
+			27, // SettingRemoveOrphans
+			30, // SettingGlobalSearchEnabled
+			31, // SettingSearchTier
+			32, // SettingRecentDays
+			35, // SettingShowOutput
+			36, // SettingShowAnalytics
+			39, // SettingMaintenanceEnabled
 		}
 		cursorLine := cursorToLine[s.cursor]
 

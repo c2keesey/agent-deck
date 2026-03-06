@@ -2539,3 +2539,55 @@ func TestCurrentComposerPrompt_UsesBottomComposerBlock(t *testing.T) {
 		t.Fatalf("unexpected composer prompt.\nwant: %q\ngot:  %q", want, got)
 	}
 }
+
+// TestParseClaudeJSONLTail_SlugExtraction tests slug extraction from JSONL records
+func TestParseClaudeJSONLTail_SlugExtraction(t *testing.T) {
+	tests := []struct {
+		name       string
+		data       string
+		wantPrompt string
+		wantSlug   string
+	}{
+		{
+			name: "slug on every record",
+			data: `{"type":"system","message":{"role":"system","content":"hello"},"slug":"glittery-mixing-seal"}
+{"type":"human","message":{"role":"user","content":"fix the bug"},"slug":"glittery-mixing-seal"}`,
+			wantPrompt: "fix the bug",
+			wantSlug:   "glittery-mixing-seal",
+		},
+		{
+			name: "no slug field",
+			data: `{"type":"human","message":{"role":"user","content":"hello world"}}`,
+			wantPrompt: "hello world",
+			wantSlug:   "",
+		},
+		{
+			name:       "slug but no user message",
+			data:       `{"type":"system","message":{"role":"system","content":"init"},"slug":"fuzzy-purple-cat"}`,
+			wantPrompt: "",
+			wantSlug:   "fuzzy-purple-cat",
+		},
+		{
+			name: "slug changes across records (simulates /clear)",
+			data: `{"type":"human","message":{"role":"user","content":"old prompt"},"slug":"old-session-slug"}
+{"type":"human","message":{"role":"user","content":"new prompt"},"slug":"new-session-slug"}`,
+			wantPrompt: "new prompt",
+			wantSlug:   "new-session-slug",
+		},
+		{
+			name:       "empty data",
+			data:       "",
+			wantPrompt: "",
+			wantSlug:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prompt, slug, err := parseClaudeJSONLTail([]byte(tt.data))
+			require.NoError(t, err)
+			require.Equal(t, tt.wantPrompt, prompt, "prompt mismatch")
+			require.Equal(t, tt.wantSlug, slug, "slug mismatch")
+		})
+	}
+}

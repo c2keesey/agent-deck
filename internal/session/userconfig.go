@@ -431,6 +431,11 @@ type ClaudeSettings struct {
 	// Default: false
 	AllowDangerousMode bool `toml:"allow_dangerous_mode"`
 
+	// AutoName automatically renames agent-deck sessions to match the Claude Code session slug.
+	// The slug is extracted from JSONL transcript files during the poll cycle.
+	// Default: false (nil = false)
+	AutoName *bool `toml:"auto_name"`
+
 	// EnvFile is a .env file specific to Claude sessions
 	// Sourced AFTER global [shell].env_files
 	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
@@ -464,12 +469,30 @@ func (c *ClaudeSettings) GetDangerousMode() bool {
 	return *c.DangerousMode
 }
 
+// GetAutoName returns whether auto-naming from Claude slug is enabled, defaulting to false
+func (c *ClaudeSettings) GetAutoName() bool {
+	if c.AutoName == nil {
+		return false
+	}
+	return *c.AutoName
+}
+
 // GetHooksEnabled returns whether Claude Code hooks are enabled, defaulting to true
 func (c *ClaudeSettings) GetHooksEnabled() bool {
 	if c.HooksEnabled == nil {
 		return true
 	}
 	return *c.HooksEnabled
+}
+
+// GetClaudeAutoName returns whether auto-naming from Claude slug is enabled.
+// Package-level convenience function that loads config and checks the setting.
+func GetClaudeAutoName() bool {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return false
+	}
+	return config.Claude.GetAutoName()
 }
 
 // GeminiSettings defines Gemini CLI configuration
@@ -1402,6 +1425,8 @@ func CreateExampleConfig() error {
 # config_dir = "~/.claude-work"
 # Enable --dangerously-skip-permissions by default (default: false)
 # dangerous_mode = true
+# Auto-rename sessions to match Claude Code session slug (default: false)
+# auto_name = true
 
 # Gemini CLI integration
 # [gemini]
