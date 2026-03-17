@@ -13,6 +13,7 @@ const (
 	hotkeyQuickCreate     = "quick_create"
 	hotkeyRename          = "rename"
 	hotkeyRestart         = "restart"
+	hotkeyHardRestart     = "hard_restart"
 	hotkeyDelete          = "delete"
 	hotkeyCloseSession    = "close_session"
 	hotkeyUndoDelete      = "undo_delete"
@@ -44,6 +45,7 @@ var hotkeyActionOrder = []string{
 	hotkeyQuickCreate,
 	hotkeyRename,
 	hotkeyRestart,
+	hotkeyHardRestart,
 	hotkeyDelete,
 	hotkeyCloseSession,
 	hotkeyUndoDelete,
@@ -75,6 +77,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyQuickCreate:     "N",
 	hotkeyRename:          "r",
 	hotkeyRestart:         "R",
+	hotkeyHardRestart:     "H",
 	hotkeyDelete:          "d",
 	hotkeyCloseSession:    "D",
 	hotkeyUndoDelete:      "ctrl+z",

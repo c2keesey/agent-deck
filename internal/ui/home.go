@@ -5669,6 +5669,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "H":
+		// Hard restart session (fresh claude session, no --resume)
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				if h.hasActiveAnimation(item.Session.ID) {
+					h.setError(fmt.Errorf("session is starting, please wait..."))
+					return h, nil
+				}
+				if session.IsClaudeCompatible(item.Session.Tool) {
+					h.resumingSessions[item.Session.ID] = time.Now()
+					return h, h.hardRestartSession(item.Session)
+				}
+			}
+		}
+		return h, nil
+
 	case "c":
 		// Copy last AI response to system clipboard
 		if h.cursor < len(h.flatItems) {
@@ -7327,6 +7344,36 @@ func (h *Home) restartRemoteSession(remoteName, sessionID, title string) tea.Cmd
 		defer cancel()
 		err = runner.RestartSession(ctx, sessionID)
 		return remoteSessionRestartedMsg{remoteName: remoteName, sessionID: sessionID, title: title, err: err}
+	}
+}
+
+// hardRestartSession starts a completely fresh Claude session (no --resume).
+func (h *Home) hardRestartSession(inst *session.Instance) tea.Cmd {
+	id := inst.ID
+	mcpUILog.Debug(
+		"hard_restart_session_called",
+		slog.String("id", inst.ID),
+		slog.String("title", inst.Title),
+		slog.String("tool", inst.Tool),
+	)
+	return func() tea.Msg {
+		mcpUILog.Debug("hard_restart_session_executing", slog.String("id", id))
+
+		h.instancesMu.RLock()
+		current := h.instanceByID[id]
+		h.instancesMu.RUnlock()
+		if current == nil {
+			err := fmt.Errorf("session no longer exists")
+			mcpUILog.Debug("hard_restart_session_result", slog.String("id", id), slog.Any("error", err))
+			return sessionRestartedMsg{sessionID: id, err: err}
+		}
+
+		err := current.HardRestart()
+		mcpUILog.Debug("hard_restart_session_result", slog.String("id", id), slog.Any("error", err))
+		return sessionRestartedMsg{
+			sessionID: id,
+			err:       err,
+		}
 	}
 }
 

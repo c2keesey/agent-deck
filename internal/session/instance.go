@@ -4058,8 +4058,84 @@ func (i *Instance) Restart() error {
 	return nil
 }
 
-// buildClaudeResumeCommand builds the claude resume command with proper config options
-// Respects: CLAUDE_CONFIG_DIR, dangerous_mode, and [shell].env_files + init_script
+// HardRestart starts a completely fresh Claude session, discarding the old session ID.
+// Unlike Restart() which uses --resume to continue the conversation, HardRestart clears
+// the session identity and builds a new claude command (with a new UUID). This fully
+// reloads MCPs and starts with a clean conversation.
+// Only works for Claude-compatible tools.
+func (i *Instance) HardRestart() error {
+	if !IsClaudeCompatible(i.Tool) {
+		return fmt.Errorf("hard restart is only supported for Claude-compatible tools")
+	}
+
+	mcpLog.Debug(
+		"hard_restart_called",
+		slog.String("tool", i.Tool),
+		slog.String("old_claude_session_id", i.ClaudeSessionID),
+		slog.Bool("tmux_session", i.tmuxSession != nil),
+	)
+
+	// Clear session identity — this is the core difference from soft restart
+	i.ClaudeSessionID = ""
+	i.ClaudeDetectedAt = time.Time{}
+
+	// Regenerate .mcp.json before restart
+	skipRegen := i.SkipMCPRegenerate
+	i.SkipMCPRegenerate = false
+	if !skipRegen {
+		if err := i.regenerateMCPConfig(); err != nil {
+			mcpLog.Warn("hard_restart_mcp_regen_failed", slog.String("error", err.Error()))
+		}
+	}
+
+	// Kill old tmux session
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		mcpLog.Debug("hard_restart_killing_old_session", slog.String("session_name", i.tmuxSession.Name))
+		if killErr := i.tmuxSession.Kill(); killErr != nil {
+			mcpLog.Warn("hard_restart_kill_failed", slog.String("error", killErr.Error()))
+		}
+	}
+
+	// Create a fresh tmux session
+	i.tmuxSession = tmux.NewSession(i.Title, i.ProjectPath)
+	i.tmuxSession.InstanceID = i.ID
+	i.tmuxSession.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
+
+	// Build a fresh claude command (no --resume, new UUID)
+	command := i.buildClaudeCommand(i.Command)
+	command, containerName, err := i.prepareCommand(command)
+	if err != nil {
+		return err
+	}
+	if containerName != "" {
+		i.SandboxContainer = containerName
+	}
+
+	i.loadCustomPatternsFromConfig()
+	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
+	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed()
+
+	mcpLog.Debug("hard_restart_starting_new_session", slog.String("command", command))
+
+	if err := i.tmuxSession.Start(command); err != nil {
+		i.Status = StatusError
+		return fmt.Errorf("failed to hard restart tmux session: %w", err)
+	}
+
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_INSTANCE_ID", i.ID); err != nil {
+		sessionLog.Warn("set_instance_id_failed", slog.String("error", err.Error()))
+	}
+
+	i.CaptureLoadedMCPs()
+	i.lastStartTime = time.Now()
+	i.Status = StatusStarting
+
+	mcpLog.Debug("hard_restart_succeeded")
+	return nil
+}
+
+// buildClaudeResumeCommand builds the Claude resume command with proper config options.
+// Respects: CLAUDE_CONFIG_DIR, use_happy, and dangerous_mode from user/session config.
 // CLAUDE_SESSION_ID is set via host-side SetEnvironment (called by SyncSessionIDsToTmux after restart)
 func (i *Instance) buildClaudeResumeCommand() string {
 	// Source env files and init_script so resumed sessions have the same
