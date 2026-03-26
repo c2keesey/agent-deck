@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -461,6 +462,15 @@ func (h *Home) detachByte() byte {
 	return ResolvedDetachByte(session.GetHotkeyOverrides())
 }
 
+func (h *Home) mruSwitchByte() byte {
+	bindings := resolveHotkeys(session.GetHotkeyOverrides())
+	key := actionHotkey(bindings, hotkeyMRUCycle)
+	if key == "" {
+		return 0
+	}
+	return DetachByteFromBinding(key)
+}
+
 func (h *Home) setHotkeys(bindings map[string]string) {
 	if bindings == nil {
 		bindings = resolveHotkeys(nil)
@@ -532,6 +542,7 @@ type refreshMsg struct{}
 type statusUpdateMsg struct {
 	attachedSessionID string // Session that just returned from attach (if local attach)
 	attachedWorkDir   string // pane_current_path captured after attach returns
+	mruSwitchFrom     string // If non-empty, MRU switch was requested from this session
 } // Triggers immediate status update without reloading
 
 // storageChangedMsg signals that state.db was modified externally
@@ -3766,6 +3777,17 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		h.followAttachReturnCwd(msg)
 
+		// MRU switch: user pressed Ctrl+W while attached — immediately attach to previous session
+		if msg.mruSwitchFrom != "" {
+			mruList := h.mruSortedSessions()
+			for _, inst := range mruList {
+				if inst.ID != msg.mruSwitchFrom && inst.Exists() {
+					h.moveCursorToSession(inst.ID)
+					return h, tea.Batch(tea.EnableMouseCellMotion, h.attachSession(inst))
+				}
+			}
+		}
+
 		// PERFORMANCE FIX: Skip save on attach return for 10 seconds
 		// Saving can also be blocking (JSON serialization + file write).
 		// Combine with periodic save instead of saving on every attach/detach.
@@ -4929,7 +4951,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Reset MRU cycle position on any key except the cycle key itself
-	if key != "`" {
+	if key != "ctrl+w" {
 		h.mruCycleIndex = 0
 	}
 
@@ -5869,7 +5891,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		h.rebuildFlatItems()
 
-	case "`":
+	case "ctrl+w":
 		// MRU cycle: jump through sessions sorted by most-recently-accessed
 		mruList := h.mruSortedSessions()
 		if len(mruList) < 2 {
@@ -7462,7 +7484,7 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 	// On return, immediately update all session statuses (don't reload from storage
 	// which would lose the tmux session state)
 	h.isAttaching.Store(true) // Prevent View() output only during actual attach transition
-	return tea.Exec(attachCmd{session: tmuxSess, detachByte: h.detachByte()}, func(err error) tea.Msg {
+	return tea.Exec(attachCmd{session: tmuxSess, detachByte: h.detachByte(), mruSwitchKey: h.mruSwitchByte()}, func(err error) tea.Msg {
 		// CRITICAL: Set isAttaching to false BEFORE returning the message
 		// This prevents a race condition where View() could be called with
 		// isAttaching=true before Update() processes statusUpdateMsg,
@@ -7483,7 +7505,15 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 		// Capture current pane CWD after attach returns for optional path follow.
 		currentWorkDir := strings.TrimSpace(tmuxSess.GetWorkDir())
 
-		return statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: currentWorkDir}
+		msg := statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: currentWorkDir}
+
+		// If the user pressed Ctrl+W (MRU switch), signal that we should
+		// immediately attach to the previous session
+		if errors.Is(err, tmux.ErrMRUSwitch) {
+			msg.mruSwitchFrom = inst.ID
+		}
+
+		return msg
 	})
 }
 
@@ -7541,8 +7571,9 @@ func (h *Home) followAttachReturnCwd(msg statusUpdateMsg) {
 
 // attachCmd implements tea.ExecCommand for custom PTY attach
 type attachCmd struct {
-	session    *tmux.Session
-	detachByte byte
+	session      *tmux.Session
+	detachByte   byte
+	mruSwitchKey byte
 }
 
 func (a attachCmd) Run() error {
@@ -7557,7 +7588,10 @@ func (a attachCmd) Run() error {
 	defer DisableKittyKeyboard(os.Stdout)
 
 	ctx := context.Background()
-	return a.session.Attach(ctx, a.detachByte)
+	return a.session.AttachWithOpts(ctx, tmux.AttachOpts{
+		DetachByte:   a.detachByte,
+		MRUSwitchKey: a.mruSwitchKey,
+	})
 }
 
 func (a attachCmd) SetStdin(r io.Reader)  {}

@@ -19,6 +19,10 @@ import (
 	"golang.org/x/term"
 )
 
+// ErrMRUSwitch is returned by Attach when the user presses the MRU switch key
+// instead of the detach key. The caller should switch to the previous session.
+var ErrMRUSwitch = fmt.Errorf("mru switch requested")
+
 // IndexDetachKey returns the index of a control-key sequence in data, or -1 if
 // not found. detachByte is the raw ASCII byte (e.g. 0x11 for Ctrl+Q).
 // Handles three encodings:
@@ -55,6 +59,12 @@ func IndexCtrlQ(data []byte) int {
 	return IndexDetachKey(data, 17)
 }
 
+// AttachOpts configures the Attach call.
+type AttachOpts struct {
+	DetachByte   byte // default 0x11 (Ctrl+Q)
+	MRUSwitchKey byte // if non-zero, this key triggers ErrMRUSwitch instead of detach
+}
+
 // Attach attaches to the tmux session with full PTY support.
 // The configured detach key (default Ctrl+Q) will detach and return to the caller.
 // Pass an optional detachByte to override the default (0x11 / Ctrl+Q).
@@ -63,6 +73,16 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 	if len(detachByte) > 0 && detachByte[0] != 0 {
 		detach = detachByte[0]
 	}
+	return s.AttachWithOpts(ctx, AttachOpts{DetachByte: detach})
+}
+
+// AttachWithOpts attaches to the tmux session with configurable detach and MRU switch keys.
+func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
+	detach := opts.DetachByte
+	if detach == 0 {
+		detach = 17
+	}
+	mruSwitch := opts.MRUSwitchKey
 
 	if !s.Exists() {
 		return fmt.Errorf("session %s does not exist", s.Name)
@@ -142,8 +162,9 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 	// Initial resize
 	sigwinch <- syscall.SIGWINCH
 
-	// Channel to signal detach
-	detachCh := make(chan struct{})
+	// Channel to signal detach via configured detach key.
+	// Sends true for MRU switch, false for normal detach.
+	detachCh := make(chan bool, 1)
 
 	// Channel for I/O errors (buffered to prevent goroutine leaks)
 	ioErrors := make(chan error, 2)
@@ -195,6 +216,24 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 				continue
 			}
 
+			// Check for MRU switch key (if configured) before detach key.
+			if mruSwitch != 0 {
+				if idx := IndexDetachKey(buf[:n], mruSwitch); idx >= 0 {
+					if idx > 0 {
+						if _, err := ptmx.Write(buf[:idx]); err != nil {
+							select {
+							case ioErrors <- fmt.Errorf("PTY write error: %w", err):
+							default:
+							}
+							return
+						}
+					}
+					detachCh <- true // MRU switch
+					cancel()
+					return
+				}
+			}
+
 			// Check for the detach key anywhere in the input chunk.
 			// Some terminals coalesce reads, so detach must not require a single-byte read.
 			// Handles raw byte, xterm modifyOtherKeys, and kitty CSI u encodings.
@@ -209,7 +248,7 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 						return
 					}
 				}
-				close(detachCh)
+				detachCh <- false // normal detach
 				cancel()
 				return
 			}
@@ -251,9 +290,12 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 	// Wait for either detach or command completion
 	var attachErr error
 	select {
-	case <-detachCh:
-		// User pressed the detach key, detach gracefully
-		attachErr = nil
+	case isMRU := <-detachCh:
+		if isMRU {
+			attachErr = ErrMRUSwitch
+		} else {
+			attachErr = nil
+		}
 	case err := <-cmdDone:
 		if err != nil {
 			// Check if it's a normal exit (tmux detach via Ctrl+B,D)

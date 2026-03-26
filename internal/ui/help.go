@@ -153,7 +153,7 @@ func (h *HelpOverlay) View() string {
 	worktreeKey := h.key(hotkeyWorktreeFinish, "W")
 	groupKey := h.key(hotkeyCreateGroup, "g")
 	undoKey := h.key(hotkeyUndoDelete, "Ctrl+Z")
-	mruKey := h.key(hotkeyMRUCycle, "`")
+	mruKey := h.key(hotkeyMRUCycle, "Ctrl+W")
 
 	sections := []struct {
 		title string

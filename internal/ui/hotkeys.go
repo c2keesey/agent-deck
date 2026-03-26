@@ -103,7 +103,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyImport:          "i",
 	hotkeyReload:          "ctrl+r",
 	hotkeyDetach:          "ctrl+q",
-	hotkeyMRUCycle:        "`",
+	hotkeyMRUCycle:        "ctrl+w",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{
