@@ -461,6 +461,15 @@ func (h *Home) reloadHotkeysFromConfig() {
 	h.setHotkeys(resolveHotkeys(session.GetHotkeyOverrides()))
 }
 
+// resetMouseModes is a tea.Cmd that disables all mouse reporting modes.
+// This ensures the terminal is in a clean state before Bubble Tea re-enables
+// its own mouse mode, preventing Shift from being captured as text selection.
+func resetMouseModes() tea.Msg {
+	// Disable: X10 (1000), cell-motion (1002), all-motion (1003), SGR (1006)
+	_, _ = os.Stdout.WriteString("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")
+	return nil
+}
+
 func (h *Home) detachByte() byte {
 	return ResolvedDetachByte(session.GetHotkeyOverrides())
 }
@@ -3775,7 +3784,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		reloading := h.isReloading
 		h.reloadMu.Unlock()
 		if reloading {
-			return h, tea.EnableMouseCellMotion
+			return h, tea.Sequence(resetMouseModes, tea.EnableMouseCellMotion)
 		}
 
 		h.followAttachReturnCwd(msg)
@@ -3809,7 +3818,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				target := h.mruCycleSnapshot[h.mruCycleIndex]
 				if target.Exists() {
 					h.moveCursorToSession(target.ID)
-					return h, tea.Batch(tea.EnableMouseCellMotion, h.attachSession(target))
+					return h, tea.Batch(tea.Sequence(resetMouseModes, tea.EnableMouseCellMotion), h.attachSession(target))
 				}
 			}
 		}
@@ -3822,7 +3831,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Re-enable mouse mode after returning from tea.Exec.
 		// tmux detach-client sends terminal reset sequences that disable mouse reporting,
 		// and Bubble Tea doesn't re-enable it automatically after exec returns.
-		return h, tea.EnableMouseCellMotion
+		// First disable ALL mouse modes to reset terminal state cleanly — without this,
+		// Ghostty (and other terminals) can get stuck interpreting Shift as text selection.
+		return h, tea.Sequence(resetMouseModes, tea.EnableMouseCellMotion)
 
 	case previewDebounceMsg:
 		// PERFORMANCE: Debounce period elapsed - check if this fetch is still relevant
