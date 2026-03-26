@@ -403,7 +403,9 @@ type Home struct {
 	lastNotifSwitchMu sync.Mutex
 
 	// MRU session cycling (alt-tab style)
-	mruCycleIndex int // Current position in the MRU list (-1 = not cycling)
+	mruCycleIndex    int                  // Current position in the MRU list
+	mruCycleSnapshot []*session.Instance  // Frozen MRU list during a switch chain
+	mruCycleOrigin   string               // Session ID where the chain started
 
 	// Undo delete stack (Chrome-style: Ctrl+Z restores in reverse order)
 	undoStack []deletedSessionEntry
@@ -3777,13 +3779,33 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		h.followAttachReturnCwd(msg)
 
-		// MRU switch: user pressed Ctrl+W while attached — immediately attach to previous session
+		// Reset MRU chain on normal detach (not an MRU switch)
+		if msg.mruSwitchFrom == "" {
+			h.mruCycleSnapshot = nil
+			h.mruCycleOrigin = ""
+			h.mruCycleIndex = 0
+		}
+
+		// MRU switch: user pressed Ctrl+W while attached — attach to next MRU session.
+		// Uses a frozen snapshot so consecutive Ctrl+W presses cycle through the
+		// full list instead of bouncing between two sessions.
 		if msg.mruSwitchFrom != "" {
-			mruList := h.mruSortedSessions()
-			for _, inst := range mruList {
-				if inst.ID != msg.mruSwitchFrom && inst.Exists() {
-					h.moveCursorToSession(inst.ID)
-					return h, tea.Batch(tea.EnableMouseCellMotion, h.attachSession(inst))
+			// Start a new chain or continue existing one
+			if h.mruCycleSnapshot == nil || h.mruCycleOrigin == "" {
+				h.mruCycleSnapshot = h.mruSortedSessions()
+				h.mruCycleOrigin = msg.mruSwitchFrom
+				h.mruCycleIndex = 0
+			}
+			if len(h.mruCycleSnapshot) >= 2 {
+				h.mruCycleIndex = (h.mruCycleIndex + 1) % len(h.mruCycleSnapshot)
+				// Skip the origin session (index 0)
+				if h.mruCycleIndex == 0 {
+					h.mruCycleIndex = 1
+				}
+				target := h.mruCycleSnapshot[h.mruCycleIndex]
+				if target.Exists() {
+					h.moveCursorToSession(target.ID)
+					return h, tea.Batch(tea.EnableMouseCellMotion, h.attachSession(target))
 				}
 			}
 		}
@@ -4953,6 +4975,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Reset MRU cycle position on any key except the cycle key itself
 	if key != "ctrl+w" {
 		h.mruCycleIndex = 0
+		h.mruCycleSnapshot = nil
+		h.mruCycleOrigin = ""
 	}
 
 	switch key {
@@ -5892,18 +5916,21 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.rebuildFlatItems()
 
 	case "ctrl+w":
-		// MRU cycle: jump through sessions sorted by most-recently-accessed
-		mruList := h.mruSortedSessions()
-		if len(mruList) < 2 {
+		// MRU cycle: jump through sessions sorted by most-recently-accessed.
+		// Freeze the MRU snapshot on first press so MarkAccessed doesn't re-sort.
+		if h.mruCycleSnapshot == nil {
+			h.mruCycleSnapshot = h.mruSortedSessions()
+			h.mruCycleIndex = 0
+		}
+		if len(h.mruCycleSnapshot) < 2 {
 			return h, nil
 		}
-		// Advance the cycle index (wraps around)
-		h.mruCycleIndex = (h.mruCycleIndex + 1) % len(mruList)
-		// Skip the current session (index 0 is most recent = current)
+		h.mruCycleIndex = (h.mruCycleIndex + 1) % len(h.mruCycleSnapshot)
+		// Skip index 0 (the session where cycling started)
 		if h.mruCycleIndex == 0 {
 			h.mruCycleIndex = 1
 		}
-		h.moveCursorToSession(mruList[h.mruCycleIndex].ID)
+		h.moveCursorToSession(h.mruCycleSnapshot[h.mruCycleIndex].ID)
 		return h, nil
 	}
 
