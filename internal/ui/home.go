@@ -406,6 +406,7 @@ type Home struct {
 	mruCycleIndex    int                  // Current position in the MRU list
 	mruCycleSnapshot []*session.Instance  // Frozen MRU list during a switch chain
 	mruCycleOrigin   string               // Session ID where the chain started
+	mruCycleLastSwitch time.Time          // When the last Ctrl+W was pressed
 
 	// Undo delete stack (Chrome-style: Ctrl+Z restores in reverse order)
 	undoStack []deletedSessionEntry
@@ -3784,18 +3785,21 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.mruCycleSnapshot = nil
 			h.mruCycleOrigin = ""
 			h.mruCycleIndex = 0
+			h.mruCycleLastSwitch = time.Time{}
 		}
 
 		// MRU switch: user pressed Ctrl+W while attached — attach to next MRU session.
 		// Uses a frozen snapshot so consecutive Ctrl+W presses cycle through the
 		// full list instead of bouncing between two sessions.
 		if msg.mruSwitchFrom != "" {
-			// Start a new chain or continue existing one
-			if h.mruCycleSnapshot == nil || h.mruCycleOrigin == "" {
+			// Start a new chain, or reset if more than 3 seconds since last switch
+			stale := !h.mruCycleLastSwitch.IsZero() && time.Since(h.mruCycleLastSwitch) > 3*time.Second
+			if h.mruCycleSnapshot == nil || h.mruCycleOrigin == "" || stale {
 				h.mruCycleSnapshot = h.mruSortedSessions()
 				h.mruCycleOrigin = msg.mruSwitchFrom
 				h.mruCycleIndex = 0
 			}
+			h.mruCycleLastSwitch = time.Now()
 			if len(h.mruCycleSnapshot) >= 2 {
 				h.mruCycleIndex = (h.mruCycleIndex + 1) % len(h.mruCycleSnapshot)
 				// Skip the origin session (index 0)
@@ -4977,6 +4981,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.mruCycleIndex = 0
 		h.mruCycleSnapshot = nil
 		h.mruCycleOrigin = ""
+		h.mruCycleLastSwitch = time.Time{}
 	}
 
 	switch key {
@@ -5918,10 +5923,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+w":
 		// MRU cycle: jump through sessions sorted by most-recently-accessed.
 		// Freeze the MRU snapshot on first press so MarkAccessed doesn't re-sort.
-		if h.mruCycleSnapshot == nil {
+		// Reset if stale (>3s since last press).
+		stale := !h.mruCycleLastSwitch.IsZero() && time.Since(h.mruCycleLastSwitch) > 3*time.Second
+		if h.mruCycleSnapshot == nil || stale {
 			h.mruCycleSnapshot = h.mruSortedSessions()
 			h.mruCycleIndex = 0
 		}
+		h.mruCycleLastSwitch = time.Now()
 		if len(h.mruCycleSnapshot) < 2 {
 			return h, nil
 		}
