@@ -4126,9 +4126,17 @@ func (i *Instance) HardRestart() error {
 		sessionLog.Warn("set_instance_id_failed", slog.String("error", err.Error()))
 	}
 
+	// Propagate tool session IDs to tmux environment (host-side)
+	i.SyncSessionIDsToTmux()
+
 	i.CaptureLoadedMCPs()
 	i.lastStartTime = time.Now()
-	i.Status = StatusStarting
+
+	if command != "" {
+		i.Status = StatusWaiting
+	} else {
+		i.Status = StatusIdle
+	}
 
 	mcpLog.Debug("hard_restart_succeeded")
 	return nil
