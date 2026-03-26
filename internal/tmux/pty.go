@@ -172,7 +172,12 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 	// Timeout to ignore initial terminal control sequences (50ms)
 	startTime := time.Now()
 	const controlSeqTimeout = 50 * time.Millisecond
-	const terminalStyleReset = "\x1b]8;;\x1b\\\x1b[0m\x1b[24m\x1b[39m\x1b[49m"
+	// Reset OSC-8, SGR attributes, AND fully disable all mouse modes before
+	// Bubble Tea re-enables mouse reporting. Without this, tmux detach can leave
+	// mouse state dirty, causing Shift to trigger text selection instead of
+	// sending Shift+key to the application.
+	const terminalStyleReset = "\x1b]8;;\x1b\\\x1b[0m\x1b[24m\x1b[39m\x1b[49m" +
+		"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" // disable all mouse modes
 	outputDone := make(chan struct{})
 
 	// Goroutine 1: Copy PTY output to stdout
