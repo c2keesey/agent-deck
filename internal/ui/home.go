@@ -401,6 +401,9 @@ type Home struct {
 	lastNotifSwitchID string
 	lastNotifSwitchMu sync.Mutex
 
+	// MRU session cycling (alt-tab style)
+	mruCycleIndex int // Current position in the MRU list (-1 = not cycling)
+
 	// Undo delete stack (Chrome-style: Ctrl+Z restores in reverse order)
 	undoStack []deletedSessionEntry
 
@@ -1210,6 +1213,30 @@ func (h *Home) moveCursorToGroup(path string) {
 			return
 		}
 	}
+}
+
+// mruSortedSessions returns all sessions sorted by LastAccessedAt (most recent first).
+// Sessions that have never been accessed are sorted to the end by creation order.
+func (h *Home) mruSortedSessions() []*session.Instance {
+	h.instancesMu.RLock()
+	result := make([]*session.Instance, len(h.instances))
+	copy(result, h.instances)
+	h.instancesMu.RUnlock()
+
+	sort.SliceStable(result, func(i, j int) bool {
+		ti := result[i].LastAccessedAt
+		tj := result[j].LastAccessedAt
+		// Both accessed: most recent first
+		if !ti.IsZero() && !tj.IsZero() {
+			return ti.After(tj)
+		}
+		// Accessed beats never-accessed
+		if !ti.IsZero() {
+			return true
+		}
+		return false
+	})
+	return result
 }
 
 // rebuildFlatItems rebuilds the flattened view from group tree
@@ -4901,6 +4928,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 	}
 
+	// Reset MRU cycle position on any key except the cycle key itself
+	if key != "`" {
+		h.mruCycleIndex = 0
+	}
+
 	switch key {
 	case "q", "ctrl+c":
 		return h.tryQuit()
@@ -5836,6 +5868,20 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.statusFilter = FilterModeActive
 		}
 		h.rebuildFlatItems()
+
+	case "`":
+		// MRU cycle: jump through sessions sorted by most-recently-accessed
+		mruList := h.mruSortedSessions()
+		if len(mruList) < 2 {
+			return h, nil
+		}
+		// Advance the cycle index (wraps around)
+		h.mruCycleIndex = (h.mruCycleIndex + 1) % len(mruList)
+		// Skip the current session (index 0 is most recent = current)
+		if h.mruCycleIndex == 0 {
+			h.mruCycleIndex = 1
+		}
+		h.moveCursorToSession(mruList[h.mruCycleIndex].ID)
 		return h, nil
 	}
 

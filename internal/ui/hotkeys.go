@@ -37,6 +37,7 @@ const (
 	hotkeyImport          = "import"
 	hotkeyReload          = "reload"
 	hotkeyDetach          = "detach"
+	hotkeyMRUCycle        = "mru_cycle"
 )
 
 var hotkeyActionOrder = []string{
@@ -69,6 +70,7 @@ var hotkeyActionOrder = []string{
 	hotkeyImport,
 	hotkeyReload,
 	hotkeyDetach,
+	hotkeyMRUCycle,
 }
 
 var defaultHotkeyBindings = map[string]string{
@@ -101,6 +103,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyImport:          "i",
 	hotkeyReload:          "ctrl+r",
 	hotkeyDetach:          "ctrl+q",
+	hotkeyMRUCycle:        "`",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{
