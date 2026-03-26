@@ -48,3 +48,5 @@ Thumbs.db
 
 .worktrees
 agent-deck-test
+.ad-sync.log
+excalidraw.log

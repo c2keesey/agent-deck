@@ -1,7 +1,0 @@
-[15:09:43] SKIP: working tree dirty
-[15:10:07] Pulled 3 new commits from upstream
-Rebasing (1/7)Rebasing (2/7)Rebasing (3/7)Rebasing (4/7)Rebasing (5/7)Rebasing (6/7)Rebasing (7/7)Successfully rebased and updated refs/heads/local.
-[15:10:08] Rebase succeeded (no conflicts)
-go build -ldflags "-X main.Version=v0.23.0-259-g93feb69" -o ./build/agent-deck ./cmd/agent-deck
-[15:10:10] Build succeeded
-[16:00:01] No upstream changes
