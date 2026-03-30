@@ -124,33 +124,33 @@ func (h *HelpOverlay) View() string {
 	}
 
 	// Define help sections
-	newKeys := h.keyPair(hotkeyNewSession, hotkeyQuickCreate, "n/N")
-	forkKeys := h.keyPair(hotkeyQuickFork, hotkeyForkWithOptions, "f/F")
+	newKeys := h.keyPair(hotkeyNewSession, hotkeyQuickCreate, "n/a")
+	forkKeys := h.keyPair(hotkeyQuickFork, hotkeyForkWithOptions, "f/Ctrl+F")
 	reorderKeys := "K / J"
 	searchKey := h.key(hotkeySearch, "/")
-	settingsKey := h.key(hotkeySettings, "S")
+	settingsKey := h.key(hotkeySettings, "p")
 	helpKey := h.key(hotkeyHelp, "?")
 	quitKey := h.key(hotkeyQuit, "q")
 	importKey := h.key(hotkeyImport, "i")
 	reloadKey := h.key(hotkeyReload, "Ctrl+R")
 	deleteKey := h.key(hotkeyDelete, "d")
-	closeKey := h.key(hotkeyCloseSession, "D")
-	restartKey := h.key(hotkeyRestart, "Shift+R")
-	hardRestartKey := h.key(hotkeyHardRestart, "Shift+H")
+	closeKey := h.key(hotkeyCloseSession, "Ctrl+D")
+	restartKey := h.key(hotkeyRestart, "t")
+	hardRestartKey := h.key(hotkeyHardRestart, "Ctrl+T")
 	renameKey := h.key(hotkeyRename, "r")
-	moveKey := h.key(hotkeyMoveToGroup, "M")
+	moveKey := h.key(hotkeyMoveToGroup, "Ctrl+G")
 	mcpKey := h.key(hotkeyMCPManager, "m")
 	skillsKey := h.key(hotkeySkillsManager, "s")
 	previewKey := h.key(hotkeyTogglePreview, "v")
 	unreadKey := h.key(hotkeyMarkUnread, "u")
 	copyKey := h.key(hotkeyCopyOutput, "c")
 	sendKey := h.key(hotkeySendOutput, "x")
-	execShellKey := h.key(hotkeyExecShell, "E")
+	execShellKey := h.key(hotkeyExecShell, "b")
 	notesKey := h.key(hotkeyEditNotes, "e")
 	if cfg, _ := session.LoadUserConfig(); cfg != nil && !cfg.GetShowNotes() {
 		notesKey = ""
 	}
-	worktreeKey := h.key(hotkeyWorktreeFinish, "W")
+	worktreeKey := h.key(hotkeyWorktreeFinish, "w")
 	groupKey := h.key(hotkeyCreateGroup, "g")
 	undoKey := h.key(hotkeyUndoDelete, "Ctrl+Z")
 	mruKey := h.key(hotkeyMRUCycle, "Ctrl+W")
