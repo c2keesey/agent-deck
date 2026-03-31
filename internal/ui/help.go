@@ -134,7 +134,7 @@ func (h *HelpOverlay) View() string {
 	importKey := h.key(hotkeyImport, "i")
 	reloadKey := h.key(hotkeyReload, "Ctrl+R")
 	deleteKey := h.key(hotkeyDelete, "d")
-	closeKey := h.key(hotkeyCloseSession, "Ctrl+D")
+	closeKey := h.key(hotkeyCloseSession, "Ctrl+X")
 	restartKey := h.key(hotkeyRestart, "t")
 	hardRestartKey := h.key(hotkeyHardRestart, "Ctrl+T")
 	renameKey := h.key(hotkeyRename, "r")

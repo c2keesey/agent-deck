@@ -81,7 +81,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyRestart:         "t",
 	hotkeyHardRestart:     "ctrl+t",
 	hotkeyDelete:          "d",
-	hotkeyCloseSession:    "ctrl+d",
+	hotkeyCloseSession:    "ctrl+x",
 	hotkeyUndoDelete:      "ctrl+z",
 	hotkeyMoveToGroup:     "ctrl+g",
 	hotkeyMCPManager:      "m",
@@ -108,9 +108,9 @@ var defaultHotkeyBindings = map[string]string{
 
 var hotkeyActionDefaultTriggers = map[string][]string{
 	hotkeyQuit:            {"q", "ctrl+c"},
-	hotkeyForkWithOptions: {"F", "shift+f"},
-	hotkeyMoveToGroup:     {"M", "shift+m"},
-	hotkeyWorktreeFinish:  {"W", "shift+w"},
+	hotkeyForkWithOptions: {"ctrl+f"},
+	hotkeyMoveToGroup:     {"ctrl+g"},
+	hotkeyWorktreeFinish:  {"w"},
 }
 
 // renamedHotkeys maps old action names to new names for backward compatibility.

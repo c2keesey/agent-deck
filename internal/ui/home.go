@@ -5477,13 +5477,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.helpOverlay.Show()
 		return h, nil
 
-	case "S":
+	case "p":
 		// Open settings panel
 		h.settingsPanel.Show()
 		h.settingsPanel.SetSize(h.width, h.height)
 		return h, nil
 
-	case "E":
+	case "b":
 		// Exec an interactive shell inside the sandbox container.
 		if selected := h.getSelectedSession(); selected != nil && selected.IsSandboxed() &&
 			selected.SandboxContainer != "" {
@@ -5603,7 +5603,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.newDialog.ShowInGroup(groupPath, groupName, defaultPath, conductors, suggestedParentID)
 		return h, nil
 
-	case "N":
+	case "a":
 		// Check if cursor is on a remote group/session — create on remote instead
 		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -5630,7 +5630,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "D":
+	case "ctrl+x":
 		// Close session process without deleting metadata from the list/storage.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -5733,7 +5733,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "R":
+	case "t":
 		// Restart session (recreate tmux session with resume)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -5754,7 +5754,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "H":
+	case "ctrl+t":
 		// Hard restart session (fresh claude session, no --resume)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
