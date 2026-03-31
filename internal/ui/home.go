@@ -5325,7 +5325,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "F", "shift+f":
+	case "z":
 		// Fork with dialog (customize title and group)
 		// Only available when session has a valid Claude session ID
 		if h.cursor < len(h.flatItems) {
@@ -5357,7 +5357,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "M", "shift+m":
+	case "o":
 		// Move session to different group
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -5367,7 +5367,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "W", "shift+w":
+	case "w":
 		// Worktree finish - merge + cleanup for worktree sessions
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]

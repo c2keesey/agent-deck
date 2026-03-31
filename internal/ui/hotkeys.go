@@ -90,7 +90,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyMarkUnread:      "u",
 	hotkeyToggleYolo:      "y",
 	hotkeyQuickFork:       "f",
-	hotkeyForkWithOptions: "ctrl+f",
+	hotkeyForkWithOptions: "z",
 	hotkeyCopyOutput:      "c",
 	hotkeySendOutput:      "x",
 	hotkeyExecShell:       "b",
@@ -108,7 +108,7 @@ var defaultHotkeyBindings = map[string]string{
 
 var hotkeyActionDefaultTriggers = map[string][]string{
 	hotkeyQuit:            {"q", "ctrl+c"},
-	hotkeyForkWithOptions: {"ctrl+f"},
+	hotkeyForkWithOptions: {"z"},
 	hotkeyMoveToGroup:     {"o"},
 	hotkeyWorktreeFinish:  {"w"},
 }

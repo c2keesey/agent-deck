@@ -125,7 +125,7 @@ func (h *HelpOverlay) View() string {
 
 	// Define help sections
 	newKeys := h.keyPair(hotkeyNewSession, hotkeyQuickCreate, "n/a")
-	forkKeys := h.keyPair(hotkeyQuickFork, hotkeyForkWithOptions, "f/Ctrl+F")
+	forkKeys := h.keyPair(hotkeyQuickFork, hotkeyForkWithOptions, "f/z")
 	reorderKeys := "K / J"
 	searchKey := h.key(hotkeySearch, "/")
 	settingsKey := h.key(hotkeySettings, "p")
