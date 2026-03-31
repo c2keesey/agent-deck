@@ -138,7 +138,7 @@ func (h *HelpOverlay) View() string {
 	restartKey := h.key(hotkeyRestart, "t")
 	hardRestartKey := h.key(hotkeyHardRestart, "Ctrl+T")
 	renameKey := h.key(hotkeyRename, "r")
-	moveKey := h.key(hotkeyMoveToGroup, "Ctrl+G")
+	moveKey := h.key(hotkeyMoveToGroup, "Ctrl+O")
 	mcpKey := h.key(hotkeyMCPManager, "m")
 	skillsKey := h.key(hotkeySkillsManager, "s")
 	previewKey := h.key(hotkeyTogglePreview, "v")

@@ -83,7 +83,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyDelete:          "d",
 	hotkeyCloseSession:    "ctrl+x",
 	hotkeyUndoDelete:      "ctrl+z",
-	hotkeyMoveToGroup:     "ctrl+g",
+	hotkeyMoveToGroup:     "ctrl+o",
 	hotkeyMCPManager:      "m",
 	hotkeySkillsManager:   "s",
 	hotkeyTogglePreview:   "v",
@@ -109,7 +109,7 @@ var defaultHotkeyBindings = map[string]string{
 var hotkeyActionDefaultTriggers = map[string][]string{
 	hotkeyQuit:            {"q", "ctrl+c"},
 	hotkeyForkWithOptions: {"ctrl+f"},
-	hotkeyMoveToGroup:     {"ctrl+g"},
+	hotkeyMoveToGroup:     {"ctrl+o"},
 	hotkeyWorktreeFinish:  {"w"},
 }
 
