@@ -176,6 +176,11 @@ type Instance struct {
 	// that runs from UpdateStatus while this instance lock is held.
 	lastSessionMetaSync time.Time
 
+	// Rate-limits filesystem-based session ID detection (syncClaudeSessionFromDisk)
+	// for sessions that were started without pre-generating a session ID
+	// (e.g., -c/continue mode, -r/interactive resume).
+	lastDiskSessionSync time.Time
+
 	// SkipMCPRegenerate skips .mcp.json regeneration on next Restart()
 	// Set by MCP dialog Apply() to avoid race condition where Apply writes
 	// config then Restart immediately overwrites it with different pool state
@@ -2511,9 +2516,11 @@ func (i *Instance) UpdateStatus() error {
 
 // UpdateClaudeSession updates the Claude session ID from tmux environment.
 // The capture-resume pattern (used in Start/Fork/Restart) sets CLAUDE_SESSION_ID
-// in the tmux environment, making this the single authoritative source.
+// in the tmux environment, making this the primary source.
 //
-// No file scanning fallback - we rely on the consistent capture-resume pattern.
+// Self-heals when tmux env is missing: syncs existing session ID back to tmux.
+// Falls back to disk scanning for sessions started without a pre-generated ID
+// (e.g., -c/continue mode, -r/interactive resume).
 func (i *Instance) UpdateClaudeSession(excludeIDs map[string]bool) {
 	if !IsClaudeCompatible(i.Tool) {
 		return
@@ -2556,6 +2563,23 @@ func (i *Instance) UpdateClaudeSession(excludeIDs map[string]bool) {
 			}
 		}
 		i.ClaudeDetectedAt = time.Now()
+	} else if i.ClaudeSessionID != "" {
+		// Self-heal: tmux env is missing the session ID but we have one
+		// (from storage, hook, or disk sync). Sync it back to tmux so
+		// subsequent cycles take the fast path, and refresh detection time
+		// so fork/restart remain available.
+		if i.tmuxSession != nil && i.tmuxSession.Exists() {
+			_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", i.ClaudeSessionID)
+		}
+		i.ClaudeDetectedAt = time.Now()
+	} else {
+		// No tmux env AND no session ID. This happens for sessions started
+		// with -c (continue) or -r (interactive resume) where no session ID
+		// was pre-generated. Rate-limited disk scan to detect the session.
+		if i.lastDiskSessionSync.IsZero() || time.Since(i.lastDiskSessionSync) >= 10*time.Second {
+			i.lastDiskSessionSync = time.Now()
+			i.syncClaudeSessionFromDisk()
+		}
 	}
 
 	// Update latest prompt from JSONL file (tail-read with size caching)

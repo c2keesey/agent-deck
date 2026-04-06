@@ -686,8 +686,8 @@ func TestInstance_UpdateClaudeSession_TmuxFirst(t *testing.T) {
 }
 
 // TestInstance_UpdateClaudeSession_PreservesExistingID verifies that existing
-// session IDs from storage are preserved when tmux env is empty.
-// With the new tmux-only approach, we only update when tmux env has a value.
+// session IDs from storage are preserved and detection time is refreshed
+// (self-heal) when tmux env is empty but we have a stored session ID.
 func TestInstance_UpdateClaudeSession_PreservesExistingID(t *testing.T) {
 	// Create instance with known session ID (simulating loaded from storage)
 	inst := NewInstanceWithTool("preserve-id-test", "/tmp", "claude")
@@ -696,18 +696,21 @@ func TestInstance_UpdateClaudeSession_PreservesExistingID(t *testing.T) {
 	oldDetectedAt := time.Now().Add(-10 * time.Minute)
 	inst.ClaudeDetectedAt = oldDetectedAt
 
-	// Call UpdateClaudeSession - without tmux session, nothing should change
+	// Call UpdateClaudeSession - without tmux session, self-heal should refresh detection time
 	inst.UpdateClaudeSession(nil)
 
-	// Existing session ID must be preserved (tmux env is empty, so no change)
+	// Existing session ID must be preserved
 	if inst.ClaudeSessionID != existingID {
 		t.Errorf("ClaudeSessionID was changed from %q to %q - should preserve stored ID when tmux env is empty",
 			existingID, inst.ClaudeSessionID)
 	}
 
-	// Timestamp should NOT change (no tmux env = no update)
-	if inst.ClaudeDetectedAt != oldDetectedAt {
-		t.Error("ClaudeDetectedAt should not change when tmux env is empty")
+	// Detection time should be refreshed (self-heal keeps fork/restart available)
+	if inst.ClaudeDetectedAt == oldDetectedAt {
+		t.Error("ClaudeDetectedAt should be refreshed by self-heal when session ID exists but tmux env is empty")
+	}
+	if time.Since(inst.ClaudeDetectedAt) > 5*time.Second {
+		t.Error("ClaudeDetectedAt should be recent after self-heal")
 	}
 }
 
