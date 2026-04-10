@@ -4618,9 +4618,9 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if command == "claude" && claudeOpts != nil {
 			toolOptionsJSON, _ = session.MarshalToolOptions(claudeOpts)
 		} else if command == "codex" {
-			if codexOpts := h.newDialog.GetCodexOptions(); codexOpts != nil {
-				toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
-			}
+			yolo := h.newDialog.GetCodexYoloMode()
+			codexOpts := &session.CodexOptions{YoloMode: &yolo}
+			toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
 		}
 
 		parentSessionID := h.newDialog.GetParentSessionID()
