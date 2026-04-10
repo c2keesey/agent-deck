@@ -3222,6 +3222,19 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case branchPickerResultMsg:
+		if h.newDialog.IsVisible() {
+			var cmd tea.Cmd
+			h.newDialog, cmd = h.newDialog.Update(msg)
+			return h, cmd
+		}
+		if h.forkDialog.IsVisible() {
+			var cmd tea.Cmd
+			h.forkDialog, cmd = h.forkDialog.Update(msg)
+			return h, cmd
+		}
+		return h, nil
+
 	case sessionCreatedMsg:
 		// Remove the creating placeholder (if any) — always, on success or error
 		if msg.tempID != "" {
@@ -4223,6 +4236,15 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case tea.KeyMsg:
+		// Temporary key diagnostic — writes directly to /tmp/agentdeck-keys.log
+		if f, err := os.OpenFile("/tmp/agentdeck-keys.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			fmt.Fprintf(f, "key raw=%q type=%d runes=%q jump=%v wizard=%v settings=%v help=%v search=%v newdlg=%v costdash=%v notes=%v skill=%v\n",
+				msg.String(), msg.Type, string(msg.Runes),
+				h.jumpMode, h.setupWizard.IsVisible(), h.settingsPanel.IsVisible(),
+				h.helpOverlay.IsVisible(), h.search.IsVisible(), h.newDialog.IsVisible(),
+				h.showCostDashboard, h.notesEditing, h.skillDialog.IsVisible())
+			f.Close()
+		}
 		// Track user activity for adaptive status updates
 		h.lastUserInputTime = time.Now()
 
@@ -4596,9 +4618,9 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if command == "claude" && claudeOpts != nil {
 			toolOptionsJSON, _ = session.MarshalToolOptions(claudeOpts)
 		} else if command == "codex" {
-			yolo := h.newDialog.GetCodexYoloMode()
-			codexOpts := &session.CodexOptions{YoloMode: &yolo}
-			toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
+			if codexOpts := h.newDialog.GetCodexOptions(); codexOpts != nil {
+				toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
+			}
 		}
 
 		parentSessionID := h.newDialog.GetParentSessionID()
@@ -4973,7 +4995,9 @@ func (h *Home) mouseYToItemIndex(y int) int {
 
 // handleMainKey handles keys in main view
 func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	key := h.normalizeMainKey(msg.String())
+	raw := msg.String()
+	key := h.normalizeMainKey(raw)
+	uiLog.Info("keypress", "raw", raw, "normalized", key, "type", msg.Type, "runes", string(msg.Runes))
 	if key == "" {
 		return h, nil
 	}
@@ -5898,13 +5922,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "$", "shift+4":
-		// Cost dashboard (when cost tracking is active), otherwise filter to error sessions
-		if h.costStore != nil {
-			h.showCostDashboard = true
-			h.costDashboard = newCostDashboard(h.costStore, h.width, h.height)
-			return h, nil
-		}
-		// Fallback: filter to error sessions only
+		// Filter to error sessions only
 		if h.statusFilter == session.StatusError {
 			h.statusFilter = "" // Toggle off
 		} else {
