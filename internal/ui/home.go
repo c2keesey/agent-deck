@@ -51,7 +51,7 @@ func SetVersion(v string) {
 // a worktree + session is being created asynchronously.
 // It is NOT a real session.Instance — it is excluded from save, polling, and search.
 type CreatingSession struct {
-	ID        string    // Temporary ID for tracking
+	ID        string // Temporary ID for tracking
 	Title     string
 	Tool      string
 	GroupPath string
@@ -318,12 +318,12 @@ type Home struct {
 	updateInfo *update.UpdateInfo
 
 	// Launching animation state (for newly created sessions)
-	launchingSessions  map[string]time.Time // sessionID -> creation time
-	resumingSessions   map[string]time.Time // sessionID -> resume time (for restart/resume)
-	mcpLoadingSessions map[string]time.Time // sessionID -> MCP reload time
-	forkingSessions    map[string]time.Time          // sessionID -> fork start time (fork in progress)
-	creatingSessions   map[string]*CreatingSession   // tempID -> placeholder for worktree creation in progress
-	animationFrame     int                           // Current frame for spinner animation
+	launchingSessions  map[string]time.Time        // sessionID -> creation time
+	resumingSessions   map[string]time.Time        // sessionID -> resume time (for restart/resume)
+	mcpLoadingSessions map[string]time.Time        // sessionID -> MCP reload time
+	forkingSessions    map[string]time.Time        // sessionID -> fork start time (fork in progress)
+	creatingSessions   map[string]*CreatingSession // tempID -> placeholder for worktree creation in progress
+	animationFrame     int                         // Current frame for spinner animation
 
 	// Context for cleanup
 	ctx    context.Context
@@ -7635,13 +7635,6 @@ func (a attachCmd) Run() error {
 	// NOTE: Screen clearing is ONLY done in the tea.Exec callback (after Attach returns)
 	// Removing clear screen here prevents double-clearing which corrupts terminal state
 
-	// Re-enable Kitty keyboard protocol so the attached session (e.g. Claude
-	// Code) receives extended key sequences like Shift+Enter. The TUI pops
-	// the protocol at startup for Bubble Tea compatibility; push mode 1
-	// here and pop again on return.
-	EnableKittyKeyboard(os.Stdout)
-	defer DisableKittyKeyboard(os.Stdout)
-
 	ctx := context.Background()
 	return a.session.AttachWithOpts(ctx, tmux.AttachOpts{
 		DetachByte:   a.detachByte,
@@ -7684,9 +7677,6 @@ type remoteCreateAndAttachCmd struct {
 }
 
 func (r remoteCreateAndAttachCmd) Run() error {
-	EnableKittyKeyboard(os.Stdout)
-	defer DisableKittyKeyboard(os.Stdout)
-
 	ctx := context.Background()
 	sessionID, err := r.runner.CreateSession(ctx)
 	if err != nil {
@@ -7707,9 +7697,6 @@ type attachWindowCmd struct {
 }
 
 func (a attachWindowCmd) Run() error {
-	EnableKittyKeyboard(os.Stdout)
-	defer DisableKittyKeyboard(os.Stdout)
-
 	ctx := context.Background()
 	return a.session.AttachWindow(ctx, a.windowIndex, a.detachByte)
 }
@@ -7743,9 +7730,6 @@ type remoteAttachCmd struct {
 }
 
 func (r remoteAttachCmd) Run() error {
-	EnableKittyKeyboard(os.Stdout)
-	defer DisableKittyKeyboard(os.Stdout)
-
 	return r.runner.Attach(r.sessionID)
 }
 
@@ -11234,7 +11218,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	showAnalytics := config != nil && config.GetShowAnalytics() &&
 		(session.IsClaudeCompatible(selected.Tool) || selected.Tool == "gemini")
 	showOutput := config == nil || config.GetShowOutput() // Default to true if config fails
-	showNotes := config != nil && config.GetShowNotes() // Default to false if config fails
+	showNotes := config != nil && config.GetShowNotes()   // Default to false if config fails
 	notesOutputSplit := 0.33
 	if config != nil {
 		notesOutputSplit = config.Preview.GetNotesOutputSplit()
