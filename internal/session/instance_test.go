@@ -719,6 +719,7 @@ func TestWaitForClaudeSession(t *testing.T) {
 
 func TestInstance_GetSessionIDFromTmux(t *testing.T) {
 	skipIfNoTmuxServer(t)
+	skipIfNoClaudeBinary(t)
 
 	// Create instance with tmux session
 	inst := NewInstanceWithTool("tmux-env-test", "/tmp", "claude")
@@ -755,6 +756,7 @@ func TestInstance_GetSessionIDFromTmux(t *testing.T) {
 
 func TestInstance_UpdateClaudeSession_TmuxFirst(t *testing.T) {
 	skipIfNoTmuxServer(t)
+	skipIfNoClaudeBinary(t)
 
 	// Create and start instance
 	inst := NewInstanceWithTool("update-test", "/tmp", "claude")
@@ -1684,6 +1686,97 @@ func TestInstance_CanFork_OpenCode(t *testing.T) {
 	}
 }
 
+func TestInstance_CanRestartFresh(t *testing.T) {
+	tests := []struct {
+		name string
+		inst *Instance
+		want bool
+	}{
+		{
+			name: "claude with session ID",
+			inst: &Instance{Tool: "claude", ClaudeSessionID: "claude-session-1"},
+			want: true,
+		},
+		{
+			name: "claude without session ID",
+			inst: &Instance{Tool: "claude"},
+			want: false,
+		},
+		{
+			name: "gemini with session ID",
+			inst: &Instance{Tool: "gemini", GeminiSessionID: "gemini-session-1"},
+			want: true,
+		},
+		{
+			name: "opencode with session ID",
+			inst: &Instance{Tool: "opencode", OpenCodeSessionID: "ses_123"},
+			want: true,
+		},
+		{
+			name: "codex with session ID",
+			inst: &Instance{Tool: "codex", CodexSessionID: "codex-session-1"},
+			want: true,
+		},
+		{
+			name: "shell never offers fresh restart",
+			inst: &Instance{Tool: "shell"},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.inst.CanRestartFresh(); got != tt.want {
+				t.Fatalf("CanRestartFresh() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInstance_ClearSessionBindingForFreshStart(t *testing.T) {
+	inst := &Instance{
+		Tool:               "opencode",
+		ClaudeSessionID:    "claude-session-1",
+		GeminiSessionID:    "gemini-session-1",
+		OpenCodeSessionID:  "ses_123",
+		CodexSessionID:     "codex-session-1",
+		OpenCodeStartedAt:  123,
+		CodexStartedAt:     456,
+		OpenCodeDetectedAt: time.Now(),
+		CodexDetectedAt:    time.Now(),
+	}
+
+	inst.clearSessionBindingForFreshStart()
+
+	if inst.OpenCodeSessionID != "" {
+		t.Fatalf("OpenCodeSessionID = %q, want empty", inst.OpenCodeSessionID)
+	}
+	if inst.OpenCodeStartedAt != 0 {
+		t.Fatalf("OpenCodeStartedAt = %d, want 0", inst.OpenCodeStartedAt)
+	}
+	if !inst.OpenCodeDetectedAt.IsZero() {
+		t.Fatal("OpenCodeDetectedAt should be cleared")
+	}
+	if inst.ClaudeSessionID != "claude-session-1" {
+		t.Fatalf("ClaudeSessionID should be untouched for opencode, got %q", inst.ClaudeSessionID)
+	}
+	if inst.GeminiSessionID != "gemini-session-1" {
+		t.Fatalf("GeminiSessionID should be untouched for opencode, got %q", inst.GeminiSessionID)
+	}
+	if inst.CodexSessionID != "codex-session-1" {
+		t.Fatalf("CodexSessionID should be untouched for opencode, got %q", inst.CodexSessionID)
+	}
+
+	claude := &Instance{Tool: "claude", ClaudeSessionID: "claude-session-2", ClaudeDetectedAt: time.Now()}
+	claude.clearSessionBindingForFreshStart()
+	if claude.ClaudeSessionID != "" {
+		t.Fatalf("ClaudeSessionID = %q, want empty", claude.ClaudeSessionID)
+	}
+	if !claude.ClaudeDetectedAt.IsZero() {
+		t.Fatal("ClaudeDetectedAt should be cleared")
+	}
+}
+
 func TestInstance_ForkOpenCode(t *testing.T) {
 	inst := NewInstanceWithTool("test", "/tmp/test", "opencode")
 
@@ -2204,6 +2297,13 @@ func TestSessionHasConversationData(t *testing.T) {
 	ClearUserConfigCache()
 	defer ClearUserConfigCache()
 
+	// Build an Instance pointing at the test project. No conductor/group
+	// config override is set, so GetClaudeConfigDirForInstance(inst) falls
+	// through to the CLAUDE_CONFIG_DIR env var above — preserving the
+	// original semantics of this legacy test.
+	inst := NewInstance("legacy-has-data", projectPath)
+	inst.Tool = "claude"
+
 	t.Run("file with sessionId returns true", func(t *testing.T) {
 		sessionID := "has-session-id"
 		filePath := filepath.Join(projectsDir, sessionID+".jsonl")
@@ -2212,7 +2312,7 @@ func TestSessionHasConversationData(t *testing.T) {
 {"type":"user","sessionId":"has-session-id","text":"hello"}`
 		_ = os.WriteFile(filePath, []byte(content), 0o644)
 
-		if !sessionHasConversationData(sessionID, projectPath) {
+		if !sessionHasConversationData(inst, sessionID) {
 			t.Error("Expected true for file with sessionId")
 		}
 	})
@@ -2224,13 +2324,13 @@ func TestSessionHasConversationData(t *testing.T) {
 {"type":"summary","leafUuid":"def"}`
 		_ = os.WriteFile(filePath, []byte(content), 0o644)
 
-		if sessionHasConversationData(sessionID, projectPath) {
+		if sessionHasConversationData(inst, sessionID) {
 			t.Error("Expected false for file without sessionId")
 		}
 	})
 
 	t.Run("missing file returns false (use --session-id)", func(t *testing.T) {
-		if sessionHasConversationData("nonexistent-file", projectPath) {
+		if sessionHasConversationData(inst, "nonexistent-file") {
 			t.Error("Expected false for missing file (nothing to resume)")
 		}
 	})
@@ -2372,6 +2472,16 @@ func TestCollectDockerEnvVars(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCollectDockerEnvVars_ColorFGBGFallback(t *testing.T) {
+	// Cannot use t.Parallel() because t.Setenv mutates process env.
+	t.Setenv("COLORFGBG", "")
+	os.Unsetenv("COLORFGBG")
+
+	result := collectDockerEnvVars(nil)
+	require.Contains(t, result, "COLORFGBG")
+	require.NotEmpty(t, result["COLORFGBG"])
 }
 
 func TestNewSandboxConfig(t *testing.T) {
@@ -3351,5 +3461,129 @@ func TestForkCommandNoUuidgen(t *testing.T) {
 	}
 	if strings.Contains(cmd, "session_id=$(") {
 		t.Errorf("Fork command must NOT use $( shell substitution:\n  cmd: %q", cmd)
+	}
+}
+
+// --- Issue #601 regression guards -------------------------------------------
+// prepareCommand() must apply the user wrapper BEFORE the bash -c wrap so that
+// extra args folded into a "{command} --flag1 --flag2" wrapper end up INSIDE
+// the quoted bash -c payload, not outside it. The old (reversed) order produced
+// "bash -c 'tool' --flag1 --flag2", turning --flag1/--flag2 into bash positional
+// parameters ($0, $1) which the tool never receives.
+
+// TestPrepareCommand_AppliesWrapperBeforeBashWrap pins the exact output shape:
+// every extra flag in the wrapper suffix must live inside the 'bash -c …' quotes.
+func TestPrepareCommand_AppliesWrapperBeforeBashWrap(t *testing.T) {
+	inst := NewInstance("issue-601-unit", "/tmp")
+	inst.Tool = "claude"
+	inst.Wrapper = "{command} --extra1 --extra2"
+
+	got, _, err := inst.prepareCommand("tool")
+	if err != nil {
+		t.Fatalf("prepareCommand returned error: %v", err)
+	}
+
+	want := `bash -c 'tool --extra1 --extra2'`
+	if got != want {
+		t.Fatalf("prepareCommand output shape wrong.\n  got:  %q\n  want: %q", got, want)
+	}
+
+	// Defense in depth: trailing flags must NOT appear outside the quoted payload.
+	badShape := regexp.MustCompile(`^bash -c '[^']*' --extra`)
+	if badShape.MatchString(got) {
+		t.Fatalf("flags leaked outside bash -c quotes (issue #601 regression):\n  got: %q", got)
+	}
+}
+
+// TestPrepareCommand_WrapperWithSingleQuoteInCmd_QuotesSafely asserts that
+// after the reorder, a single quote in the fully-substituted wrapped string
+// is escaped via the close/dq/open ( '"'"' ) pattern used by prepareCommand.
+func TestPrepareCommand_WrapperWithSingleQuoteInCmd_QuotesSafely(t *testing.T) {
+	inst := NewInstance("issue-601-quoting", "/tmp")
+	inst.Tool = "claude"
+	inst.Wrapper = "{command} --trailing"
+
+	got, _, err := inst.prepareCommand(`echo it's-fine`)
+	if err != nil {
+		t.Fatalf("prepareCommand returned error: %v", err)
+	}
+
+	want := `bash -c 'echo it'"'"'s-fine --trailing'`
+	if got != want {
+		t.Fatalf("quoting escape wrong.\n  got:  %q\n  want: %q", got, want)
+	}
+}
+
+// TestPrepareCommand_NoWrapper_Unchanged guards against the reorder breaking
+// the no-wrapper path: prepareCommand must still return cmd unchanged.
+func TestPrepareCommand_NoWrapper_Unchanged(t *testing.T) {
+	inst := NewInstance("issue-601-nowrap", "/tmp")
+	inst.Tool = "shell"
+	inst.Wrapper = ""
+
+	got, _, err := inst.prepareCommand("echo hi")
+	if err != nil {
+		t.Fatalf("prepareCommand returned error: %v", err)
+	}
+	if got != "echo hi" {
+		t.Fatalf("no-wrapper path should pass cmd through unchanged.\n  got:  %q\n  want: %q", got, "echo hi")
+	}
+}
+
+// TestPrepareCommand_Issue601_ReporterRepro exercises the exact situation from
+// #601: claude-compatible tool + --cmd with extra flags. Pins the bug at the
+// last in-repo boundary before the string is handed to tmux.Start (→ /bin/sh -c).
+func TestPrepareCommand_Issue601_ReporterRepro(t *testing.T) {
+	inst := NewInstance("issue-601-repro", "/tmp")
+	inst.Tool = "claude"
+	// Mirrors what resolveSessionCommand produces for:
+	//   -c "my-claude-wrapper --session-id UUID --dangerously-skip-permissions"
+	inst.Wrapper = "{command} --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --dangerously-skip-permissions"
+
+	got, _, err := inst.prepareCommand("my-claude-wrapper")
+	if err != nil {
+		t.Fatalf("prepareCommand returned error: %v", err)
+	}
+
+	if !strings.Contains(got, `'my-claude-wrapper --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --dangerously-skip-permissions'`) {
+		t.Fatalf("issue #601 repro: flags not inside bash -c single-quoted payload.\n  got: %q", got)
+	}
+	if strings.Contains(got, `'my-claude-wrapper' --session-id`) {
+		t.Fatalf("issue #601 BAD SHAPE: flags leaked outside bash -c quotes:\n  got: %q", got)
+	}
+}
+
+// --- Issue #598 regression tests: RefreshLiveSessionIDs ---
+// Cross-session `x` in the TUI captured stale JSONL content because
+// Instance.ClaudeSessionID was never refreshed from the live tmux env before
+// reading. RefreshLiveSessionIDs is the designated refresh point; these tests
+// pin its safety contract.
+//
+// Restored on 2026-04-17 (v1.7.16 sprint-cleanup) after PR #640 (issue #601)
+// rebased on top of #598 and silently dropped these two functions during
+// conflict resolution. See .planning/verify-today-sprint/REPORT.md F1.
+
+func TestInstance_RefreshLiveSessionIDs_NoOpWhenTmuxSessionNil(t *testing.T) {
+	inst := NewInstance("sess-598-nil", t.TempDir())
+	inst.Tool = "claude"
+	inst.ClaudeSessionID = "stored-id"
+	// tmuxSession intentionally nil
+	inst.RefreshLiveSessionIDs() // must not panic
+	if inst.ClaudeSessionID != "stored-id" {
+		t.Errorf("ClaudeSessionID mutated with nil tmuxSession: got %q", inst.ClaudeSessionID)
+	}
+}
+
+func TestInstance_RefreshLiveSessionIDs_NoOpForNonAgenticTool(t *testing.T) {
+	inst := NewInstance("sess-598-shell", t.TempDir())
+	inst.Tool = "shell"
+	inst.ClaudeSessionID = "leftover-id"
+	inst.GeminiSessionID = "leftover-gemini"
+	inst.RefreshLiveSessionIDs()
+	if inst.ClaudeSessionID != "leftover-id" {
+		t.Errorf("ClaudeSessionID mutated for non-agentic tool: got %q", inst.ClaudeSessionID)
+	}
+	if inst.GeminiSessionID != "leftover-gemini" {
+		t.Errorf("GeminiSessionID mutated for non-agentic tool: got %q", inst.GeminiSessionID)
 	}
 }

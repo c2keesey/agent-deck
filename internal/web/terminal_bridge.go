@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,8 +46,15 @@ type tmuxPTYBridge struct {
 	sessionID   string
 	writer      *wsConnWriter
 
-	cmd  *exec.Cmd
-	ptmx *os.File
+	cmd *exec.Cmd
+
+	// ptmxMu guards ptmx against a concurrent Close/Resize race. Close
+	// closes the PTY file and nils the pointer under the write lock;
+	// Resize reads under the read lock so Setsize cannot hit a freshly
+	// closed fd. Observed as an intermittent TestTmuxPTYBridgeResize
+	// -race failure on CI (v1.7.4, v1.7.5 release workflows).
+	ptmxMu sync.RWMutex
+	ptmx   *os.File
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -129,19 +137,46 @@ func (b *tmuxPTYBridge) WriteInput(data string) error {
 }
 
 func (b *tmuxPTYBridge) Resize(cols, rows int) error {
-	if b == nil || b.ptmx == nil {
+	if b == nil {
 		return fmt.Errorf("bridge not initialized")
 	}
 	if cols <= 0 || rows <= 0 {
 		return fmt.Errorf("invalid dimensions: cols=%d rows=%d", cols, rows)
 	}
 
-	// Do NOT call pty.Setsize here. Resizing the local PTY sends SIGWINCH to
-	// the tmux attach process, which causes the tmux server to recalculate the
-	// window size. Even with "ignore-size" on the attach client, this can race
-	// with the TUI client's dimensions. The web terminal should adapt to the
-	// size provided by the tmux session, not the other way around.
-	return nil
+	b.ptmxMu.RLock()
+	defer b.ptmxMu.RUnlock()
+	if b.ptmx == nil {
+		return fmt.Errorf("bridge not initialized")
+	}
+
+	var firstErr error
+
+	// Step 1: Resize the local PTY master (per D-02: pty.Setsize first).
+	// This sends SIGWINCH to the tmux attach process. With ignore-size on the
+	// attach client, the tmux server will not auto-resize from this signal,
+	// but the PTY master's own TIOCGWINSZ is updated so xterm.js cell layout
+	// calculations are correct.
+	if err := pty.Setsize(b.ptmx, &pty.Winsize{
+		Rows: uint16(rows),
+		Cols: uint16(cols),
+	}); err != nil {
+		firstErr = fmt.Errorf("resize pty: %w", err)
+	}
+
+	// Step 2: Tell the tmux server the new window dimensions (per D-01).
+	// Required because ignore-size prevents the server from adopting the
+	// attach client's PTY size automatically.
+	args := []string{
+		"resize-window", "-t", b.tmuxSession,
+		"-x", strconv.Itoa(cols),
+		"-y", strconv.Itoa(rows),
+	}
+	if output, err := tmuxCommand(args...).CombinedOutput(); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("tmux resize-window: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
+	return firstErr
 }
 
 func (b *tmuxPTYBridge) Close() {
@@ -149,9 +184,12 @@ func (b *tmuxPTYBridge) Close() {
 		return
 	}
 	b.closeOnce.Do(func() {
+		b.ptmxMu.Lock()
 		if b.ptmx != nil {
 			_ = b.ptmx.Close()
+			b.ptmx = nil
 		}
+		b.ptmxMu.Unlock()
 		if b.cmd != nil && b.cmd.Process != nil {
 			pgid, err := syscall.Getpgid(b.cmd.Process.Pid)
 			if err == nil {

@@ -33,6 +33,8 @@ func handleSession(profile string, args []string) {
 		handleSessionStop(profile, args[1:])
 	case "restart":
 		handleSessionRestart(profile, args[1:])
+	case "revive":
+		handleSessionRevive(profile, args[1:])
 	case "fork":
 		handleSessionFork(profile, args[1:])
 	case "attach":
@@ -70,6 +72,7 @@ func printSessionHelp() {
 	fmt.Println("  start <id>              Start a session's tmux process")
 	fmt.Println("  stop <id>               Stop/kill session process")
 	fmt.Println("  restart <id>            Restart session (Claude: reload MCPs)")
+	fmt.Println("  revive [--all|--name]   Rebuild dead control pipes for errored sessions")
 	fmt.Println("  fork <id>               Fork Claude session with context")
 	fmt.Println("  attach <id>             Attach to session interactively")
 	fmt.Println("  show [id]               Show session details (auto-detect current if no id)")
@@ -472,7 +475,7 @@ func handleSessionFork(profile string, args []string) {
 	if *worktreeBranchLong != "" {
 		wtBranch = *worktreeBranchLong
 	}
-	_ = *newBranch || *newBranchLong
+	createNewBranch := *newBranch || *newBranchLong
 
 	// Handle worktree creation
 	var opts *session.ClaudeOptions
@@ -487,12 +490,20 @@ func handleSessionFork(profile string, args []string) {
 			os.Exit(1)
 		}
 
+		// Apply configured branch prefix before validation/existence checks
+		wtSettings := session.GetWorktreeSettings()
+		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
+
 		if err := git.ValidateBranchName(wtBranch); err != nil {
 			out.Error(fmt.Sprintf("invalid branch name: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 
-		wtSettings := session.GetWorktreeSettings()
+		if !createNewBranch && !git.BranchExists(repoRoot, wtBranch) {
+			out.Error(fmt.Sprintf("branch '%s' does not exist (use -b to create)", wtBranch), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+
 		worktreePath := git.WorktreePath(git.WorktreePathOptions{
 			Branch:    wtBranch,
 			Location:  wtSettings.DefaultLocation,
@@ -704,6 +715,9 @@ func handleSessionShow(profile string, args []string) {
 		}
 	}
 
+	// Warm tmux pane-title cache + load hook status so `session show --json`
+	// reports the same Status the TUI and /api/menu do (issue #610).
+	session.RefreshInstancesForCLIStatus([]*session.Instance{inst})
 	// Update status
 	_ = inst.UpdateStatus()
 
@@ -738,6 +752,13 @@ func handleSessionShow(profile string, args []string) {
 
 		if mcps := mcpInfoForJSON(mcpInfo); mcps != nil {
 			jsonData["mcps"] = mcps
+		}
+
+		// Always include channels for claude sessions — omitting when empty
+		// would make absence-of-field ambiguous with absence-of-value. Match
+		// the `list --json` emitter which surfaces this field unconditionally.
+		if len(inst.Channels) > 0 {
+			jsonData["channels"] = inst.Channels
 		}
 	}
 
@@ -839,6 +860,8 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  command            Command to run")
 		fmt.Println("  tool               Tool type (claude, gemini, shell, etc.)")
 		fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
+		fmt.Println("  channels           Comma-separated plugin channel ids (claude only)")
+		fmt.Println("  extra-args         Extra claude CLI tokens (claude only; use `-- --flag value` for tokens starting with -; persisted plaintext — no secrets)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
 		fmt.Println()
@@ -864,6 +887,11 @@ func handleSessionSet(profile string, args []string) {
 	identifier := fs.Arg(0)
 	field := fs.Arg(1)
 	value := fs.Arg(2)
+	// For extra-args: accept an arbitrary number of positional tokens after
+	// the field name. Use `--` terminator so Go's flag package leaves tokens
+	// starting with `-` alone, e.g.:
+	//   agent-deck session set <id> extra-args -- --model opus
+	extraArgTokens := fs.Args()[2:]
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(*jsonOutput, quietMode)
 
@@ -874,6 +902,8 @@ func handleSessionSet(profile string, args []string) {
 		"command":           true,
 		"tool":              true,
 		"wrapper":           true,
+		"channels":          true,
+		"extra-args":        true,
 		"claude-session-id": true,
 		"gemini-session-id": true,
 	}
@@ -881,7 +911,7 @@ func handleSessionSet(profile string, args []string) {
 	if !validFields[field] {
 		out.Error(
 			fmt.Sprintf(
-				"invalid field: %s\nValid fields: title, path, command, tool, wrapper, claude-session-id, gemini-session-id",
+				"invalid field: %s\nValid fields: title, path, command, tool, wrapper, channels, extra-args, claude-session-id, gemini-session-id",
 				field,
 			),
 			ErrCodeInvalidOperation,
@@ -928,6 +958,54 @@ func handleSessionSet(profile string, args []string) {
 	case "wrapper":
 		oldValue = inst.Wrapper
 		inst.Wrapper = value
+	case "channels":
+		// channels is a Claude Code CLI flag; only meaningful for claude sessions.
+		if inst.Tool != "claude" {
+			out.Error(
+				fmt.Sprintf("channels only supported for claude sessions (this session's tool is %q); requires --channels on the claude binary", inst.Tool),
+				ErrCodeInvalidOperation,
+			)
+			os.Exit(1)
+		}
+		oldValue = strings.Join(inst.Channels, ",")
+		// Parse CSV value: trim whitespace, drop empties.
+		parsed := []string{}
+		for _, raw := range strings.Split(value, ",") {
+			if s := strings.TrimSpace(raw); s != "" {
+				parsed = append(parsed, s)
+			}
+		}
+		inst.Channels = parsed
+	case "extra-args":
+		// extra-args are passed to the claude binary by buildClaudeExtraFlags;
+		// only meaningful for claude sessions. Every positional arg after the
+		// field name is treated as one already-tokenised extra arg. Use `--`
+		// so Go's flag package leaves tokens starting with `-` alone:
+		//   agent-deck session set <id> extra-args -- --model opus
+		// Empty string clears all extra args. Empty tokens mixed with real
+		// ones are dropped (avoid emitting literal `''` to claude).
+		//
+		// Note: extra-args persist in state.db as plaintext. Do NOT pass
+		// secrets like API keys via --extra-arg.
+		if inst.Tool != "claude" {
+			out.Error(
+				fmt.Sprintf("extra-args only supported for claude sessions (this session's tool is %q); claude is the only tool whose builder appends user extra args", inst.Tool),
+				ErrCodeInvalidOperation,
+			)
+			os.Exit(1)
+		}
+		oldValue = strings.Join(inst.ExtraArgs, " ")
+		cleaned := make([]string, 0, len(extraArgTokens))
+		for _, tok := range extraArgTokens {
+			if tok != "" {
+				cleaned = append(cleaned, tok)
+			}
+		}
+		if len(cleaned) == 0 {
+			inst.ExtraArgs = nil
+		} else {
+			inst.ExtraArgs = cleaned
+		}
 	case "claude-session-id":
 		oldValue = inst.ClaudeSessionID
 		inst.ClaudeSessionID = value
@@ -1395,15 +1473,13 @@ func handleSessionSend(profile string, args []string) {
 	sentAt := time.Now()
 
 	// Send message atomically (text + Enter in single tmux invocation).
-	// --no-wait: skip readiness waiting, but still do a short retry/verification
-	// loop to avoid silent "pasted but not submitted" races.
+	// --no-wait: skip full readiness waiting, but run a capped preflight
+	// barrier + extended verification loop to avoid the #616 race where
+	// Claude's composer renders after the loop has already returned
+	// success on startup "active" status, leaving the message unsubmitted.
 	// default mode: full retry budget after readiness check.
 	if *noWait {
-		if err := sendWithRetryTarget(tmuxSess, message, false, sendRetryOptions{
-			maxRetries:     8,
-			checkDelay:     150 * time.Millisecond,
-			maxFullResends: -1, // no-wait: message already delivered, never re-send
-		}); err != nil {
+		if err := sendNoWait(tmuxSess, inst.Tool, message); err != nil {
 			out.Error(fmt.Sprintf("failed to send message: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -1473,6 +1549,91 @@ func sendWithRetry(tmuxSess *tmux.Session, message string, skipVerify bool) erro
 		maxRetries: 50,
 		checkDelay: 300 * time.Millisecond,
 	})
+}
+
+// noWaitSendOptions returns the verification-loop options used by the
+// `session send --no-wait` path.
+//
+// Budget sizing (issue #616): a fresh Claude session with MCPs can take
+// 5-40s before its TUI input handler is interactive. If verification
+// returns on `activeChecks>=2` (from startup animations) before the
+// composer renders, a swallowed Enter leaves the message typed-but-not-
+// submitted. Budget must be long enough to see the composer either
+// accept or reject the submission.
+//
+// maxFullResends=-1 is load-bearing: it disables the Ctrl+C-then-resend
+// path (issue #479 — would otherwise double-send).
+func noWaitSendOptions() sendRetryOptions {
+	return sendRetryOptions{
+		maxRetries:     30,
+		checkDelay:     200 * time.Millisecond,
+		maxFullResends: -1,
+	}
+}
+
+// awaitComposerReadyBestEffort polls the pane until the Claude composer
+// prompt (`❯`) appears, returning true. If the composer never appears
+// within maxWait, returns false without blocking longer — preserving the
+// `--no-wait` spirit when the session is slow or broken.
+//
+// Added for issue #616: eliminates the race where `session send --no-wait`
+// fires before Claude's TUI input handler is mounted.
+func awaitComposerReadyBestEffort(target sendRetryTarget, maxWait, pollInterval time.Duration) bool {
+	if pollInterval <= 0 {
+		pollInterval = 100 * time.Millisecond
+	}
+	deadline := time.Now().Add(maxWait)
+	for {
+		if rawContent, err := target.CapturePaneFresh(); err == nil {
+			if send.HasCurrentComposerPrompt(tmux.StripANSI(rawContent)) {
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		remaining := time.Until(deadline)
+		sleep := pollInterval
+		if remaining < sleep {
+			sleep = remaining
+		}
+		if sleep > 0 {
+			time.Sleep(sleep)
+		}
+	}
+}
+
+// sendNoWait implements `session send --no-wait` semantics for the CLI.
+//
+// Issue #616 fix has three layers, applied in order:
+//
+//  1. Preflight readiness barrier (capped at 5s): polls the pane for a
+//     visible Claude composer `❯`. Without this, the initial paste
+//     lands in the TTY before Claude's Ink TUI has rendered the input
+//     surface — the keystrokes are discarded by pre-mount handlers.
+//
+//  2. Post-composer settle delay (500ms): Claude's composer glyph can
+//     render BEFORE React completes mounting the input handler. Without
+//     this delay, the paste can still be partially swallowed by the
+//     mount transition (observed live: message vanished entirely, no
+//     unsent prompt to retry on). 500ms is empirically enough.
+//
+//  3. Extended verification budget via noWaitSendOptions() (6s, 30×200ms):
+//     after the initial send, keeps detecting unsent-prompt markers and
+//     re-firing SendEnter if the composer still holds our message.
+//
+// maxFullResends=-1 is load-bearing for the #479 regression (never
+// double-send). Non-Claude tools skip the preflight — they have their
+// own readiness shapes and upstream gating.
+func sendNoWait(target sendRetryTarget, tool, message string) error {
+	if session.IsClaudeCompatible(tool) {
+		if awaitComposerReadyBestEffort(target, 5*time.Second, 100*time.Millisecond) {
+			// Post-composer settle: React mount can lag behind the
+			// composer glyph by a few hundred ms on cold starts.
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	return sendWithRetryTarget(target, message, false, noWaitSendOptions())
 }
 
 type sendRetryTarget interface {

@@ -3,16 +3,21 @@ package session
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
 	dark "github.com/thiagokokada/dark-mode-go"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/platform"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
@@ -60,6 +65,22 @@ type UserConfig struct {
 	// [profiles.work.claude]
 	// config_dir = "~/.claude-work"
 	Profiles map[string]ProfileSettings `toml:"profiles"`
+
+	// Groups defines optional per-group overrides.
+	// Example:
+	// [groups."my-group".claude]
+	// config_dir = "~/.claude-my-group"
+	Groups map[string]GroupSettings `toml:"groups"`
+
+	// Conductors defines optional per-conductor overrides.
+	// Keyed by conductor name (matches Instance.Title minus "conductor-" prefix).
+	// Mirrors Groups — see ConductorOverrides for the sub-table shape.
+	// Closes issue #602.
+	// Example:
+	// [conductors.gsd-v154.claude]
+	// config_dir = "~/.claude-work"
+	// env_file   = "~/git/work/.envrc"
+	Conductors map[string]ConductorOverrides `toml:"conductors"`
 
 	// Gemini defines Gemini CLI integration settings
 	Gemini GeminiSettings `toml:"gemini"`
@@ -189,6 +210,48 @@ type ProfileSettings struct {
 type ProfileClaudeSettings struct {
 	// ConfigDir overrides [claude].config_dir for this profile only.
 	ConfigDir string `toml:"config_dir"`
+}
+
+// GroupSettings defines per-group configuration overrides.
+type GroupSettings struct {
+	// Claude defines Claude Code overrides for a specific group.
+	Claude GroupClaudeSettings `toml:"claude"`
+}
+
+// GroupClaudeSettings defines group-specific Claude overrides.
+type GroupClaudeSettings struct {
+	// ConfigDir overrides [claude].config_dir for sessions in this group.
+	ConfigDir string `toml:"config_dir"`
+
+	// EnvFile overrides [claude].env_file for sessions in this group.
+	EnvFile string `toml:"env_file"`
+}
+
+// ConductorOverrides defines per-conductor configuration overrides.
+// Mirrors GroupSettings — conductors are first-class entities keyed by
+// conductor name (derived from Instance.Title via strings.TrimPrefix at the
+// call site, same pattern as env.go getConductorEnv).
+//
+// Named ConductorOverrides (not ConductorSettings) to avoid collision with
+// the pre-existing global [conductor] meta-agent orchestration block
+// declared in conductor.go:49 (heartbeat, telegram, slack, discord).
+// Closes issue #602.
+type ConductorOverrides struct {
+	// Claude defines Claude Code overrides for a specific conductor.
+	Claude ConductorClaudeSettings `toml:"claude"`
+}
+
+// ConductorClaudeSettings defines conductor-specific Claude overrides.
+// Semantics mirror GroupClaudeSettings — ExpandPath is applied on read via
+// GetConductorClaudeConfigDir; env_file resolution is deferred to the spawn
+// builder (resolvePath handles path expansion at use).
+type ConductorClaudeSettings struct {
+	// ConfigDir overrides [claude].config_dir for this conductor only.
+	ConfigDir string `toml:"config_dir"`
+
+	// EnvFile is sourced before claude exec for this conductor.
+	// Matches CFG-03 semantics — missing file logs a warning, does not block.
+	EnvFile string `toml:"env_file"`
 }
 
 // MCPPoolSettings defines HTTP MCP pool configuration
@@ -585,6 +648,61 @@ func (c *UserConfig) GetProfileClaudeConfigDir(profile string) string {
 	return ExpandPath(profileCfg.Claude.ConfigDir)
 }
 
+// GetGroupClaudeConfigDir returns the group-specific Claude config directory, if configured.
+func (c *UserConfig) GetGroupClaudeConfigDir(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	groupCfg, ok := c.Groups[groupPath]
+	if !ok || groupCfg.Claude.ConfigDir == "" {
+		return ""
+	}
+	return ExpandPath(groupCfg.Claude.ConfigDir)
+}
+
+// GetGroupClaudeEnvFile returns the group-specific Claude env file, if configured.
+func (c *UserConfig) GetGroupClaudeEnvFile(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	groupCfg, ok := c.Groups[groupPath]
+	if !ok || groupCfg.Claude.EnvFile == "" {
+		return ""
+	}
+	return groupCfg.Claude.EnvFile
+}
+
+// GetConductorClaudeConfigDir returns the conductor-specific Claude config
+// directory, if configured. Keyed by conductor name (Instance.Title minus
+// "conductor-" prefix — single source of truth is conductorNameFromInstance
+// in claude.go). Path expansion matches GetGroupClaudeConfigDir. Returns ""
+// when the conductor has no block or no config_dir — callers fall through
+// to the group/profile/global chain.
+func (c *UserConfig) GetConductorClaudeConfigDir(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok || conductorCfg.Claude.ConfigDir == "" {
+		return ""
+	}
+	return ExpandPath(conductorCfg.Claude.ConfigDir)
+}
+
+// GetConductorClaudeEnvFile returns the conductor-specific Claude env_file,
+// if configured. Mirrors GetGroupClaudeEnvFile — no expansion here;
+// resolvePath handles it at the spawn-command build site (env.go).
+func (c *UserConfig) GetConductorClaudeEnvFile(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok || conductorCfg.Claude.EnvFile == "" {
+		return ""
+	}
+	return conductorCfg.Claude.EnvFile
+}
+
 // GetDangerousMode returns whether dangerous mode is enabled, defaulting to true
 // Power users (the primary audience) typically want this enabled for faster iteration
 func (c *ClaudeSettings) GetDangerousMode() bool {
@@ -685,11 +803,22 @@ func (w *WorktreeSettings) Template() string {
 }
 
 // Prefix returns the branch prefix if set, or "feature/" if nil.
+// Environment variables (e.g., $USER) in the prefix are expanded.
 func (w *WorktreeSettings) Prefix() string {
 	if w.BranchPrefix == nil {
 		return "feature/"
 	}
-	return *w.BranchPrefix
+	return os.ExpandEnv(*w.BranchPrefix)
+}
+
+// ApplyBranchPrefix prepends the configured prefix to a branch name.
+// If the branch name already starts with the expanded prefix, it is returned unchanged.
+func (w *WorktreeSettings) ApplyBranchPrefix(branch string) string {
+	prefix := w.Prefix()
+	if prefix == "" || strings.HasPrefix(branch, prefix) {
+		return branch
+	}
+	return prefix + branch
 }
 
 // GlobalSearchSettings defines global conversation search configuration
@@ -884,8 +1013,14 @@ type TmuxSettings struct {
 	// LaunchInUserScope starts new tmux servers via `systemd-run --user --scope`
 	// so the tmux server lives under the user's systemd manager instead of the
 	// current login session scope. This keeps tmux alive when an SSH session
-	// scope is torn down. Default: false.
-	LaunchInUserScope bool `toml:"launch_in_user_scope"`
+	// scope is torn down.
+	//
+	// Default (when nil / field absent): true on Linux hosts where
+	// `systemd-run --user --version` succeeds, false otherwise. Explicit
+	// `launch_in_user_scope = true` or `launch_in_user_scope = false` in
+	// config.toml is always honored. Pointer type is required to distinguish
+	// "field absent" from "explicit false".
+	LaunchInUserScope *bool `toml:"launch_in_user_scope"`
 
 	// WindowStyleOverride sets the tmux window-style (and window-active-style) for
 	// all sessions, overriding the theme default. Use "default" to let your terminal
@@ -915,9 +1050,122 @@ func (t TmuxSettings) GetInjectStatusLine() bool {
 }
 
 // GetLaunchInUserScope returns whether new tmux servers should be launched
-// under the user's systemd manager, defaulting to false.
+// under the user's systemd manager. If LaunchInUserScope is non-nil
+// (explicit override in config.toml), its value is returned. Otherwise the
+// default is determined by isSystemdUserScopeAvailable(): true on
+// Linux+systemd hosts, false elsewhere. PERSIST-01..PERSIST-03.
 func (t TmuxSettings) GetLaunchInUserScope() bool {
-	return t.LaunchInUserScope
+	if t.LaunchInUserScope != nil {
+		return *t.LaunchInUserScope
+	}
+	return isSystemdUserScopeAvailable()
+}
+
+// systemdUserScopeAvailable caches the result of probing whether
+// `systemd-run --user --version` succeeds on this host. Populated exactly
+// once per process via systemdUserScopeOnce. Tests can reset both vars via
+// resetSystemdDetectionCacheForTest.
+//
+// systemdUserScopeProbeCount counts how many times the probe body has run;
+// it is incremented inside the sync.Once.Do callback. Tests assert it equals
+// 1 after consecutive calls (cache hit) and 2 after a reset+call cycle.
+var (
+	systemdUserScopeOnce       sync.Once
+	systemdUserScopeAvailable  bool
+	systemdUserScopeProbeCount int64
+)
+
+// isSystemdUserScopeAvailable returns true iff exec.LookPath("systemd-run")
+// succeeds AND `systemd-run --user --version` exits zero. The result is
+// cached for the lifetime of the process. The probe must mirror
+// requireSystemdRun in internal/session/session_persistence_test.go so the
+// production-code default and the test gate agree on what "Linux+systemd
+// available" means. Side effects: none — no stdout/stderr writes, no panic
+// on missing/broken systemd-run, errors are swallowed and treated as false.
+func isSystemdUserScopeAvailable() bool {
+	systemdUserScopeOnce.Do(func() {
+		atomic.AddInt64(&systemdUserScopeProbeCount, 1)
+		if _, err := exec.LookPath("systemd-run"); err != nil {
+			systemdUserScopeAvailable = false
+			return
+		}
+		if err := exec.Command("systemd-run", "--user", "--version").Run(); err != nil {
+			systemdUserScopeAvailable = false
+			return
+		}
+		systemdUserScopeAvailable = true
+	})
+	return systemdUserScopeAvailable
+}
+
+// resetSystemdDetectionCacheForTest discards the cached detection result
+// so the next call to isSystemdUserScopeAvailable re-probes the host. Used
+// only by tests in package session. Not safe for concurrent use with
+// callers of isSystemdUserScopeAvailable.
+func resetSystemdDetectionCacheForTest() {
+	systemdUserScopeOnce = sync.Once{}
+	systemdUserScopeAvailable = false
+}
+
+// systemdAvailableForLog is a swappable seam so unit tests can deterministically
+// drive both branches of the OBS-01 log decision without manipulating PATH or
+// the systemd user manager. Production callers always read
+// isSystemdUserScopeAvailable.
+var systemdAvailableForLog = isSystemdUserScopeAvailable
+
+// cgroupIsolationLog is the slog handle used by LogCgroupIsolationDecision.
+// It mirrors the migrationLog pattern at internal/session/migration.go:13 so
+// the OBS-01 line is routed through the same dynamicHandler that lands records
+// in lumberjack-rotated ~/.agent-deck/debug.log. Tests swap it via
+// captureCgroupIsolationLog to capture the emitted record without going
+// through disk.
+var cgroupIsolationLog *slog.Logger = logging.ForComponent(logging.CompSession)
+
+// cgroupIsolationOnce ensures LogCgroupIsolationDecision emits exactly once
+// per process. Tests can reset it via resetCgroupIsolationLogOnceForTest.
+var cgroupIsolationOnce sync.Once
+
+// resetCgroupIsolationLogOnceForTest clears the once-guard so the next
+// LogCgroupIsolationDecision call re-emits. Test-only — never call from
+// production code.
+func resetCgroupIsolationLogOnceForTest() {
+	cgroupIsolationOnce = sync.Once{}
+}
+
+// LogCgroupIsolationDecision emits exactly one structured log line per
+// process describing the cgroup isolation decision the runtime made. The
+// emitted message is one of these four exact strings (pinned by
+// TestLogCgroupIsolationDecision_*):
+//
+//   - "tmux cgroup isolation: enabled (systemd-run detected)"
+//   - "tmux cgroup isolation: disabled (systemd-run not available)"
+//   - "tmux cgroup isolation: enabled (config override)"
+//   - "tmux cgroup isolation: disabled (config override)"
+//
+// Decision logic mirrors GetLaunchInUserScope: an explicit (non-nil)
+// LaunchInUserScope wins, otherwise systemdAvailableForLog() decides. The
+// sync.Once guarantees one-line-per-process even when called from multiple
+// goroutines.
+//
+// Satisfies OBS-01. Intended to be called once from the application bootstrap
+// (cmd/agent-deck/main.go) immediately after logging.Init so the line lands in
+// ~/.agent-deck/debug.log via lumberjack.
+func LogCgroupIsolationDecision() {
+	cgroupIsolationOnce.Do(func() {
+		settings := GetTmuxSettings()
+		var msg string
+		switch {
+		case settings.LaunchInUserScope != nil && *settings.LaunchInUserScope:
+			msg = "tmux cgroup isolation: enabled (config override)"
+		case settings.LaunchInUserScope != nil && !*settings.LaunchInUserScope:
+			msg = "tmux cgroup isolation: disabled (config override)"
+		case systemdAvailableForLog():
+			msg = "tmux cgroup isolation: enabled (systemd-run detected)"
+		default:
+			msg = "tmux cgroup isolation: disabled (systemd-run not available)"
+		}
+		cgroupIsolationLog.Info(msg)
+	})
 }
 
 // DockerSettings defines Docker sandbox configuration.
@@ -1031,10 +1279,14 @@ var defaultUserConfig = UserConfig{
 	MCPs:  make(map[string]MCPDef),
 }
 
-// Cache for user config (loaded once per session)
+// Cache for user config. Invalidated when config.toml's mtime advances past
+// the snapshot taken at cache time, so long-running processes (TUI, web,
+// notify-daemon) pick up external edits without requiring a full restart.
+// Regression: TestLoadUserConfig_PicksUpExternalEdits.
 var (
-	userConfigCache   *UserConfig
-	userConfigCacheMu sync.RWMutex
+	userConfigCache      *UserConfig
+	userConfigCacheMtime time.Time
+	userConfigCacheMu    sync.RWMutex
 )
 
 // GetUserConfigPath returns the path to the user config file
@@ -1046,47 +1298,61 @@ func GetUserConfigPath() (string, error) {
 	return filepath.Join(dir, UserConfigFileName), nil
 }
 
-// LoadUserConfig loads the user configuration from TOML file
-// Returns cached config after first load
+// LoadUserConfig loads the user configuration from TOML file.
+// After the first load the result is cached; the cache is invalidated when
+// config.toml's mtime advances, so external edits to the file (e.g. the user
+// editing ~/.agent-deck/config.toml by hand while the TUI is running) are
+// picked up on the next call without a manual ClearUserConfigCache.
 func LoadUserConfig() (*UserConfig, error) {
+	configPath, pathErr := GetUserConfigPath()
+
+	// Stat the file once up front so both the fast-path and the slow-path
+	// agree on the same mtime. A missing file is not an error — we fall
+	// through to the default config branch below.
+	var currentMtime time.Time
+	if pathErr == nil {
+		if st, err := os.Stat(configPath); err == nil {
+			currentMtime = st.ModTime()
+		}
+	}
+
 	userConfigCacheMu.RLock()
-	if userConfigCache != nil {
+	if userConfigCache != nil && currentMtime.Equal(userConfigCacheMtime) {
 		defer userConfigCacheMu.RUnlock()
 		return userConfigCache, nil
 	}
 	userConfigCacheMu.RUnlock()
 
-	// Load config (only happens once)
 	userConfigCacheMu.Lock()
 	defer userConfigCacheMu.Unlock()
 
-	// Double-check after acquiring write lock
-	if userConfigCache != nil {
+	// Re-check under write lock: another goroutine may have refreshed the
+	// cache to match currentMtime between our RLock drop and Lock acquire.
+	if userConfigCache != nil && currentMtime.Equal(userConfigCacheMtime) {
 		return userConfigCache, nil
 	}
 
-	configPath, err := GetUserConfigPath()
-	if err != nil {
+	if pathErr != nil {
 		userConfigCache = &defaultUserConfig
+		userConfigCacheMtime = time.Time{}
 		return userConfigCache, nil
 	}
 
-	// Check if config exists
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		// Return default config (no file exists yet)
 		userConfigCache = &defaultUserConfig
+		userConfigCacheMtime = time.Time{}
 		return userConfigCache, nil
 	}
 
 	var config UserConfig
 	if _, err := toml.DecodeFile(configPath, &config); err != nil {
-		// Return error so caller can display it to user
-		// Still cache default to prevent repeated parse attempts
+		// Cache default to prevent hot-looping on a broken file, but still
+		// return the error so the caller can surface it.
 		userConfigCache = &defaultUserConfig
+		userConfigCacheMtime = currentMtime
 		return userConfigCache, fmt.Errorf("config.toml parse error: %w", err)
 	}
 
-	// Initialize maps if nil
 	if config.Tools == nil {
 		config.Tools = make(map[string]ToolDef)
 	}
@@ -1095,6 +1361,7 @@ func LoadUserConfig() (*UserConfig, error) {
 	}
 
 	userConfigCache = &config
+	userConfigCacheMtime = currentMtime
 	return userConfigCache, nil
 }
 
@@ -1181,11 +1448,14 @@ func syncConfigFile(path string) error {
 	return f.Sync()
 }
 
-// ClearUserConfigCache clears the cached user config, allowing tests to reset state
-// This does NOT reload - the next LoadUserConfig() call will read fresh from disk
+// ClearUserConfigCache clears the cached user config, allowing tests to reset state.
+// This does NOT reload - the next LoadUserConfig() call will read fresh from disk.
+// Resets both the cache pointer AND the tracked mtime so the invalidation state
+// machine starts clean.
 func ClearUserConfigCache() {
 	userConfigCacheMu.Lock()
 	userConfigCache = nil
+	userConfigCacheMtime = time.Time{}
 	userConfigCacheMu.Unlock()
 }
 
@@ -1836,9 +2106,11 @@ auto_cleanup = true
 # Default: true (agent-deck injects its own status bar with session info)
 # inject_status_line = false
 # launch_in_user_scope starts new tmux servers with systemd-run --user --scope
-# so they are not tied to the current login session scope (useful for SSH/tmux).
-# Default: false
-# launch_in_user_scope = true
+# so they survive when the current login session is torn down (e.g. SSH logout).
+# Default: true on Linux+systemd hosts where 'systemd-run --user --version'
+#          succeeds, false on macOS / BSD / Linux without a user manager.
+# An explicit setting here is ALWAYS honored.
+# launch_in_user_scope = false
 # window_style_override sets the tmux window-style for all sessions, overriding
 # the theme default. Use "default" to let your terminal's background show through.
 # window_style_override = "default"
@@ -2170,6 +2442,9 @@ type WatcherSettings struct {
 
 	// HealthCheckIntervalSeconds is the interval between health checks in seconds (default: 30)
 	HealthCheckIntervalSeconds int `toml:"health_check_interval_seconds"`
+
+	// Alerts configures the health alerts bridge (opt-in). See WatcherAlertsSettings.
+	Alerts WatcherAlertsSettings `toml:"alerts"`
 }
 
 // GetMaxEventsPerWatcher returns the max events per watcher (default: 500).
@@ -2194,4 +2469,27 @@ func (w WatcherSettings) GetHealthCheckIntervalSeconds() int {
 		return w.HealthCheckIntervalSeconds
 	}
 	return 30
+}
+
+// WatcherAlertsSettings configures the health alerts bridge (REQ-WF-3).
+// Opt-in via [watcher.alerts] in config.toml.
+type WatcherAlertsSettings struct {
+	// Enabled turns the bridge on. Default: false (no alerts emitted).
+	Enabled bool `toml:"enabled"`
+
+	// Channels lists notification channel names the bridge's notifier should fan out to
+	// (e.g. "telegram", "slack", "discord"). Semantics are owned by the Notifier
+	// implementation; the bridge only passes the list to the notifier.
+	Channels []string `toml:"channels"`
+
+	// DebounceMinutes is the per-(watcher x trigger) debounce window. Default: 15.
+	DebounceMinutes int `toml:"debounce_minutes"`
+}
+
+// GetDebounceMinutes returns the debounce window in minutes (default: 15).
+func (a WatcherAlertsSettings) GetDebounceMinutes() int {
+	if a.DebounceMinutes > 0 {
+		return a.DebounceMinutes
+	}
+	return 15
 }

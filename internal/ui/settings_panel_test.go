@@ -101,12 +101,6 @@ func TestSettingsPanel_LoadConfig(t *testing.T) {
 	if panel.claudeConfigDir != "~/.claude-work" {
 		t.Errorf("claudeConfigDir: got %q, want %q", panel.claudeConfigDir, "~/.claude-work")
 	}
-	if !panel.claudeUseHappy {
-		t.Error("claudeUseHappy should be true")
-	}
-	if !panel.codexUseHappy {
-		t.Error("codexUseHappy should be true")
-	}
 	if !panel.codexYoloMode {
 		t.Error("codexYoloMode should be true")
 	}
@@ -261,8 +255,6 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	panel.selectedTool = 2 // opencode
 	panel.dangerousMode = true
 	panel.claudeConfigDir = "~/.claude-custom"
-	panel.claudeUseHappy = true
-	panel.codexUseHappy = true
 	panel.codexYoloMode = true
 	panel.checkForUpdates = false
 	panel.autoUpdate = true
@@ -509,29 +501,6 @@ func TestSettingsPanel_Update_ToggleCheckbox(t *testing.T) {
 	panel.Update(tea.KeyMsg{Type: tea.KeySpace})
 	if panel.dangerousMode != initialValue {
 		t.Error("dangerousMode should have toggled back")
-	}
-}
-
-func TestSettingsPanel_Update_ToggleHappyCheckboxes(t *testing.T) {
-	panel := NewSettingsPanel()
-	panel.Show()
-
-	panel.cursor = int(SettingClaudeUseHappy)
-	_, _, changed := panel.Update(tea.KeyMsg{Type: tea.KeySpace})
-	if !changed {
-		t.Fatal("Claude use_happy toggle should report a change")
-	}
-	if !panel.claudeUseHappy {
-		t.Fatal("claudeUseHappy should toggle on")
-	}
-
-	panel.cursor = int(SettingCodexUseHappy)
-	_, _, changed = panel.Update(tea.KeyMsg{Type: tea.KeySpace})
-	if !changed {
-		t.Fatal("Codex use_happy toggle should report a change")
-	}
-	if !panel.codexUseHappy {
-		t.Fatal("codexUseHappy should toggle on")
 	}
 }
 
@@ -947,6 +916,42 @@ func TestSettingsPanel_PreviewSettings_GetConfigPreservesHiddenFields(t *testing
 	}
 	if config.Preview.Analytics.ShowTools == nil || *config.Preview.Analytics.ShowTools {
 		t.Fatal("Preview.Analytics should preserve original hidden settings")
+	}
+}
+
+func TestSettingsPanel_Worktree_GetConfigPreservesHiddenFields(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	branchPrefix := "dev/"
+	pathTemplate := "~/worktrees/{repo-name}/{branch}"
+	original := &session.UserConfig{
+		Worktree: session.WorktreeSettings{
+			AutoCleanup:     true,
+			DefaultEnabled:  true,
+			DefaultLocation: "sibling",
+			PathTemplate:    &pathTemplate,
+			BranchPrefix:    &branchPrefix,
+		},
+	}
+	panel.LoadConfig(original)
+	panel.originalConfig = original
+
+	config := panel.GetConfig()
+
+	if !config.Worktree.AutoCleanup {
+		t.Fatal("Worktree.AutoCleanup should be preserved")
+	}
+	if !config.Worktree.DefaultEnabled {
+		t.Fatal("Worktree.DefaultEnabled should be preserved")
+	}
+	if config.Worktree.DefaultLocation != "sibling" {
+		t.Fatalf("Worktree.DefaultLocation = %q, want %q", config.Worktree.DefaultLocation, "sibling")
+	}
+	if config.Worktree.PathTemplate == nil || *config.Worktree.PathTemplate != pathTemplate {
+		t.Fatalf("Worktree.PathTemplate should be preserved, got %v", config.Worktree.PathTemplate)
+	}
+	if config.Worktree.BranchPrefix == nil || *config.Worktree.BranchPrefix != branchPrefix {
+		t.Fatalf("Worktree.BranchPrefix should be preserved, got %v", config.Worktree.BranchPrefix)
 	}
 }
 

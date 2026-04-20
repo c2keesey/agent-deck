@@ -66,6 +66,7 @@ agent-deck session output "Project"
 | `agent-deck add --worktree <branch>` | Create session in git worktree |
 | `agent-deck worktree list` | List worktrees with sessions |
 | `agent-deck worktree cleanup` | Find orphaned worktrees/sessions |
+| `agent-deck feedback` | Submit feedback (opens rating prompt + optional comment) |
 
 **Status:** `●` running | `◐` waiting | `○` idle | `✕` error
 
@@ -166,6 +167,39 @@ agent-deck remove "Consult Codex"
 agent-deck remove "Codex Review" && agent-deck remove "Gemini Arch"
 ```
 
+## Peer (Root) Sessions vs Sub-Agents
+
+**The default — sub-agent linkage:** `agent-deck launch` and `agent-deck add`, when invoked from *inside* an existing agent-deck session, automatically link the new session as a child of the calling session (sets `parent_session_id`, inherits the parent's group when `-g` is omitted, and grants `--add-dir` to the parent's project path). This is usually what you want for short-lived work sessions (plan / verify / release / consult).
+
+**When the default is wrong — root-level peer sessions:** if you are creating a session that should stand independently at the root — a peer conductor, a standalone project session, a session that should outlive the current one, or anything that semantically is NOT a child of the calling session — pass the `-no-parent` flag.
+
+| Use case | Parent linkage | Flag |
+|---|---|---|
+| Plan / impl / verify worker for the current task | ✅ child | (default) |
+| Consultation (codex / gemini / research) | ✅ child | (default) |
+| Another conductor (root-level peer) | ❌ child | `-no-parent` |
+| Project session unrelated to current work | ❌ child | `-no-parent` |
+| Session intended to outlive the caller | ❌ child | `-no-parent` |
+
+```bash
+# Root-level peer conductor, no parent linkage:
+agent-deck launch ~/projects/foo -t "conductor-foo" -g "conductor" -c claude -no-parent -m "..."
+
+# Verify after spawn:
+agent-deck list --json | jq '.[] | select(.title=="conductor-foo") | .parent_session_id'
+# Must print: null
+```
+
+**Symptoms you created a sub-agent when you wanted a peer:**
+- `parent_session_id` is non-null in `list --json` output
+- The new session's baked `pane_start_command` contains `--add-dir <caller's path>` even though you gave it a different project path
+- Transition events for the new session's children flow to the caller instead of the new peer
+- Event routing and heartbeat parent-linkage puts it under the caller's tree in the TUI
+
+**Fix for an already-created sub-agent:** stop + remove the session, re-launch with `-no-parent`. There is no in-place un-parent flag.
+
+**Note on the launch-subagent.sh script:** that script is specifically designed to create sub-agents (the name says so). It does NOT support `-no-parent`. For peer sessions, skip the script and invoke `agent-deck launch -no-parent` directly.
+
 ## TUI Keyboard Shortcuts
 
 ### Navigation
@@ -198,6 +232,7 @@ agent-deck remove "Codex Review" && agent-deck remove "Gemini Arch"
 |-----|--------|
 | `?` | Help overlay |
 | `Ctrl+Q` | Detach (keep tmux running) |
+| `Ctrl+E` | Open feedback dialog |
 | `q` | Quit |
 
 ## MCP Management
@@ -338,6 +373,89 @@ $SKILL_DIR/../session-share/scripts/import.sh ~/Downloads/session-file.json
 1. **Flags before arguments:** `session start -m "Hello" name` (not `name -m "Hello"`)
 2. **Restart after MCP attach:** Always run `session restart` after `mcp attach`
 3. **Never poll from other agents** - can interfere with target session
+
+## Known Gotchas (v1.7.0+)
+
+Friction points discovered during real usage. Work around them per the patterns below.
+
+### `session send --no-wait` can leave prompts typed-but-not-submitted
+
+On a freshly-launched Claude session, `agent-deck session send --no-wait <id> "..."` may paste the message into the input buffer before Claude is fully ready, leaving it TYPED but not SUBMITTED. Classic race.
+
+**Workaround (always safe):**
+```bash
+agent-deck -p <profile> session send <id> "..." --no-wait -q
+sleep 3
+# Get the tmux session name and send Enter to submit
+TMUX=$(agent-deck -p <profile> session show --json <id> | jq -r .tmux_session)
+tmux send-keys -t "$TMUX" Enter
+```
+
+The Enter is idempotent — if already submitted, it's just a no-op newline. Use this pattern every time you `session send --no-wait` to a freshly-launched session.
+
+**Alternative:** omit `--no-wait` so the built-in 60s readiness wait kicks in before submitting.
+
+### Replacing the binary while agent-deck is running (`text file busy`)
+
+If `/usr/local/bin/agent-deck` is a symlink to a build artifact and the binary is currently running (any tmux session, any daemon), a direct `cp` over it fails with `Text file busy`.
+
+**Workaround — move-then-copy (keeps running processes on the old inode):**
+```bash
+INSTALL=$(which agent-deck)
+TARGET=$(readlink -f "$INSTALL")
+go build -ldflags "-X main.Version=X.Y.Z" -o /tmp/agent-deck-new ./cmd/agent-deck
+mv "$TARGET" "$TARGET.old"
+cp /tmp/agent-deck-new "$TARGET" && chmod +x "$TARGET"
+agent-deck --version    # verify
+rm "$TARGET.old"
+```
+
+Kernel tracks inodes, not names. Running processes keep a reference to the renamed inode; new invocations resolve through the original name to the new inode.
+
+### Cross-machine config drift (macOS ↔ Linux)
+
+If `~/.agent-deck/skills/sources.toml` (or other config files) were copied verbatim from a macOS machine, paths like `/Users/<name>/` won't exist on Linux (should be `/home/<user>/`). The symptom: `agent-deck skill list` returns "No skills found" while the pool directory is clearly populated.
+
+**Check & fix:**
+```bash
+grep -n "/Users/" ~/.agent-deck/skills/sources.toml
+# If any matches, substitute the Linux home path:
+sed -i "s|/Users/<mac-user>|$HOME|g" ~/.agent-deck/skills/sources.toml
+```
+
+### Channel subscription for conductor/bot sessions (v1.7.0+)
+
+For a session to receive Telegram/Discord/Slack messages as conversation turns (not just as MCP tool calls), it MUST be started with `--channels <plugin-id>`. Use the first-class field:
+
+```bash
+# At creation (preferred):
+agent-deck -p personal add --channel plugin:telegram@claude-plugins-official -c claude -t my-bot /path
+
+# Or after creation, then restart:
+agent-deck -p personal session set my-bot channels plugin:telegram@claude-plugins-official
+agent-deck -p personal session restart my-bot
+```
+
+The `channels` field persists and every `session start` / `session restart` rebuilds the claude invocation with `--channels`. Do NOT rely on `.mcp.json` telegram entries — those load the plugin as a regular MCP (tools only), not a channel (inbound delivery).
+
+**Note — v1.7.0 display bug:** `agent-deck session show --json <id>` currently omits the `channels` field (fix pending). `agent-deck list --json | jq '.[] | select(.id==<id>)'` shows it correctly. Data is persisted fine regardless.
+
+### Many competing telegram pollers after multiple session starts
+
+Telegram's Bot API `getUpdates` is single-consumer per bot token. If N Claude sessions all load the telegram plugin, N `bun` pollers race for messages — deliveries land in whichever wins, not where you want them.
+
+**Correct topology:** exactly ONE session loads the telegram channel plugin (normally the conductor, via `--channels` at start-time). All other sessions should NOT have telegram in their enabled plugins.
+
+**Disable globally:** in `~/.claude/settings.json`:
+```json
+"enabledPlugins": {
+  "telegram@claude-plugins-official": false
+}
+```
+
+**Enable per-session:** via `--channel` on the specific session that should receive messages. See "Channel subscription" above.
+
+**Debug:** `pgrep -af "bun.*telegram" | wc -l` should return 1. Anything higher means a race. Kill extras: `pkill -f "bun.*telegram"` then restart only the intended session.
 
 ## References
 

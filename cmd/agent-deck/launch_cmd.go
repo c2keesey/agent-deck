@@ -47,6 +47,25 @@ func handleLaunch(profile string, args []string) {
 		return nil
 	})
 
+	// Plugin channel flag - can be specified multiple times; requires -c claude.
+	// Mirrors handleAdd's --channel; both routes feed Instance.Channels which
+	// buildClaudeExtraFlags emits as --channels <csv> on every Start/Restart.
+	var channelFlags []string
+	fs.Func("channel", "Plugin channel id (can specify multiple times); requires -c claude", func(s string) error {
+		channelFlags = append(channelFlags, s)
+		return nil
+	})
+
+	// Extra claude CLI tokens - repeatable; mirrors handleAdd's --extra-arg.
+	// Each invocation contributes one already-tokenised arg; feeds
+	// Instance.ExtraArgs which buildClaudeExtraFlags shellescapes and appends.
+	// Persisted plaintext in state.db — do NOT pass secrets like API keys.
+	var extraArgFlags []string
+	fs.Func("extra-arg", "Extra claude CLI token (can specify multiple times); requires -c claude; persisted plaintext — no secrets", func(s string) error {
+		extraArgFlags = append(extraArgFlags, s)
+		return nil
+	})
+
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume")
 
@@ -67,6 +86,7 @@ func handleLaunch(profile string, args []string) {
 		fmt.Println("  agent-deck launch . -c claude -m \"Explain this codebase\"")
 		fmt.Println("  agent-deck launch /path/to/project -t \"My Agent\" -c claude -g work")
 		fmt.Println("  agent-deck launch . -c claude --mcp memory -m \"Research topic X\"")
+		fmt.Println("  agent-deck launch . -c claude --channel plugin:telegram@user/repo -m \"Listen for messages\"")
 		fmt.Println("  agent-deck launch . -c claude -m \"Fix bug\" --no-wait")
 		fmt.Println("  agent-deck launch . -c \"codex --dangerously-bypass-approvals-and-sandbox\"")
 		fmt.Println("  agent-deck launch . -g ard --no-parent -c claude -m \"Run review\"")
@@ -129,7 +149,7 @@ func handleLaunch(profile string, args []string) {
 	if *worktreeBranchLong != "" {
 		wtBranch = *worktreeBranchLong
 	}
-	_ = *newBranch || *newBranchLong
+	createNewBranch := *newBranch || *newBranchLong
 
 	// Validate --resume-session requires Claude
 	if *resumeSession != "" {
@@ -154,12 +174,21 @@ func handleLaunch(profile string, args []string) {
 			os.Exit(1)
 		}
 
+		// Apply configured branch prefix before validation/existence checks
+		wtSettings := session.GetWorktreeSettings()
+		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
+
 		if err := git.ValidateBranchName(wtBranch); err != nil {
 			out.Error(fmt.Sprintf("invalid branch name: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 
-		wtSettings := session.GetWorktreeSettings()
+		branchExists := git.BranchExists(repoRoot, wtBranch)
+		if createNewBranch && branchExists {
+			out.Error(fmt.Sprintf("branch '%s' already exists (remove -b flag to use existing branch)", wtBranch), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+
 		location := wtSettings.DefaultLocation
 		if *worktreeLocation != "" {
 			location = *worktreeLocation
@@ -266,6 +295,24 @@ func handleLaunch(profile string, args []string) {
 	if sessionCommandInput != "" {
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		newInstance.Command = sessionCommandResolved
+	}
+
+	// Apply --channel flags (claude only — channels is a Claude Code CLI flag).
+	if len(channelFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			out.Error("--channel only supported for claude sessions (use -c claude); requires --channels on the claude binary", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		newInstance.Channels = channelFlags
+	}
+
+	// Apply --extra-arg flags (claude only; mirror of handleAdd).
+	if len(extraArgFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			out.Error("--extra-arg only supported for claude sessions (use -c claude); claude is the only tool whose builder appends user extra args", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		newInstance.ExtraArgs = extraArgFlags
 	}
 
 	if sessionWrapperResolved != "" {

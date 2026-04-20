@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.5.0
-milestone_name: "**Goal:** Ship v1.5.0 with all gates green — clean build, Go 1.24.0 verified, visual verification pass, macOS smoke test, real-device mobile test, comprehensive changelog. Locked by CLAUDE.md release rules."
+milestone: v1.6.0
+milestone_name: milestone
 status: executing
-stopped_at: Phase 18 VERIFIED COMPLETE — all 4 INTEL requirements delivered, 30 tests green, clean build with Go 1.24.0. 3 manual verifications pending (real Claude triage, skill UX, real state.db migration).
-last_updated: "2026-04-11T17:45:57.870Z"
-last_activity: 2026-04-11
+stopped_at: "Phase 19 CLOSED — Plan 19-02 complete, REQ-WF-2 closed with three Phase 15 backfill docs in signed commit e294ed1. Both REQ-WF-1 (plan 19-01, commit 2c19e3f) and REQ-WF-2 (plan 19-02, commit e294ed1) ledger entries closed; Phase 19 is done. Next: Phase 20 Health Alerts Bridge (REQ-WF-3)."
+last_updated: "2026-04-16T01:30:52.060Z"
+last_activity: 2026-04-16 -- Phase 21 planning complete
 progress:
-  total_phases: 14
-  completed_phases: 7
-  total_plans: 21
-  completed_plans: 21
+  total_phases: 12
+  completed_phases: 4
+  total_plans: 7
+  completed_plans: 9
   percent: 100
 ---
 
@@ -20,42 +20,59 @@ progress:
 
 **Project:** Agent Deck
 **Repository:** /home/ashesh-goplani/agent-deck
-**Branch:** main
-**Current version:** v1.5.0
+**Worktree:** /home/ashesh-goplani/agent-deck/.worktrees/watcher-completion
+**Branch:** feat/watcher-completion (off main after v1.5.4 merges locally)
+**Current version:** v1.5.4 (local hotfix series, unpushed)
 **Target version:** v1.6.0
 
-See `/home/ashesh-goplani/agent-deck/.planning/PROJECT.md` for full project context.
-See `/home/ashesh-goplani/agent-deck/.planning/ROADMAP.md` for the v1.6.0 roadmap.
-See `/home/ashesh-goplani/agent-deck/.planning/REQUIREMENTS.md` for requirements and phase mappings.
+See `.planning/PROJECT.md` for full project context.
+See `.planning/ROADMAP.md` for the v1.6.0 roadmap (Waves A + B).
+See `.planning/REQUIREMENTS.md` for requirements and phase mappings.
 
-## Milestone: v1.6.0 — Watcher Framework
+## Milestone: v1.6.0 — Watcher Framework Completion (Wave B)
 
-**Goal:** Add event-driven automation to agent-deck. Watchers listen for external events (email, Slack, webhooks, meeting transcripts) and route them to conductor sessions automatically.
+**Goal:** Close out the watcher framework. Wave A (phases 12-18) shipped engine + adapters + CLI + TUI + triage. Wave B (phases 19-23) writes verification docs, ships the health alerts bridge, reorganizes on-disk state to mirror the conductor folder pattern, syncs skills + repo docs, ships an integration harness, and locks the framework under a CLAUDE.md mandate.
 
-**Source spec:** `docs/superpowers/specs/2026-04-10-watcher-framework-design.md`
-**Starting point:** v1.5.0 (premium web app polish milestone)
+**Source specs:**
+
+- Wave A: `docs/superpowers/specs/2026-04-10-watcher-framework-design.md`
+- Wave B: `docs/WATCHER-COMPLETION-SPEC.md`
+
+**Starting point:** v1.5.4 (local hotfix series)
+**Branch:** feat/watcher-completion (already checked out in this worktree)
 
 ## Current Position
 
-Phase: 18 (Intelligence (Triage and Self-Improving Routing)) — EXECUTING
-Plan: 2 of 6
+Phase: 21
+Plan: Not started
 Status: Ready to execute
-Last activity: 2026-04-11
+Last activity: 2026-04-16 -- Phase 21 planning complete
 
 ## Phase Progress
 
+### Wave A (v1.6.0 build, code shipped 2026-04-10 → 2026-04-11, ledger closed by Wave B Phase 19)
+
+| # | Phase | Status | Requirements |
+|---|-------|--------|--------------|
+| 12 | Schema & Config | Code shipped (SchemaVersion 5) | SCHEMA-01..06 |
+| 13 | Engine Core | VERIFIED COMPLETE (`13-VERIFICATION.md`, 7/7 truths) | ENGINE-01..07 |
+| 14 | Simple Adapters (Webhook + ntfy + GitHub) | VERIFIED COMPLETE (`14-VERIFICATION.md`, 10/10 truths, aggregate 127 tests green under -race) | ADAPT-01, ADAPT-02, ADAPT-03 |
+| 15 | Slack Adapter + watcher import | VERIFIED COMPLETE (`15-VERIFICATION.md`, 7/7 truths, Slack + Watcher suites green under -race) — backfill PLAN + SUMMARY also shipped (REQ-WF-2 closed 2026-04-16, commit e294ed1) | ADAPT-04, CLI-07 |
+| 16 | CLI + TUI Integration | Code shipped beyond plan (8 CLI subcommands + watcher panel); health alerts deferred to Wave B Phase 20 | CLI-01..06, TUI-01, TUI-02, TUI-04 |
+| 17 | Gmail Adapter | Code shipped (~60KB) with OAuth2 + Pub/Sub watch renewal | ADAPT-05, ADAPT-06 |
+| 18 | Intelligence (Triage + Self-Improving Routing) | Code shipped: triage sessions, atomic clients.json updates, watcher-creator skill | INTEL-01..04 |
+
+### Wave B (v1.6.0 completion, this milestone)
+
 | # | Phase | Status | Requirements | Plans |
 |---|-------|--------|--------------|-------|
-| 5 | Critical Regressions | COMPLETE (shipped in v1.4.1) | 6 (REG-01..06 ✓) | — |
-| 6 | Web App Critical P0 Bugs | COMPLETE 2026-04-08 (5/5 plans, WEB-P0-1 ✓ WEB-P0-2 ✓ WEB-P0-3 ✓ WEB-P0-4 mitigation ✓ WEB-P0-4 prevention ✓ + POL-7 ✓) | 4 (WEB-P0-1..4 all ✓) | 5 |
-| 7 | Web App P1 Layout Bugs | COMPLETE 2026-04-09 (4/4 plans, WEB-P1-1 ✓ WEB-P1-2 ✓ WEB-P1-3 ✓ WEB-P1-4 ✓ WEB-P1-5 ✓) | 5 (WEB-P1-1..5 all ✓) | 4 |
-| 8 | Performance (Premium Feel) | COMPLETE 2026-04-09 (5/5 plans, PERF-A..K all ✓) | 11 (PERF-A..K) | 5 |
-| 9 | Polish (Premium UX) | COMPLETE 2026-04-09 (4/4 plans, POL-1 ✓ POL-2 ✓ POL-3 ✓ POL-4 ✓ POL-5 ✓ POL-6 ✓ POL-7 ✓) | 7 (POL-1..7 all ✓) | 4 |
-| 10 | Automated Testing | COMPLETE 2026-04-10 (4/4 plans, TEST-A ✓ TEST-B ✓ TEST-C ✓ TEST-D ✓ TEST-E ✓) | 5 (TEST-A..E all ✓) | 4 |
-| 11 | Release v1.5.0 | Planned (3 plans: 11-01 pre-release verify, 11-02 tag+ship+changelog, 11-03 real-device mobile) | 5 (REL-1..5) | 3 |
+| 19 | Verification Docs (Phases 14 + 15) | COMPLETE — plan 19-01 closed REQ-WF-1 (commit 2c19e3f); plan 19-02 closed REQ-WF-2 (commit e294ed1) | REQ-WF-1 ✓, REQ-WF-2 ✓ | 2 |
+| 20 | Health Alerts Bridge | Planned (depends on 19) | REQ-WF-3 | 1 (RED+GREEN tasks) |
+| 21 | Watcher Folder Hierarchy | Planned (depends on 19) | REQ-WF-6 | 1 (RED+GREEN+migration tasks) |
+| 22 | Skills + Docs Sync | Planned (depends on 21) | REQ-WF-7 | 1 |
+| 23 | Integration Harness + CLAUDE.md Mandate | Planned (depends on 20, 21, 22) | REQ-WF-5, REQ-WF-4 | 2 |
 
-**Total active plans across Phases 6-11:** 25
-**Total active requirements:** 37
+**Wave B totals:** 5 phases, 7 plans, 7 requirements (all mapped, 100% coverage).
 
 ## Accumulated Context
 
@@ -200,6 +217,41 @@ Last activity: 2026-04-11
 - **Pre-calibration fallback used:** `./build/agent-deck web` cannot start inside agent-deck sessions (nested-session detection exits immediately). Conservative Phase 8 spec + CI noise buffers used as documented in the plan. Run `calibrate.sh` from a plain terminal to replace with real calibrated values.
 - **Documentation:** `tests/lighthouse/README.md` covers threshold tiers, CI flow, local verification, recalibration process, troubleshooting (including nested-session limitation), and design decisions (JSON vs CJS, temporary-public-storage, 5 runs, desktop preset).
 
+### Plan 19-01 Complete (2026-04-16) — REQ-WF-1 CLOSED
+
+- **Phase 14 verification doc shipped.** `.planning/phases/14-simple-adapters-webhook-ntfy-github/14-VERIFICATION.md` written from scratch (101 lines) with 10 observable-truth rows, every Evidence cell carrying at least one `internal/watcher/<file>.go:<line>` citation. Matches the structural template set by `13-VERIFICATION.md`.
+- **All path:line anchors re-derived against the current worktree tree.** Plan's must-haves explicitly required this; the 14-01 and 14-02 SUMMARYs quoted drifted numbers from 2026-04-10. Anchors cover webhook.go (194 lines), ntfy.go (213 lines), github.go (356 lines), adapters_integration_test.go (424 lines), plus the 12/12/17 test files.
+- **Central REQ-WF-1 claims anchored:**
+  - WebhookAdapter lifecycle (Setup/Listen/Teardown/HealthCheck) at `internal/watcher/webhook.go:33/65/166/171`
+  - NtfyAdapter 2s/2x/30s backoff at `internal/watcher/ntfy.go:67,70,95-98`
+  - GitHubAdapter constant-time `hmac.Equal` at `internal/watcher/github.go:179`
+  - Integration pipeline test at `internal/watcher/adapters_integration_test.go:29`
+  - Cross-adapter dedup test at `internal/watcher/adapters_integration_test.go:240`
+- **62-test pass claim reproduced live.** `go test ./internal/watcher/... -race -count=1 -timeout 120s` exits 0 in 17.063s. Pass banner `ok  	github.com/asheshgoplani/agent-deck/internal/watcher	17.063s` pasted verbatim into Behavioral Spot-Checks table. Current aggregate is 127 tests (Phase 14 subset still green; Phases 15/17/18 added the surplus) — documented transparently rather than filtered.
+- **Anti-speculation grep clean.** `grep -E "\bTODO\b|\bmight\b|\bprobably\b|\blikely\b" 14-VERIFICATION.md` returns zero matches. 25 `path:line` citations in total (target was ≥8).
+- **Single atomic commit `2c19e3f`:** `docs(19-01): Phase 14 verification doc -- webhook + ntfy + GitHub adapters`. Signed `Committed by Ashesh Goplani`. Zero Claude/Co-Authored-By attribution. Only `14-VERIFICATION.md` staged. Pre-commit hooks passed (fmt-check + vet, .planning-only diff).
+- **No `--no-verify` used.** Honored the repo-root v1.5.4 CLAUDE.md mandate despite this being a `.planning/`-only commit.
+- **REQ-WF-1 ready to be flipped to `[x]` in REQUIREMENTS.md.** Plan 19-02 (Phase 15 backfill, REQ-WF-2) is now unblocked — sibling Wave B Phase 19 plan, no file overlap.
+
+### Plan 19-02 Complete (2026-04-16) — REQ-WF-2 CLOSED; PHASE 19 CLOSED
+
+- **Phase 15 backfill shipped: three docs in one signed commit.** `.planning/phases/15-slack-adapter-and-import/15-01-PLAN.md` (159 lines, reconstructed plan-of-record for the shipped SlackAdapter), `15-01-SUMMARY.md` (130 lines, mirroring the `15-02-SUMMARY.md` template), and `15-VERIFICATION.md` (89 lines, 7 observable-truth rows). Every citation re-derived from the current worktree tree — no trust placed in the line numbers quoted by `15-02-SUMMARY.md`.
+- **All path:line anchors live in the current tree:** `slack.go` 243 lines (Setup L57, Listen L86, streamOnce L109, normalizeSlackEvent L164, normalizeV2 L173 with `Sender: fmt.Sprintf("slack:%s", payload.Channel)` at L181, normalizeV1 L198 with `slack:unknown` at L206, Teardown L216, HealthCheck L222), `slack_test.go` 559 lines (13 tests, `TestSlack_Listen_SenderFormat` at L128, `TestSlack_Listen_V1Fallback` at L285, `TestSlack_Listen_StopNoLeaks` goleak-bounded at L498), `watcher_cmd.go` 816 lines (`mergeClientsJSON` at L666 with atomic `os.Rename` at L708, `importChannels` at L719 with `os.Lstat` at L723 + `symlink not allowed` at L728, `clientKey := fmt.Sprintf("slack:%s", channelID)` at L772), `watcher_cmd_test.go` 544 lines (13 tests including `TestImportChannels_RejectsSymlink` at L300, `TestImportChannels_RejectsDirectory` at L322, `TestImportChannels_EndToEnd` at L208).
+- **Central REQ-WF-2 claims anchored:**
+  - Slack adapter lifecycle satisfies `WatcherAdapter` interface at `internal/watcher/adapter.go:26-38`
+  - `slack:{CHANNEL_ID}` routing key format at `internal/watcher/slack.go:181`
+  - `os.Lstat` symlink rejection primitive at `cmd/agent-deck/watcher_cmd.go:723-728`
+  - `os.Rename` atomic merge primitive at `cmd/agent-deck/watcher_cmd.go:708`
+  - Key-format loop closure: identical `fmt.Sprintf("slack:%s", ...)` on both sides of the router (emitter at `slack.go:181`, writer at `watcher_cmd.go:772`)
+- **Both test suites pass live under -race.** `go test ./internal/watcher/... -run TestSlack -race -count=1 -timeout 120s` exits 0 in 1.357s (`ok  	github.com/asheshgoplani/agent-deck/internal/watcher	1.357s`). `go test ./cmd/agent-deck/... -run Watcher -race -count=1 -timeout 120s` exits 0 in 1.041s (`ok  	github.com/asheshgoplani/agent-deck/cmd/agent-deck	1.041s`). `go build ./internal/watcher/... ./cmd/agent-deck/...` exits 0 with no output. All three banners pasted verbatim into the Behavioral Spot-Checks table of `15-VERIFICATION.md`.
+- **Anti-speculation grep clean across all three docs.** `grep -E "\bTODO\b|\bmight\b|\bprobably\b|\blikely\b"` across 15-01-PLAN.md + 15-01-SUMMARY.md + 15-VERIFICATION.md returns zero matches. A first-draft `TODO` leakage ("TODO comment" describing `generateWatcherToml`) was caught by the Task 4 grep gate and rewritten to "operator-action comment" before commit.
+- **Wrong-phase leakage check passed.** `grep hmac.Equal 15-VERIFICATION.md` returns 0 — HMAC belongs to Phase 14 (GitHub adapter), not Phase 15.
+- **Single atomic commit `e294ed1`:** `docs(19-02): Phase 15 backfill -- Slack adapter PLAN/SUMMARY + Phase 15 VERIFICATION`. Signed `Committed by Ashesh Goplani`. Zero Claude/Co-Authored-By attribution. Only the three new files staged (`15-02-SUMMARY.md` untouched). Pre-commit hooks (lefthook fmt-check + vet) passed cleanly on the `.planning/`-only diff.
+- **No `--no-verify` used.** Honored the repo-root v1.5.4 CLAUDE.md mandate.
+- **Git history records the shipped TDD pair honestly.** `15-01-SUMMARY.md` Task Commits section names the actual commits: `feb50f8` (test(15-01): add failing tests for SlackAdapter) → `be1d1f3` (feat(15-01): implement SlackAdapter with v2 payload parsing and thread routing), both authored by Ashesh Goplani on 2026-04-10.
+- **REQ-WF-2 flipped to `[x]` in REQUIREMENTS.md** (line 19 + traceability table line 43) with the closure note "Closed 2026-04-16 by plan 19-02, commit e294ed1."
+- **Phase 19 CLOSED.** Both plans shipped. Wave B continues with Phase 20 (Health Alerts Bridge, REQ-WF-3) — no file overlap with Phase 19.
+
 ### Plan 10-04 Complete (2026-04-10) — Phase 10 CLOSED
 
 - **TEST-E shipped:** Alert-only weekly regression workflow (Sunday midnight UTC + `workflow_dispatch`) that runs visual regression + Lighthouse CI, creates a labeled GitHub issue with idempotency on failure, and stays silent on success. Three files: `.github/workflows/weekly-regression.yml`, `.github/weekly-regression-issue-template.md` (11 placeholder tokens), and the shell validator `tests/ci/weekly-alert-format.test.sh` (6 structural checks).
@@ -270,15 +322,33 @@ From `.planning/config.json`:
 
 ## Next Action
 
-Phase 7 is COMPLETE. 10 commits live on local main, NOT pushed (per HARD RULES — user owns push/PR/merge/tag). Next: Phase 8 (Performance / Premium Feel — 11 PERF requirements across 5 plans). Phase 8 PERF-K virtualization is now unblocked because Phase 7 plan 03 stabilized SessionRow height at exactly 40 px. Recommended next command in a fresh session: `/gsd:plan-phase 8`.
+**Wave B milestone bootstrapped 2026-04-16.** Awaiting conductor to spawn `gsd-v160-plan-1` for Phase 19 (Verification Docs) planning. Per conductor instruction: **do NOT auto-plan** — this session's job ends with the roadmap.
+
+When conductor spawns the planner, recommended invocation:
+
+```
+/gsd:plan-phase 19
+```
+
+This will produce `.planning/phases/19-verification-docs/{19-01-PLAN.md, 19-02-PLAN.md}` for the two backfill verification docs.
 
 ## Last session
 
-- **Stopped at:** Phase 18 VERIFIED COMPLETE — all 4 INTEL requirements delivered, 30 tests green, clean build with Go 1.24.0. 3 manual verifications pending (real Claude triage, skill UX, real state.db migration).
-- **Timestamp:** 2026-04-09T17:42:25Z
-- **Duration:** ~20 min (tmux-hosted test server avoided 09-02's `script -qfc` debug detour)
-- **Commits:** 03b191f (test(09-01) failing specs + pw-p9-plan1 config), 7f91b26 (feat(09-01) POL-1 skeleton loader), 44d38e2 (fix(09-01) POL-2 GroupRow fade + POL-4 density)
-- **Key issues handled in-flight:** (1) Playwright `baseURL: '/?token=test'` + `page.goto('/')` clobbers the query string — each test must use `page.goto('/?token=test')` explicitly; (2) stale embed.FS bundle after source edit — `make build` alone is insufficient, must run `go generate ./internal/web/...` first to refresh `dist/main.<hash>.js`; (3) test server TTY requirement — wrapped in `tmux new-session -d -s adeck-p9-test` which provides a real pty, cleaner than `script -qfc` from 09-02.
+- **Stopped at:** Phase 19 CLOSED — Plan 19-02 complete, REQ-WF-2 closed with three Phase 15 backfill docs in signed commit e294ed1. Both REQ-WF-1 (plan 19-01, commit 2c19e3f) and REQ-WF-2 (plan 19-02, commit e294ed1) ledger entries closed; Phase 19 is done. Next: Phase 20 Health Alerts Bridge (REQ-WF-3).
+- **Timestamp:** 2026-04-16T00:45:00Z
+- **Duration:** ~15 min (single session, autonomous bootstrap from `docs/WATCHER-COMPLETION-SPEC.md`)
+- **Artifacts produced:**
+  - PROJECT.md: Current Milestone block reframed for Wave B; Active reqs replaced with REQ-WF-1..7; Wave A items moved to Validated with code-shipped notes
+  - REQUIREMENTS.md: New "v1.6.0 Wave B Completion Requirements" section (REQ-WF-1..7) prepended; Wave A retained for history with shipped-but-unverified note
+  - ROADMAP.md: Replaced (was v1.5.1 patch roadmap on this worktree). New v1.6.0 roadmap groups Wave A in `<details>` collapsed and lays out 5 Wave B phases (19-23) with TDD plans
+  - STATE.md: Frontmatter and body retargeted from v1.5.0 to v1.6.0 Wave B; phase progress table split Wave A / Wave B
+- **Key decisions in-flight:**
+  1. **Phase numbering: continuous 19-23.** Roadmap template guideline says "never restart at 01"; existing watcher dirs are 13/14/15. Wave B starts at 19. Spec's `test(16-01)`-style commit prefixes were aspirational; actual prefixes will be `test(19-01)` etc.
+  2. **Verification docs land in existing `.planning/phases/14-...` and `.planning/phases/15-...` dirs**, not `.planning.archived/phases/` (spec was ambiguous; co-locating verification with the phase dir is cleaner and avoids creating new archive paths during a completion milestone).
+  3. **Spec's 7 sub-phases collapsed to 5 GSD phases** per conductor's "5 phases estimated" hint and project convention of bundling TDD RED+GREEN within a single phase. Spec phases 2+3 → Wave B Phase 20 (one plan, two tasks). Spec phases 6+7 → Wave B Phase 23 (two plans).
+  4. **Did NOT delete or archive existing 13/14/15 phase dirs** — they hold shipped Wave A code + tests and remain authoritative for the verification docs Phase 19 will write against.
+  5. **Did NOT run `gsd-tools phases clear`** despite workflow step 6 — that would have destroyed Wave A artifacts.
+- **Hard rules honored:** No push, no tag, no PR, no merge. No Claude attribution in commits. No `--no-verify` (commit pending and will use signed `Committed by Ashesh Goplani` per v1.5.4 mandate).
 
 ## Performance Metrics
 
@@ -299,3 +369,5 @@ Phase 7 is COMPLETE. 10 commits live on local main, NOT pushed (per HARD RULES �
 | Phase 10-automated-testing P02 | 5 | 4 tasks | 5 files |
 | Phase 10-automated-testing P03 | 17min | 7 tasks | 7 files |
 | Phase 18 P04 | 35 | 5 tasks | 7 files |
+| 19 | 01 | ~15 min | 3 | 1 (+ 1 created) | 2026-04-16 |
+| 19 | 02 | ~10 min | 4 | 0 (+ 4 created: 15-01-PLAN.md, 15-01-SUMMARY.md, 15-VERIFICATION.md, 19-02-SUMMARY.md) | 2026-04-16 |

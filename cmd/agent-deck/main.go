@@ -32,7 +32,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.5.0" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.7.20" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -293,11 +293,20 @@ func main() {
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
 			return
+		case "feedback":
+			handleFeedback(args[1:])
+			return
 		case "debug-dump":
 			handleDebugDump()
 			return
 		}
 	}
+
+	// Startup reviver scan (v1.7.8, REPORT-D). Fire-and-forget — rebuilds
+	// control pipes for any instance whose tmux server is alive but whose
+	// pipe got killed by e.g. an SSH logout scope cleanup. Runs in the
+	// background so it never blocks TUI boot. See .planning/v178-ssh-reviver/PLAN.md.
+	go reviveOnStartup(profile)
 
 	// Block TUI launch inside a managed session to prevent infinite nesting.
 	// CLI commands (add, session start/stop, mcp attach, etc.) still work fine.
@@ -312,6 +321,27 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  agent-deck list                    # List sessions")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "To open the TUI, detach first with Ctrl+Q.")
+		os.Exit(1)
+	}
+
+	// Block TUI launch inside a *generic* (non-agentdeck) tmux session (#560).
+	// Detach semantics get confusing when nested: Ctrl+Q returns to the outer
+	// tmux instead of a clean shell. CLI subcommands still work inside tmux —
+	// this guard only fires on the interactive TUI path.
+	if isOuterTmuxWithoutOptIn() {
+		fmt.Fprintln(os.Stderr, "Error: The agent-deck TUI is designed to run OUTSIDE of tmux.")
+		fmt.Fprintln(os.Stderr, "You are inside a tmux session, so Ctrl+Q detach and nested")
+		fmt.Fprintln(os.Stderr, "tmux behavior will be surprising. agent-deck manages its own")
+		fmt.Fprintln(os.Stderr, "tmux sessions internally.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Options:")
+		fmt.Fprintln(os.Stderr, "  • Detach from tmux (Ctrl+B d) and run agent-deck from a clean shell.")
+		fmt.Fprintln(os.Stderr, "  • Run CLI subcommands — they work fine inside tmux:")
+		fmt.Fprintln(os.Stderr, "      agent-deck list                    # List sessions")
+		fmt.Fprintln(os.Stderr, "      agent-deck add /path -t \"Title\"  # Add a new session")
+		fmt.Fprintln(os.Stderr, "      agent-deck session start <id>      # Start a session")
+		fmt.Fprintln(os.Stderr, "  • If you really want to run the TUI anyway, set:")
+		fmt.Fprintln(os.Stderr, "      AGENT_DECK_ALLOW_OUTER_TMUX=1 agent-deck")
 		os.Exit(1)
 	}
 
@@ -433,6 +463,12 @@ func main() {
 
 		logging.Init(logCfg)
 		defer logging.Shutdown()
+
+		// OBS-01: emit the cgroup-isolation decision exactly once on TUI
+		// startup. The line lands in ~/.agent-deck/debug.log via the
+		// dynamicHandler + lumberjack pipeline that logging.Init wires up.
+		// See internal/session/userconfig.go LogCgroupIsolationDecision.
+		session.LogCgroupIsolationDecision()
 
 		if debugMode {
 			logging.ForComponent(logging.CompUI).Info("instance_started",
@@ -604,9 +640,16 @@ func main() {
 	// Disable the Kitty keyboard protocol before starting the TUI.
 	// Wayland terminals (Ghostty, Foot, Alacritty) send keys using CSI u
 	// encoding by default; Bubble Tea v1.3.10 does not parse those sequences,
-	// so uppercase shortcuts and uppercase text input are silently dropped.
-	// Pushing keyboard mode 0 (legacy) restores standard key reporting.
-	// Terminals that don't support the protocol ignore this sequence safely.
+	// so uppercase shortcuts and uppercase text input (including '_') are
+	// silently dropped. Pushing keyboard mode 0 (legacy) restores standard
+	// key reporting. Terminals that don't support the protocol ignore this
+	// sequence safely.
+	//
+	// As a belt-and-suspenders fallback, we also wrap os.Stdin with
+	// NewCSIuReader, which translates any remaining CSI u sequences (including
+	// Shift+hyphen → '_', codepoint 95) to their legacy byte equivalents
+	// before Bubble Tea sees them. This handles terminals that send CSI u
+	// sequences even after the disable request (e.g. tmux with extended-keys).
 	ui.DisableKittyKeyboard(os.Stdout)
 	defer ui.RestoreKittyKeyboard(os.Stdout)
 
@@ -614,6 +657,7 @@ func main() {
 		homeModel,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
+		tea.WithInput(ui.NewCSIuReader(os.Stdin)),
 	)
 
 	// Start maintenance worker (background goroutine, respects config toggle)
@@ -714,9 +758,11 @@ func reorderArgsForFlagParsing(args []string) []string {
 		"-c": true, "--cmd": true,
 		"-m": true, "--message": true,
 		"-p": true, "--parent": true,
-		"--mcp":     true,
-		"--wrapper": true,
-		"-w":        true, "--worktree": true,
+		"--mcp":       true,
+		"--channel":   true,
+		"--extra-arg": true,
+		"--wrapper":   true,
+		"-w":          true, "--worktree": true,
 		"--location":       true,
 		"--resume-session": true,
 		"--sandbox-image":  true,
@@ -898,6 +944,26 @@ func handleAdd(profile string, args []string) {
 		return nil
 	})
 
+	// Plugin channel flag - can be specified multiple times; requires -c claude.
+	// Persisted on Instance.Channels and emitted as --channels <csv> on every
+	// claude Start/Restart so plugin channels deliver inbound messages.
+	var channelFlags []string
+	fs.Func("channel", "Plugin channel id (can specify multiple times); requires -c claude", func(s string) error {
+		channelFlags = append(channelFlags, s)
+		return nil
+	})
+
+	// Extra claude CLI tokens - repeatable; each invocation is one already-
+	// tokenised arg (e.g. --extra-arg --agent --extra-arg reviewer).
+	// Persisted on Instance.ExtraArgs (plaintext — do NOT pass secrets) and
+	// appended verbatim to every claude Start/Restart/Fork command via
+	// buildClaudeExtraFlags.
+	var extraArgFlags []string
+	fs.Func("extra-arg", "Extra claude CLI token (can specify multiple times); requires -c claude; persisted plaintext — no secrets", func(s string) error {
+		extraArgFlags = append(extraArgFlags, s)
+		return nil
+	})
+
 	// Sandbox flags
 	sandbox := fs.Bool("sandbox", false, "Run session in Docker sandbox")
 	sandboxImage := fs.String("sandbox-image", "", "Docker image for sandbox (overrides config default)")
@@ -930,6 +996,7 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck -p work add               # Add to 'work' profile")
 		fmt.Println("  agent-deck add -t \"Sub-task\" --parent \"Main Project\"  # Create sub-session")
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
+		fmt.Println("  agent-deck add -t \"Bot\" -c claude --channel plugin:telegram@user/repo .  # subscribe to plugin channel")
 		fmt.Println("  agent-deck add -c opencode --wrapper \"nvim +'terminal {command}' +'startinsert'\" .")
 		fmt.Println("  agent-deck add -c \"codex --dangerously-bypass-approvals-and-sandbox\" .")
 		fmt.Println("  agent-deck add -c gemini --yolo .")
@@ -967,7 +1034,7 @@ func handleAdd(profile string, args []string) {
 	if *worktreeBranchLong != "" {
 		wtBranch = *worktreeBranchLong
 	}
-	_ = *newBranch || *newBranchLong
+	createNewBranch := *newBranch || *newBranchLong
 
 	// Merge short and long flags
 	sessionTitle := mergeFlags(*title, *titleShort)
@@ -1101,14 +1168,28 @@ func handleAdd(profile string, args []string) {
 			os.Exit(1)
 		}
 
+		// Determine worktree settings and apply configured branch prefix
+		// (e.g., "$USER/" -> "dani.fernandez/") before validation/existence checks
+		wtSettings := session.GetWorktreeSettings()
+		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
+
 		// Pre-validate branch name for better error messages
 		if err := git.ValidateBranchName(wtBranch); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: invalid branch name: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Determine worktree location: CLI flag overrides config
-		wtSettings := session.GetWorktreeSettings()
+		// Check -b flag logic: if -b is passed, branch must NOT exist (user wants new branch)
+		branchExists := git.BranchExists(repoRoot, wtBranch)
+		if createNewBranch && branchExists {
+			fmt.Fprintf(
+				os.Stderr,
+				"Error: branch '%s' already exists (remove -b flag to use existing branch)\n",
+				wtBranch,
+			)
+			os.Exit(1)
+		}
+
 		location := wtSettings.DefaultLocation
 		if *worktreeLocation != "" {
 			location = *worktreeLocation
@@ -1197,6 +1278,25 @@ func handleAdd(profile string, args []string) {
 	if sessionCommandInput != "" {
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		newInstance.Command = sessionCommandResolved
+	}
+
+	// Apply --channel flags (claude only — channels is a Claude Code CLI flag).
+	if len(channelFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			fmt.Println("Error: --channel only supported for claude sessions (use -c claude); requires --channels on the claude binary")
+			os.Exit(1)
+		}
+		newInstance.Channels = channelFlags
+	}
+
+	// Apply --extra-arg flags (claude only for now — these are passed to the
+	// claude binary via buildClaudeExtraFlags; other tools have their own builders).
+	if len(extraArgFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			fmt.Println("Error: --extra-arg only supported for claude sessions (use -c claude); claude is the only tool whose builder appends user extra args")
+			os.Exit(1)
+		}
+		newInstance.ExtraArgs = extraArgFlags
 	}
 
 	// Set wrapper if provided
@@ -1443,7 +1543,12 @@ func handleList(profile string, args []string) {
 			CreatedAt     time.Time `json:"created_at"`
 			SSHHost       string    `json:"ssh_host,omitempty"`
 			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
+			Channels      []string  `json:"channels,omitempty"`
+			ExtraArgs     []string  `json:"extra_args,omitempty"`
 		}
+		// Warm tmux pane-title cache + load hook statuses so the CLI
+		// reports the same Status the TUI and /api/menu do (issue #610).
+		session.RefreshInstancesForCLIStatus(instances)
 		sessions := make([]sessionJSON, len(instances))
 		for i, inst := range instances {
 			_ = inst.UpdateStatus()
@@ -1459,6 +1564,8 @@ func handleList(profile string, args []string) {
 				CreatedAt:     inst.CreatedAt,
 				SSHHost:       inst.SSHHost,
 				SSHRemotePath: inst.SSHRemotePath,
+				Channels:      inst.Channels,
+				ExtraArgs:     inst.ExtraArgs,
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
@@ -1799,6 +1906,9 @@ type statusCounts struct {
 
 // countByStatus counts sessions by their status
 func countByStatus(instances []*session.Instance) statusCounts {
+	// Warm tmux pane-title cache + load hook statuses so `status`/`status --json`
+	// reports the same counts the TUI and /api/menu do (issue #610).
+	session.RefreshInstancesForCLIStatus(instances)
 	var counts statusCounts
 	for _, inst := range instances {
 		_ = inst.UpdateStatus() // Refresh status from tmux
@@ -2153,6 +2263,7 @@ func handleProfileSetDefault(out *CLIOutput, name string) {
 func handleUpdate(args []string) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	checkOnly := fs.Bool("check", false, "Only check for updates, don't install")
+	targetVersion := fs.String("version", "", "Install a specific released version (e.g. 1.7.3); may be a downgrade")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck update [options]")
@@ -2163,12 +2274,18 @@ func handleUpdate(args []string) {
 		fs.PrintDefaults()
 		fmt.Println()
 		fmt.Println("Examples:")
-		fmt.Println("  agent-deck update           # Check and install if available")
-		fmt.Println("  agent-deck update --check   # Only check, don't install")
+		fmt.Println("  agent-deck update              # Check and install latest if available")
+		fmt.Println("  agent-deck update --check      # Only check, don't install")
+		fmt.Println("  agent-deck update --version 1.7.3  # Install a specific version (may downgrade)")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
+	}
+
+	if strings.TrimSpace(*targetVersion) != "" {
+		handleUpdateToSpecificVersion(*targetVersion, *checkOnly)
+		return
 	}
 
 	fmt.Printf("Agent Deck v%s\n", Version)
@@ -2258,6 +2375,91 @@ func handleUpdate(args []string) {
 
 	// Offer to update remotes
 	updateRemotesAfterLocalUpdate(info.LatestVersion)
+}
+
+// handleUpdateToSpecificVersion installs a user-specified release version.
+// Unlike the default update flow, this bypasses the "is this newer?" check so
+// callers can reinstall or downgrade to a prior release on purpose.
+func handleUpdateToSpecificVersion(requested string, checkOnly bool) {
+	fmt.Printf("Agent Deck v%s\n", Version)
+
+	normalized := update.NormalizeReleaseTag(requested)
+	if normalized == "" {
+		fmt.Println("Error: --version requires a non-empty version (e.g. 1.7.3)")
+		os.Exit(1)
+	}
+	targetVersion := strings.TrimPrefix(normalized, "v")
+
+	installPath, homebrewUpgradeCmd, homebrewManaged, hbErr := update.DetectHomebrewManagedInstall()
+	if hbErr != nil {
+		homebrewManaged = false
+	}
+	if homebrewManaged {
+		fmt.Printf("\nHomebrew-managed install detected at %s\n", installPath)
+		fmt.Printf("Pinning to a specific version is not supported via this command.\n")
+		fmt.Printf("Use Homebrew directly, or run `%s` for the latest.\n", homebrewUpgradeCmd)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Fetching release %s...\n", normalized)
+	release, err := update.FetchReleaseByTag(normalized)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	downloadURL := update.GetAssetURLForPlatform(release, runtime.GOOS, runtime.GOARCH)
+	if downloadURL == "" {
+		fmt.Printf("Error: release %s has no binary for %s/%s\n", normalized, runtime.GOOS, runtime.GOARCH)
+		os.Exit(1)
+	}
+
+	cmp := update.CompareVersions(Version, targetVersion)
+	switch {
+	case cmp == 0:
+		fmt.Printf("\n↻ Reinstalling v%s (current = requested)\n", targetVersion)
+	case cmp < 0:
+		fmt.Printf("\n⬆ Installing v%s → v%s\n", Version, targetVersion)
+	default:
+		fmt.Printf("\n⬇ Downgrading v%s → v%s\n", Version, targetVersion)
+	}
+	fmt.Printf("  Release: %s\n", release.HTMLURL)
+
+	if checkOnly {
+		fmt.Println("\nRun without --check to install.")
+		return
+	}
+
+	drainStdin()
+	defaultYes := cmp <= 0
+	prompt := fmt.Sprintf("\nInstall v%s now? [Y/n] ", targetVersion)
+	if !defaultYes {
+		prompt = fmt.Sprintf("\nDowngrade to v%s now? [y/N] ", targetVersion)
+	}
+	fmt.Print(prompt)
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(strings.ToLower(response))
+
+	confirmed := response == "y" || response == "yes" || (defaultYes && response == "")
+	if !confirmed {
+		fmt.Println("Update cancelled.")
+		return
+	}
+
+	fmt.Println()
+	if err := update.PerformUpdate(downloadURL); err != nil {
+		fmt.Printf("Error installing v%s: %v\n", targetVersion, err)
+		os.Exit(1)
+	}
+
+	if err := update.UpdateBridgePy(); err != nil {
+		fmt.Printf("Warning: Failed to update bridge.py: %v\n", err)
+		fmt.Println("  You can manually refresh it with: agent-deck conductor setup <name>")
+	}
+
+	fmt.Printf("\n✓ Installed v%s\n", targetVersion)
+	fmt.Println("  Restart agent-deck to use this version.")
 }
 
 func runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd string) error {
@@ -2912,6 +3114,25 @@ func handleUninstall(args []string) {
 // Uses GetCurrentSessionID() which checks if the current tmux session name matches agentdeck_*.
 func isNestedSession() bool {
 	return GetCurrentSessionID() != ""
+}
+
+// isOuterTmuxWithoutOptIn reports true when the user is launching the
+// interactive TUI from inside a NON-agentdeck tmux session without the
+// AGENT_DECK_ALLOW_OUTER_TMUX=1 opt-in. See issue #560: nesting the TUI
+// inside an outer tmux leads to confusing detach semantics (Ctrl+Q returns
+// to the outer tmux, not a clean shell). The guard fires only on the TUI
+// path — CLI subcommands remain usable inside tmux.
+func isOuterTmuxWithoutOptIn() bool {
+	if os.Getenv("TMUX") == "" {
+		return false
+	}
+	if isNestedSession() {
+		return false
+	}
+	if os.Getenv("AGENT_DECK_ALLOW_OUTER_TMUX") == "1" {
+		return false
+	}
+	return true
 }
 
 // ensureTmuxInPath checks that tmux is reachable. If exec.LookPath fails
