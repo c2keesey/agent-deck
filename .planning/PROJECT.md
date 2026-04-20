@@ -8,30 +8,30 @@ Terminal session manager for AI coding agents. Go + Bubble Tea TUI that manages 
 
 Reliable session management for AI coding agents: users can create, monitor, and control many concurrent agent sessions from anywhere (desktop terminal, mobile browser, web) without losing work or context.
 
-## Current Milestone: v1.5.0 — Premium Web App
+## Current Milestone: v1.6.0 — Watcher Framework Completion
 
-**Starting point:** v1.4.1 (2026-04-08). v1.4.0 shipped the web app redesign with 4 executed phases (Tailwind precompile, critical bug fixes, UX/cosmetic polish). v1.4.1 was an emergency patch that fixed 6 regressions shipped with v1.4.0 (REG-01 through REG-06: CSI u reader, tmux scrollback, mousewheel, conductor heartbeat, tmux PATH detection, bash -c quoting).
+**Starting point:** v1.5.4 (local, unpushed — 2026-04-16). v1.5.0 shipped premium web app polish (Phase 11 release pending). v1.5.1–v1.5.4 are local hotfixes (web-terminal resize, underscore input, Ctrl+C detach regression, scrollback contamination, session-persistence, feedback-closeout, per-group claude config). v1.5.4 introduced a CLAUDE.md mandate at repo root forbidding `--no-verify` on source commits.
 
-**User testing verdict (post-v1.4.1):**
-- **4 P0 bugs remain** from the v1.3.4 audit that were NOT actually fixed in v1.4.0 (profile switcher broken, mobile topbar hamburger unclickable, session title truncation STILL broken, mutations-disabled toast spam)
-- **5 P1 layout bugs** (sidebar density, terminal panel sizing, fixed sidebar width, empty-state void, mobile topbar overflow)
-- **12 performance bottlenecks** (no gzip = 518 KB extra wire per cold load, Chart.js blocking, WebGL broken fallback, listener leaks, etc.)
-- **7 polish items** that separate "works" from "premium"
+**Goal:** Close out the watcher framework. Wave A (phases 12–18) shipped the core engine, adapters, CLI, TUI, triage, self-improving routing, and Gmail watcher across 2026-04-10 → 2026-04-11. **Wave B (this milestone, phases 19–23)** adds the missing verification docs for phases 14+15, implements the health alerts bridge (phase 16 from the design spec), reorganizes on-disk state into the conductor-style folder hierarchy, syncs the watcher-creator skill + repo docs to the new layout, ships an end-to-end integration harness, and locks the framework under a CLAUDE.md test-coverage mandate.
 
-**Goal:** Ship a **premium-quality** v1.5.0 where the web app feels instant and snappy, all remaining bugs are fixed, the desktop uses screen real estate properly, mobile is fully functional, the terminal fills its pane, and automated visual regression tests prevent future regressions. The app should represent what agent-deck deserves: premium, polished, production-ready.
+**Source specs:**
+- `docs/superpowers/specs/2026-04-10-watcher-framework-design.md` (Wave A, original design)
+- `docs/WATCHER-COMPLETION-SPEC.md` (Wave B, this milestone)
 
-**Source spec:** `docs/WEB-APP-V15-SPEC.md`
+**Wave A delivered (phases 12–18, code shipped, ledger to be reconciled):**
+- Watcher engine core (adapter/router/health/event+dedup) — Phase 13
+- Webhook + ntfy + GitHub adapters — Phase 14 (no verification doc yet)
+- Slack adapter + `watcher import` migration — Phase 15 (no verification doc yet)
+- CLI (8 subcommands) and TUI watcher panel — Phase 16 (code shipped beyond original plan)
+- Gmail adapter with OAuth2 + Pub/Sub watch renewal — Phase 17
+- Triage sessions, self-improving routing, watcher-creator skill — Phase 18
 
-**Target features:**
-- All 4 P0 bugs fixed and visually verified
-- All 5 P1 layout bugs fixed
-- First-load wire size < 150 KB gzipped (from 668 KB today)
-- FCP < 500ms, LCP < 1s, TBT < 100ms
-- Zero JS errors on load, zero listener leaks
-- Profile switching actually works (or is removed if out-of-scope)
-- Mobile fully functional on iPhone SE (375×667), iPhone 14 (390×844), iPad (768×1024)
-- Visual regression tests in CI blocking merge on >0.1% diff
-- Release v1.5.0 published with comprehensive changelog
+**Wave B target (this milestone, phases 19–23):**
+- Phase 19 — Verification docs for phases 14+15 (REQ-WF-1, REQ-WF-2)
+- Phase 20 — Health alerts bridge over conductor notification channels (REQ-WF-3)
+- Phase 21 — Watcher folder hierarchy mirroring conductor pattern, with legacy migration (REQ-WF-6)
+- Phase 22 — Skills + docs sync to the new singular `~/.agent-deck/watcher/` layout (REQ-WF-7)
+- Phase 23 — Visual verification harness + CLAUDE.md watcher-test mandate (REQ-WF-5, REQ-WF-4)
 
 ## Requirements
 
@@ -62,108 +62,71 @@ Reliable session management for AI coding agents: users can create, monitor, and
 - ✓ WEB-P0-2: profile switcher shipped as Option B read-only label (single-profile `role="status"`, multi-profile `aria-disabled` listbox) — decision gate resolved: `server.go:79` binds `cfg.Profile` once at `NewServer()`, per-request override out of scope — v1.5.0 Phase 6
 - ✓ WEB-P0-3: session title truncation eliminated (action toolbar converted from in-flow flex to `absolute right-2 top-1/2` overlay, title width 82px → 184px at 1280x800; row height stable at 44px for PERF-K) — v1.5.0 Phase 6
 - ✓ WEB-P0-4 + POL-7: toast stack capped at 3, errors sticky, `ToastHistoryDrawer` persists last 50 to localStorage; prevention layer hides write buttons + `CreateSessionDialog` when `webMutations=false` — v1.5.0 Phase 6
+- ✓ Watcher engine core: `WatcherAdapter` interface (Setup/Listen/Teardown/HealthCheck), `Event` with `DedupKey`, single-writer engine goroutine, `INSERT OR IGNORE` dedup, `HealthTracker` with rolling rate + silence detection — v1.6.0 Wave A Phase 13
+- ✓ Webhook + ntfy + GitHub adapters: `internal/watcher/{webhook,ntfy,github}.go` with HMAC-SHA256 verification, ntfy backoff (2s/2x/30s), 62 tests pass with `-race` — v1.6.0 Wave A Phase 14 (verification doc owed by Wave B Phase 19)
+- ✓ Slack adapter + `watcher import` migration: `internal/watcher/slack.go` 450+ lines, `cmd/agent-deck/watcher_cmd.go` 22KB, atomic merge with `Lstat` symlink rejection, 50+ tests — v1.6.0 Wave A Phase 15 (verification doc owed by Wave B Phase 19)
+- ✓ Watcher CLI (8 subcommands) + TUI panel: `cmd/agent-deck/watcher_cmd.go` covering create/start/stop/list/status/test/routes/import + `install-skill`; `internal/ui/watcher_panel.go` with status indicators and quick actions — v1.6.0 Wave A Phase 16 (shipped beyond original plan)
+- ✓ Gmail adapter: OAuth2 with `ReuseTokenSource`, Pub/Sub `users.Watch()`, watch_expiry persistence + 1hr-pre-expiry renewal — v1.6.0 Wave A Phase 17
+- ✓ Triage sessions + self-improving routing + watcher-creator skill: `internal/watcher/{triage,triage_reaper,triage_prompt,clients_writer}.go`, embedded `watcher-creator` skill, 5/hr rate limit — v1.6.0 Wave A Phase 18
 
-### Active (v1.5.0 scope)
+### Active (v1.6.0 Wave B — completion scope)
 
-**Phase 5 — Critical Regressions (SHIPPED in v1.4.1):**
-- [x] REG-01: CSI u reader wired, Shift+letter no longer dropped (PR #535)
-- [x] REG-02: tmux scrollback preserved, history-limit respected (PR #533)
-- [x] REG-03: Mousewheel no longer shows [0/0] (PR #531)
-- [x] REG-04: Conductor heartbeat works on Linux (PR #522)
-- [x] REG-05: tmux detected from well-known paths when not in PATH (PR #525)
-- [x] REG-06: bash -c quoting bug fixed (PR #526)
+Detailed requirements in `.planning/REQUIREMENTS.md` § "v1.6.0 Wave B Completion Requirements".
 
-**Phase 6 — Web App Critical P0 Bugs (COMPLETE 2026-04-08, 5/5 plans):**
-- [x] WEB-P0-1: Mobile hamburger clickable (7-level z-index scale, hamburger `z-topbar-primary:45`, right-side controls `z-topbar:40`)
-- [x] WEB-P0-2: Profile switcher shipped as Option B read-only label (Option A ruled out: `server.go:79` binds profile once at NewServer())
-- [x] WEB-P0-3: Session title truncation fixed (action toolbar absolute-positioned, 186px reservation eliminated, row height stable)
-- [x] WEB-P0-4: Mitigation (cap-3 toast + sticky errors + history drawer) + prevention (mutationsEnabledSignal hides write UI when webMutations=false)
+Wave A scope (originally tracked as Active) has shipped as code; verification ledger is closed by Wave B Phase 19. Wave A items are listed under Validated below.
 
-**Phase 7 — Web App P1 Layout Bugs:**
-- [ ] WEB-P1-1: Terminal panel fills its container (tmux pane resize matches browser viewport, or xterm fit addon triggers correctly)
-- [ ] WEB-P1-2: Sidebar fluid width via `clamp(260px, 22vw, 380px)` OR drag handle to resize
-- [ ] WEB-P1-3: Sidebar row density increased to 40-44px (20+ sessions visible instead of 12)
-- [ ] WEB-P1-4: Empty-state dashboard uses card layout with max-width on big screens
-- [ ] WEB-P1-5: Mobile topbar collapses right-side controls into overflow menu when viewport < 600px
-
-**Phase 8 — Performance (Premium Feel):**
-- [ ] PERF-A: gzip compression on static files (~518 KB saved on wire per cold load)
-- [ ] PERF-B: Chart.js deferred or lazy-imported (206 KB no longer blocks parser)
-- [ ] PERF-C: xterm canvas fallback fixed or dead fallback removed
-- [ ] PERF-D: WebGL addon (126 KB) lazy-loaded via dynamic import
-- [ ] PERF-E: Event listener leak fixed (no more 290→625 growth over session)
-- [ ] PERF-F: Search typing debounced (no more 33ms / 2-frame lag)
-- [ ] PERF-G: Sidebar buttons memoized (no full-tree rerender on collapse toggle)
-- [ ] PERF-H: ES module bundling via esbuild --bundle --splitting --format=esm
-- [ ] PERF-I: `/api/costs/batch` converted from GET query to POST body (avoids 414)
-- [ ] PERF-J: Cache-Control: public, max-age=31536000, immutable on hashed assets
-- [ ] PERF-K: SessionList virtualized to lower DOM baseline (876 nodes + 290 listeners)
-
-**Phase 9 — Polish (Premium UX):**
-- [ ] POL-1: Skeleton loading state eliminates 126ms of blank UI before sidebar renders
-- [ ] POL-2: Action button transitions (opacity 120ms instead of snap)
-- [ ] POL-3: Profile dropdown filters `_*` test profiles + scrollable when long
-- [ ] POL-4: Group divider gap reduced from 48px to 12-16px
-- [ ] POL-5: Cost dashboard respects user locale for currency symbol
-- [ ] POL-6: Light theme re-audited for all surfaces
-- [x] POL-7: Stacked toast auto-dismiss + stack cap (shipped early with WEB-P0-4 in Phase 6, same Toast.js refactor)
-
-**Phase 10 — Automated Testing (No More Regressions):**
-- [ ] TEST-A: Visual regression in CI with committed baselines blocking merge on >0.1% diff
-- [ ] TEST-B: Lighthouse CI with FCP/LCP/TBT thresholds blocking merge
-- [ ] TEST-C: Functional E2E covering session lifecycle and group CRUD via web
-- [ ] TEST-D: Mobile E2E at 375×667, 390×844, 768×1024 viewports
-- [ ] TEST-E: Auto-fix loop on scheduled weekly workflow (visual fail → agent creates fix PR)
-
-**Phase 11 — Release v1.5.0:**
-- [ ] REL-1: v1.5.0 tagged with clean build (`vcs.modified=false`), Go 1.24.0 toolchain verified
-- [ ] REL-2: Visual verification (`scripts/visual-verify.sh`) passes for all 5 TUI states
-- [ ] REL-3: Manual macOS smoke test passes (session create, restart, stop with existing state.db)
-- [ ] REL-4: v1.5.0 changelog documents regressions + P0/P1 fixes + perf + polish + testing
-- [ ] REL-5: Mobile verified on real device over Tailscale (iPhone + iPad)
+- [x] **REQ-WF-1**: Phase 14 verification doc — webhook + ntfy + GitHub adapters, observable truths with `path:line` citations (Closed 2026-04-16 by Phase 19 plan 19-01, commit 2c19e3f)
+- [x] **REQ-WF-2**: Phase 15 backfill (PLAN, SUMMARY, VERIFICATION) — Slack adapter + `watcher import` (Closed 2026-04-16 by Phase 19 plan 19-02, commit e294ed1)
+- [x] **REQ-WF-3**: Health alerts bridge (`internal/watcher/health_bridge.go`) — silence/error/teardown triggers, 15-min debounce, opt-in via `[watcher.alerts]` config (Closed 2026-04-16 by Phase 20 plan 20-01, commit ab139b3)
+- [ ] **REQ-WF-6**: Watcher folder hierarchy mirroring `~/.agent-deck/conductor/` — singular `watcher/` dir with per-instance `meta.json`/`state.json`/`task-log.md`/`LEARNINGS.md`, atomic legacy migration with one-cycle symlink fallback
+- [ ] **REQ-WF-7**: Skills + docs sync — embedded `watcher-creator` SKILL.md, repo SKILL.md, README, design-spec addendum, CHANGELOG; new `TestSkillDriftCheck_WatcherCreator` to lock against future drift
+- [ ] **REQ-WF-5**: `scripts/verify-watcher-framework.sh` end-to-end harness — boots ephemeral webhook, posts synthetic event, asserts routing, exits non-zero on failure, runs in <60s on macOS/Linux
+- [ ] **REQ-WF-4**: CLAUDE.md "Watcher framework: mandatory test coverage" section — pinned commands for `internal/watcher/...` + `cmd/agent-deck/... -run "Watcher"`, RFC requirement for removing health bridge / dedup / HMAC verification
 
 ### Out of Scope
 
-- **Tech stack change** — Preact + HTM + Tailwind + xterm.js is locked (v1.4.0 research verdict). No framework swap.
-- **SQLite schema changes** — v1.5.0 explicitly avoids schema changes to prevent recurrence of PR #385 ALTER TABLE incident. Any persistence goes to localStorage.
-- **Windows native support** — Tailscale from Mac/iPhone covers remote access; Windows demand not yet validated.
-- **Complete rewrites** — This is a polish milestone. Any component that "needs rewriting" must be isolated in its own plan with explicit justification.
-- **New features beyond the spec** — Scope is locked to the spec document. Feature requests defer to v1.6+.
-- **iOS/Android native apps** — PWA via web app remains the mobile path.
-- **Runtime profile switching via API** — If WEB-P0-2 is implemented, it's via page reload with `?profile=X`; no backend runtime switch (would require re-architecting the profile isolation model).
+- **Managed Agents / Agent SDK** — Both require API key billing, incompatible with subscription-based Claude Code sessions. All intelligence runs via agent-deck session launch.
+- **Always-on LLM router** — Config-driven routing handles 95%+ of cases; triage session fallback for unknowns. No persistent LLM process for routing.
+- **Web UI for watcher management** — v1.6.0 focuses on TUI + CLI. Web watcher panel deferred to v1.7+.
+- **IMAP IDLE adapter** — Requires always-running TCP connection. Gmail Pub/Sub is the recommended path for Google accounts. IMAP deferred.
+- **End-user watcher marketplace** — Community adapters are a future possibility but not v1.6.0 scope.
+- **Windows native support** — Carried from v1.5.0. Tailscale covers remote access.
+- **iOS/Android native apps** — Carried from v1.5.0. PWA via web app remains the mobile path.
 
 ## Context
 
-**Brownfield:** Mature codebase at v1.4.1. Codebase map is in `.planning/codebase/`. Architecture is a layered Go monolith: `cmd/agent-deck` → `internal/ui` (Bubble Tea TUI, ~12K lines) + `internal/web` (HTTP/WS/SSE server) + `internal/session` (data model) + `internal/tmux` (tmux abstraction) + `internal/statedb` (SQLite via `modernc.org/sqlite`, no CGO).
+**Brownfield:** Mature codebase at v1.5.0. Architecture is a layered Go monolith: `cmd/agent-deck` → `internal/ui` (Bubble Tea TUI, ~12K lines) + `internal/web` (HTTP/WS/SSE server) + `internal/session` (data model) + `internal/tmux` (tmux abstraction) + `internal/statedb` (SQLite via `modernc.org/sqlite`, no CGO).
 
-**Frontend architecture:** `internal/web/static/app/` holds Preact components. v1.4.0 introduced `go generate` for Tailwind compilation producing `internal/web/static/styles.css`. v1.5.0 introduces a JavaScript bundling step via esbuild to consolidate 24 separate ES module fetches into a split bundle (PERF-H).
+**Conductor subsystem (blueprint for watchers):** `internal/session/conductor.go` defines ConductorMeta, `cmd/agent-deck/conductor_cmd.go` handles CLI dispatch (setup/teardown/status/list). Conductors have `~/.agent-deck/conductor/<name>/meta.json`, TUI rendering, and Telegram/Slack/Discord notification bridge. Watchers follow this exact pattern with `~/.agent-deck/watchers/<name>/meta.json`.
 
-**Testing landscape:** Playwright E2E in `tests/e2e/` (25 specs covering desktop + mobile). v1.5.0 adds visual regression with committed baselines, Lighthouse CI for perf budgets, and auto-fix weekly workflow.
+**Existing watcher infrastructure (bash, production-validated):** `~/.agent-deck/issue-watcher/` handles GitHub issues and Slack bug reports via Cloudflare Worker → ntfy.sh → bash handler → `agent-deck launch`. Config-driven routing via `channels.json`. Thread-reply routing back to original sessions. v1/v2 payload versioning for ntfy 4KB limit. Per-channel dedup, logging, and user filtering.
 
-**Performance baseline (v1.4.1):** 668 KB first-load wire (uncompressed), Chart.js blocks parser, WebGL addon eagerly loaded, 290 listeners at rest, 876 DOM nodes before any session, no gzip, no cache headers. v1.5.0 target: <150 KB gzipped, FCP<500ms, LCP<1s, TBT<100ms.
+**Existing Go watcher patterns:** `internal/session/event_watcher.go` (fsnotify + channel), `internal/ui/storage_watcher.go` (polling + channel), `internal/costs/watcher.go`. All use context cancellation, goroutine lifecycle, and buffered channels.
 
-**Key files to modify (from spec):**
-- Frontend: `app/Sidebar.js` (P0-1, P1-2, P1-3, PERF-G, PERF-K), `app/SessionList.js` (P0-3, PERF-K), `app/TerminalPanel.js` (P1-1, PERF-E), `app/CostDashboard.js` (PERF-B), `app/SearchFilter.js` (PERF-F), `app/AppShell.js` (P1-5 mobile topbar, POL-3 profile), `app/Toast.js` (P0-4, POL-7), `app/EmptyStateDashboard.js` (P1-4)
-- Backend: `server.go` (gzip handler, cache headers), `handlers_costs.go` (PERF-I POST conversion), `static_files.go` (gzip + cache)
-- Build: `Makefile` (esbuild integration), new `esbuild.config.mjs` or `go generate` for JS bundling
-- Tests: new `tests/e2e/visual/` specs, `tests/e2e/mobile/` specs, `.github/workflows/visual-regression.yml`, `.github/workflows/lighthouse-ci.yml`, `.github/workflows/auto-fix-weekly.yml`
+**Key files to create:**
+- New package: `internal/watcher/` (adapter.go, router.go, webhook.go, engine.go, config.go, health.go)
+- CLI: `cmd/agent-deck/watcher_cmd.go`
+- DB: new tables in `internal/statedb/statedb.go`
+- Config: `WatcherSettings` in `internal/session/userconfig.go`
+- TUI: watcher panel additions in `internal/ui/home.go`
 
-**GitHub issues still tracked for future:** #391 (per-session colors), #434 (Ctrl+Q), #447 (reorg groups) — deferred to v1.6+.
+**Key files to modify:**
+- `cmd/agent-deck/main.go` (add `case "watcher"` dispatch)
+- `internal/statedb/statedb.go` (add watchers + watcher_events tables)
+- `internal/session/userconfig.go` (add WatcherSettings to UserConfig)
+
+**GitHub issues still tracked:** #391 (per-session colors), #434 (Ctrl+Q), #447 (reorg groups) — deferred to v1.7+.
 
 ## Constraints
 
-- **Tech stack**: Preact + HTM + Tailwind + xterm.js — locked from v1.4.0 research. No framework swap.
 - **Go toolchain**: Pinned to 1.24.0 via `GOTOOLCHAIN=go1.24.0` in `Makefile` and `.goreleaser.yml`. Go 1.25 silently breaks macOS TUI (2026-03-26 incident). Non-negotiable.
-- **No SQLite schema changes**: v1.5.0 explicitly avoids schema changes. localStorage for any new persistence.
-- **No backend runtime profile switching**: If WEB-P0-2 is solved, it's via page reload with `?profile=X`. Profile isolation model stays intact.
+- **SQLite schema changes require ALTER TABLE migration**: Every new column in CREATE TABLE MUST also have a corresponding ALTER TABLE in the alterMigrations slice. PR #385 incident: missing migration broke all existing users.
+- **Subscription-only intelligence**: No API key billing. All LLM work runs in Claude Code sessions launched via `agent-deck launch` (subscription-based). Watcher layer and router are pure Go (no LLM calls).
 - **Batch sizing**: 3-5 PRs per batch with `make ci` + macOS TUI test between each batch. Never merge 15+ PRs at once (the v0.27.0 anti-pattern).
 - **Release builds**: Must verify `vcs.modified=false` via `go version -m ./build/agent-deck`. Dirty builds never ship.
 - **Visual verification**: Mandatory before every release. `scripts/visual-verify.sh` must pass for all 5 TUI states.
-- **Performance target**: First-load < 150 KB gzipped (from 668 KB). FCP < 500ms, LCP < 1s, TBT < 100ms.
-- **Mobile**: Must work on 375px viewport (iPhone SE) and up.
 - **Testing philosophy**: Every shipped bug is a missing test. Regression test must be written *before* the fix, and must fail without the fix.
-- **Visual regression gate**: CI blocks merge when visual diff > 0.1%. Baselines committed per bug.
-- **Lighthouse gate**: CI blocks merge when FCP > 500ms, LCP > 1s, or TBT > 100ms.
+- **Conductor pattern compliance**: Watchers must follow conductor patterns: meta.json filesystem layout, statedb persistence, TUI panel rendering, CLI subcommand dispatch. No divergent infrastructure.
 
 ## Key Decisions
 
@@ -183,6 +146,26 @@ Reliable session management for AI coding agents: users can create, monitor, and
 | Locale-aware currency formatting (POL-5) | `'$' + v.toFixed(2)` ignores user locale; premium apps format per `navigator.language`. | ✓ Resolved Phase 9 plan 09-02 (module-level `Intl.NumberFormat(navigator.language, {style: 'currency', currency: 'USD'})` memoized; both `fmt()` and chart y-axis tick callback delegate to the same instance). |
 | Skeleton loader matching final layout (POL-1) | Users see "No sessions" flicker during the cold-load gap before `/api/menu` returns. Linear/Vercel pattern: render a layout-matched skeleton stack. | ✓ Resolved Phase 9 plan 09-01 (new `sessionsLoadedSignal`, tri-state render in SessionList.js, `animate-pulse motion-reduce:animate-none`). |
 | auto_advance disabled in GSD config | User explicitly requested each stage in a separate session for context hygiene | ✓ Enforced |
+| Pure Go watcher layer (no LLM in routing) | Managed Agents and Agent SDK require API key billing, incompatible with Max subscription. Config-driven routing handles 95%+ of cases at zero cost. | — Pending (v1.6.0) |
+| Extend issue-watcher pattern into Go subsystem | Existing bash scripts (handle-issue.sh, handle-slack-channel.sh) prove the architecture works. Go subsystem adds type safety, atomicity, TUI visibility, and health monitoring. | — Pending (v1.6.0) |
+| Conductor pattern as blueprint for watchers | Watchers follow conductor's filesystem layout (meta.json), statedb persistence, CLI dispatch, and TUI rendering. 65-70% infrastructure reuse. | — Pending (v1.6.0) |
+
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+5. "What This Is" still accurate? → Update if drifted
+
+**After each milestone** (via `/gsd-complete-milestone`):
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
 
 ---
-*Last updated: 2026-04-09 after Phase 9 (Polish / Premium UX) completion — 4/4 plans shipped, all 7 POL-* requirements validated (POL-1 skeleton loader, POL-2 GroupRow fade, POL-3 profile filter, POL-4 group density, POL-5 locale currency, POL-6 WCAG AA light theme audit, POL-7 toast cap + history drawer). Phases 6, 7, 8, 9 complete (18/24 plans). Phase 10 (Automated Testing — TEST-A/B/C/D/E) next.*
+*Last updated: 2026-04-16 after v1.6.0 Wave B Phase 20 (health-alerts-bridge) completed. REQ-WF-3 closed: `internal/watcher/health_bridge.go` subscribes to `Engine.HealthCh()`, maps to three triggers (`silence_detected`, `error_threshold_exceeded`, `adapter_teardown_unexpected`), applies 15-min per-(watcher × trigger) debounce, fans out via `Notifier` interface; opt-in `[watcher.alerts]` settings on `WatcherSettings`; strict RED→GREEN→DOCS TDD (commits 8c45428 → ab139b3 → f096986), 7 HealthBridge tests + `TestWatcherAlertsSettingsDefaults` pass under `-race`, `engine.go` untouched per locked scope. Next: Phase 21 (Watcher Folder Hierarchy, REQ-WF-6). v1.5.4 CLAUDE.md mandate applies (no `--no-verify` on source commits; metadata commits exempt when hooks no-op).*

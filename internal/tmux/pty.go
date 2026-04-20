@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/termreply"
 	"github.com/creack/pty"
 	"golang.org/x/term"
 )
@@ -22,6 +23,9 @@ import (
 // ErrMRUSwitch is returned by Attach when the user presses the MRU switch key
 // instead of the detach key. The caller should switch to the previous session.
 var ErrMRUSwitch = fmt.Errorf("mru switch requested")
+
+const attachOutputDrainTimeout = 250 * time.Millisecond
+const attachReplyQuarantine = 2 * time.Second
 
 // IndexDetachKey returns the index of a control-key sequence in data, or -1 if
 // not found. detachByte is the raw ASCII byte (e.g. 0x11 for Ctrl+Q).
@@ -65,6 +69,48 @@ type AttachOpts struct {
 	MRUSwitchKey byte // if non-zero, this key triggers ErrMRUSwitch instead of detach
 }
 
+func waitForAttachOutputDrain(outputDone <-chan struct{}, timeout time.Duration) (bool, time.Duration) {
+	start := time.Now()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-outputDone:
+		return true, time.Since(start)
+	case <-timer.C:
+		return false, time.Since(start)
+	}
+}
+
+// Scrollback-clear escape sequences. See emitScrollbackClear below for the
+// full rationale on why iTerm2 3.6.x requires the OSC 1337 supplement (#618).
+const (
+	// clearScrollbackCSI is CSI 3 J — "Erase Saved Lines". Honored by Terminal.app,
+	// WezTerm, Alacritty, Ghostty, Kitty, xterm, and older iTerm2 builds.
+	clearScrollbackCSI = "\x1b[3J"
+	// itermClearScrollback is OSC 1337 ; ClearScrollback BEL — iTerm2-specific.
+	// Required by iTerm2 3.6.x when "Save lines to scrollback in alternate screen
+	// mode" is OFF (#618). Other terminals parse the OSC payload and discard it
+	// safely — adding this escape is strictly additive, no regression risk.
+	itermClearScrollback = "\x1b]1337;ClearScrollback\a"
+)
+
+// emitScrollbackClear writes escape sequences to clear the host terminal's
+// scrollback buffer. Both the generic CSI 3 J escape AND the iTerm2-specific
+// OSC 1337 ClearScrollback escape are emitted, in that order:
+//
+//   - CSI first — broadly-compatible, terminals that honor it short-circuit.
+//   - OSC second — belt-and-suspenders for iTerm2 3.6.x where CSI alone is
+//     insufficient when alt-screen-scrollback-save is disabled (#618 regression
+//     of #419).
+//
+// Both Attach() entry and cleanupAttach() (exit) route through this helper so
+// the two boundaries cannot silently drift apart (parallel-paths invariant).
+func emitScrollbackClear(w io.Writer) {
+	_, _ = io.WriteString(w, clearScrollbackCSI)
+	_, _ = io.WriteString(w, itermClearScrollback)
+}
+
 // Attach attaches to the tmux session with full PTY support.
 // The configured detach key (default Ctrl+Q) will detach and return to the caller.
 // Pass an optional detachByte to override the default (0x11 / Ctrl+Q).
@@ -90,14 +136,16 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 
 	// Clear the outer terminal emulator's scrollback buffer to prevent
 	// stale content from a previously-attached session bleeding into the
-	// new one (#419). \033[3J is the "Erase Saved Lines" escape (ED param 3)
-	// supported by iTerm2, Terminal.app, Ghostty, and most modern emulators.
+	// new one (#419, #618). emitScrollbackClear writes both the generic
+	// CSI 3 J escape AND the iTerm2-specific OSC 1337 ClearScrollback escape —
+	// the latter is required for iTerm2 3.6.x where CSI alone is insufficient
+	// when alt-screen-scrollback-save is disabled (#618 regression of #419).
 	//
 	// Note: We intentionally do NOT call `tmux clear-history` here. tmux pane
 	// histories are per-pane, so session A's output never appears in session B's
 	// scrollback. Clearing pane history on attach destroys the user's scrollback
 	// and breaks mouse-wheel / copy-mode navigation (#531).
-	_, _ = os.Stdout.WriteString("\033[3J")
+	emitScrollbackClear(os.Stdout)
 
 	// Create context with cancel for detach
 	ctx, cancel := context.WithCancel(ctx)
@@ -106,9 +154,17 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 	// Start tmux attach command with PTY
 	cmd := exec.CommandContext(ctx, "tmux", "attach-session", "-t", s.Name)
 
+	// Temporarily ignore SIGINT for the duration of the attach session.
+	// The global SIGINT handler in main.go calls os.Exit(0); suppressing
+	// delivery during attach prevents the race window between tea.Exec
+	// restoring the terminal and Attach() calling term.MakeRaw().
+	// SIGINT is restored in cleanupAttach() via signal.Reset(syscall.SIGINT).
+	signal.Ignore(syscall.SIGINT)
+
 	// Start command with PTY
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
+		signal.Reset(syscall.SIGINT)
 		return fmt.Errorf("failed to start pty: %w", err)
 	}
 	defer ptmx.Close()
@@ -169,9 +225,7 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 	// Channel for I/O errors (buffered to prevent goroutine leaks)
 	ioErrors := make(chan error, 2)
 
-	// Timeout to ignore initial terminal control sequences (50ms)
 	startTime := time.Now()
-	const controlSeqTimeout = 50 * time.Millisecond
 	// Reset OSC-8, SGR attributes, AND fully disable all mouse modes before
 	// Bubble Tea re-enables mouse reporting. Without this, tmux detach can leave
 	// mouse state dirty, causing Shift to trigger text selection instead of
@@ -201,6 +255,7 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 32)
+		var replyFilter termreply.Filter
 		for {
 			n, err := os.Stdin.Read(buf)
 			if err != nil {
@@ -215,10 +270,12 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 				return
 			}
 
-			// Discard initial terminal control sequences (within first 50ms)
-			// These are things like terminal capability queries
-			if time.Since(startTime) < controlSeqTimeout {
-				continue
+			chunk := buf[:n]
+			if time.Since(startTime) < attachReplyQuarantine || replyFilter.Active() {
+				chunk = replyFilter.Consume(chunk, time.Since(startTime) < attachReplyQuarantine, false)
+				if len(chunk) == 0 {
+					continue
+				}
 			}
 
 			// Check for MRU switch key (if configured) before detach key.
@@ -242,10 +299,10 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 			// Check for the detach key anywhere in the input chunk.
 			// Some terminals coalesce reads, so detach must not require a single-byte read.
 			// Handles raw byte, xterm modifyOtherKeys, and kitty CSI u encodings.
-			if idx := IndexDetachKey(buf[:n], detach); idx >= 0 {
+			if idx := IndexDetachKey(chunk, detach); idx >= 0 {
 				// Forward any bytes before the detach key, then detach.
 				if idx > 0 {
-					if _, err := ptmx.Write(buf[:idx]); err != nil {
+					if _, err := ptmx.Write(chunk[:idx]); err != nil {
 						select {
 						case ioErrors <- fmt.Errorf("PTY write error: %w", err):
 						default:
@@ -259,7 +316,7 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 			}
 
 			// Forward other input to tmux PTY
-			if _, err := ptmx.Write(buf[:n]); err != nil {
+			if _, err := ptmx.Write(chunk); err != nil {
 				// Report PTY write error
 				select {
 				case ioErrors <- fmt.Errorf("PTY write error: %w", err):
@@ -278,16 +335,33 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 		cmdDone <- cmd.Wait()
 	}()
 
+	didDetach := false
+
 	// Ensures we don't return to Bubble Tea while PTY output is still being written.
 	// This avoids terminal style leakage (for example underline/hyperlink state)
 	// from the attached client into the Agent Deck UI.
 	cleanupAttach := func() {
+		// Restore SIGINT handling before returning to TUI.
+		// This must be the first operation so that SIGINT can terminate the
+		// process if needed after the attach session ends.
+		signal.Reset(syscall.SIGINT)
 		cancel()
 		_ = ptmx.Close()
-		select {
-		case <-outputDone:
-		case <-time.After(20 * time.Millisecond):
+		_, _ = waitForAttachOutputDrain(outputDone, attachOutputDrainTimeout)
+		// Prompts can issue terminal capability/color queries as they redraw during
+		// detach. Kitty replies on stdin; if those queued bytes survive until Bubble Tea
+		// resumes, they can leak as literal fragments like terminal version strings or
+		// rgb payloads in the TUI.
+		if didDetach {
+			_ = flushDetachInput(int(os.Stdin.Fd()))
+			termreply.QuarantineFor(attachReplyQuarantine)
 		}
+		// Clear host terminal scrollback before returning to TUI.
+		// The on-attach clear at the top of Attach() covers the "next attach" direction;
+		// this covers the "on detach" direction for belt-and-suspenders coverage
+		// (#419, #618). emitScrollbackClear emits CSI 3 J + iTerm2-specific OSC 1337
+		// ClearScrollback — both boundaries route through one helper so they cannot drift.
+		emitScrollbackClear(os.Stdout)
 		// Reset OSC-8 hyperlink state + SGR attributes before Bubble Tea redraws.
 		_, _ = os.Stdout.WriteString(terminalStyleReset)
 	}
@@ -296,6 +370,8 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 	var attachErr error
 	select {
 	case isMRU := <-detachCh:
+		// User pressed the detach key (or MRU switch key), detach gracefully.
+		didDetach = true
 		if isMRU {
 			attachErr = ErrMRUSwitch
 		} else {

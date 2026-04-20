@@ -51,11 +51,11 @@ Thumbs.db
 .mcp.json
 .playwright-mcp/
 *.screenstudio/
+.ad-sync.log
+excalidraw.log
 
 .worktrees
 agent-deck-test
-.ad-sync.log
-excalidraw.log
 
 # Tailwind brute-force diff gate scratch file (make css temp artifact)
 internal/web/static/.brute-tw.src.css

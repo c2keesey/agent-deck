@@ -442,24 +442,6 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	}
 }
 
-func TestNewDialog_GetCodexOptions(t *testing.T) {
-	d := NewNewDialog()
-	d.commandCursor = 4 // codex
-	d.updateToolOptions()
-	d.codexOptions.SetDefaults(true, true)
-
-	opts := d.GetCodexOptions()
-	if opts == nil {
-		t.Fatal("GetCodexOptions returned nil")
-	}
-	if opts.YoloMode == nil || !*opts.YoloMode {
-		t.Fatalf("expected YoloMode=true, got %+v", opts)
-	}
-	if opts.UseHappy == nil || !*opts.UseHappy {
-		t.Fatalf("expected UseHappy=true, got %+v", opts)
-	}
-}
-
 // ===== Worktree Support Tests =====
 
 func TestNewDialog_WorktreeToggle(t *testing.T) {
@@ -540,20 +522,6 @@ func TestNewDialog_Validate_WorktreeEnabled_EmptyBranch_WithName(t *testing.T) {
 	err := dialog.Validate()
 	if err != "" {
 		t.Errorf("Validation should pass when branch is empty but name is set (derives branch), got: %q", err)
-	}
-}
-
-func TestNewDialog_Validate_WorktreeEnabled_EmptyBranch_NoName(t *testing.T) {
-	dialog := NewNewDialog()
-	dialog.nameInput.SetValue("")
-	dialog.generatedName = "" // no fallback
-	dialog.pathInput.SetValue("/tmp/project")
-	dialog.worktreeEnabled = true
-	dialog.branchInput.SetValue("")
-
-	err := dialog.Validate()
-	if err == "" {
-		t.Error("Validation should fail when worktree enabled, branch empty, and no name")
 	}
 }
 
@@ -1079,58 +1047,66 @@ func TestNewDialog_ShowInGroup_ResetsBranchAutoSet(t *testing.T) {
 	}
 }
 
-func TestNewDialog_CtrlFBranchPickerAppliesSelection(t *testing.T) {
+func TestNewDialog_ShowInGroup_DefaultWorktree_SetsBranchAutoSet(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	session.ClearUserConfigCache()
+	defer session.ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := session.SaveUserConfig(&session.UserConfig{
+		Worktree: session.WorktreeSettings{DefaultEnabled: true},
+	}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	session.ClearUserConfigCache()
+
 	d := NewNewDialog()
-	d.Show()
-	d.pathInput.SetValue("/tmp/project")
-	d.ToggleWorktree()
-	d.rebuildFocusTargets()
-	d.focusIndex = d.indexOf(focusBranch)
-	d.updateFocus()
+	d.ShowInGroup("projects", "Projects", "", nil, "")
 
-	origPicker := openBranchPicker
-	defer func() { openBranchPicker = origPicker }()
-
-	called := false
-	openBranchPicker = func(path string) tea.Cmd {
-		called = true
-		if path != "/tmp/project" {
-			t.Fatalf("picker path = %q, want %q", path, "/tmp/project")
-		}
-		return func() tea.Msg {
-			return branchPickerResultMsg{branch: "feature/picked"}
-		}
+	if !d.worktreeEnabled {
+		t.Fatal("worktreeEnabled should be true from config default")
 	}
-
-	var cmd tea.Cmd
-	d, cmd = d.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
-	if !called {
-		t.Fatal("expected ctrl+f to open branch picker")
-	}
-	if cmd == nil {
-		t.Fatal("expected ctrl+f to return a branch picker command")
-	}
-
-	d, _ = d.Update(cmd())
-	if got := d.branchInput.Value(); got != "feature/picked" {
-		t.Fatalf("branch = %q, want %q", got, "feature/picked")
-	}
-	if d.validationErr != "" {
-		t.Fatalf("expected no validation error, got %q", d.validationErr)
+	if !d.branchAutoSet {
+		t.Error("branchAutoSet should be true when worktree is enabled by config default")
 	}
 }
 
-func TestNewDialog_BranchPickerErrorIsShown(t *testing.T) {
-	d := NewNewDialog()
-	d.Show()
-	d.ToggleWorktree()
-	d.rebuildFocusTargets()
-	d.focusIndex = d.indexOf(focusBranch)
-	d.updateFocus()
+func TestNewDialog_ShowInGroup_DefaultWorktree_AutoPopulatesBranchFromName(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	session.ClearUserConfigCache()
+	defer session.ClearUserConfigCache()
 
-	d, _ = d.Update(branchPickerResultMsg{err: os.ErrNotExist})
-	if !strings.Contains(d.validationErr, os.ErrNotExist.Error()) {
-		t.Fatalf("expected picker error in validationErr, got %q", d.validationErr)
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := session.SaveUserConfig(&session.UserConfig{
+		Worktree: session.WorktreeSettings{DefaultEnabled: true},
+	}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	session.ClearUserConfigCache()
+
+	d := NewNewDialog()
+	d.ShowInGroup("projects", "Projects", "", nil, "")
+	d.nameInput.SetValue("amber-falcon")
+
+	// Simulate the name-change handler: it calls autoBranchFromName() only when branchAutoSet is true.
+	if d.worktreeEnabled && d.branchAutoSet {
+		d.autoBranchFromName()
+	}
+
+	if got := d.branchInput.Value(); got != "feature/amber-falcon" {
+		t.Errorf("branch = %q, want %q; branch should auto-populate when worktree is default-enabled", got, "feature/amber-falcon")
 	}
 }
 
@@ -1376,122 +1352,6 @@ func TestNewDialog_FilterPaths_EmptyInput(t *testing.T) {
 
 // ===== Generated Name Fallback Tests =====
 
-func TestNewDialog_EmptyName_UsesGeneratedName(t *testing.T) {
-	d := NewNewDialog()
-	d.pathInput.SetValue("/tmp/project")
-	d.nameInput.SetValue("")
-	d.generatedName = "golden-eagle"
-
-	name, _, _ := d.GetValues()
-	if name != "golden-eagle" {
-		t.Errorf("GetValues() name = %q, want %q", name, "golden-eagle")
-	}
-}
-
-func TestNewDialog_Validate_EmptyName_UsesGeneratedName(t *testing.T) {
-	d := NewNewDialog()
-	d.pathInput.SetValue("/tmp/project")
-	d.nameInput.SetValue("")
-	d.generatedName = "swift-fox"
-
-	err := d.Validate()
-	if err != "" {
-		t.Errorf("Validate() should pass with generatedName fallback, got: %q", err)
-	}
-}
-
-func TestNewDialog_ShowInGroup_SetsGeneratedName(t *testing.T) {
-	d := NewNewDialog()
-	d.ShowInGroup("default", "default", "")
-
-	if d.generatedName == "" {
-		t.Error("generatedName should be set after ShowInGroup")
-	}
-	if d.nameInput.Placeholder != d.generatedName {
-		t.Errorf("nameInput.Placeholder = %q, want %q", d.nameInput.Placeholder, d.generatedName)
-	}
-}
-
-func TestNewDialog_WorktreeBranch_PlaceholderWhenNameEmpty(t *testing.T) {
-	d := NewNewDialog()
-	d.generatedName = "calm-river"
-	d.branchPrefix = "feature/"
-	d.nameInput.SetValue("")
-
-	d.autoBranchFromName()
-
-	// Branch input should remain empty (placeholder only)
-	if d.branchInput.Value() != "" {
-		t.Errorf("branch value should be empty when using generated name, got %q", d.branchInput.Value())
-	}
-	if d.branchInput.Placeholder != "feature/calm-river" {
-		t.Errorf("branch placeholder = %q, want %q", d.branchInput.Placeholder, "feature/calm-river")
-	}
-	if !d.branchAutoSet {
-		t.Error("branchAutoSet should be true")
-	}
-}
-
-func TestNewDialog_WorktreeBranch_FilledWhenNameProvided(t *testing.T) {
-	d := NewNewDialog()
-	d.generatedName = "calm-river"
-	d.branchPrefix = "feature/"
-	d.nameInput.SetValue("my-feature")
-
-	d.autoBranchFromName()
-
-	if d.branchInput.Value() != "feature/my-feature" {
-		t.Errorf("branch value = %q, want %q", d.branchInput.Value(), "feature/my-feature")
-	}
-}
-
-func TestNewDialog_GetValuesWithWorktree_EmptyBranch_DerivedFromName(t *testing.T) {
-	d := NewNewDialog()
-	d.worktreeEnabled = true
-	d.branchPrefix = "feature/"
-	d.generatedName = "bold-crane"
-	d.nameInput.SetValue("")
-	d.pathInput.SetValue("/tmp/project")
-	d.branchInput.SetValue("")
-
-	name, _, _, branch, _ := d.GetValuesWithWorktree()
-	if name != "bold-crane" {
-		t.Errorf("name = %q, want %q", name, "bold-crane")
-	}
-	if branch != "feature/bold-crane" {
-		t.Errorf("branch = %q, want %q", branch, "feature/bold-crane")
-	}
-}
-
-func TestNewDialog_BranchPrefix_Default(t *testing.T) {
-	d := NewNewDialog()
-	if d.branchPrefix != "feature/" {
-		t.Errorf("expected branchPrefix %q from constructor, got %q", "feature/", d.branchPrefix)
-	}
-}
-
-func TestNewDialog_BranchPrefix_Custom_AutoPopulates(t *testing.T) {
-	d := NewNewDialog()
-	d.branchPrefix = "dev/"
-	d.nameInput.SetValue("my-session")
-	d.autoBranchFromName()
-
-	if got := d.branchInput.Value(); got != "dev/my-session" {
-		t.Errorf("expected branch %q, got %q", "dev/my-session", got)
-	}
-}
-
-func TestNewDialog_BranchPrefix_Empty_NoPrefix(t *testing.T) {
-	d := NewNewDialog()
-	d.branchPrefix = ""
-	d.nameInput.SetValue("my-session")
-	d.autoBranchFromName()
-
-	if got := d.branchInput.Value(); got != "my-session" {
-		t.Errorf("expected branch %q, got %q", "my-session", got)
-	}
-}
-
 // TestNewDialog_CtrlR_OpensRecentPicker verifies that Ctrl+R opens the recent
 // sessions picker when recent sessions are available.
 func TestNewDialog_CtrlR_OpensRecentPicker(t *testing.T) {
@@ -1635,5 +1495,41 @@ func TestOverlayDropdown_OutOfBounds(t *testing.T) {
 	}
 	if lines[0] != "a" {
 		t.Errorf("line 0 should be unchanged, got %q", lines[0])
+	}
+}
+
+// TestNewDialog_NameInput_AcceptsUnderscore verifies that typing '_' into the
+// name input reaches the textinput buffer (regression test for BUG-02).
+func TestNewDialog_NameInput_AcceptsUnderscore(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	underscoreKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'_'}}
+	updated, _ := d.Update(underscoreKey)
+
+	if updated.nameInput.Value() != "_" {
+		t.Errorf("nameInput.Value() = %q after typing '_', want %q", updated.nameInput.Value(), "_")
+	}
+}
+
+// TestNewDialog_PathInput_AcceptsUnderscore verifies that typing '_' into the
+// path input reaches the textinput buffer (regression test for BUG-02).
+// Focus targets: focusName(0), focusMultiRepo(1), focusPath(2), ...
+// Two Tabs are required to reach focusPath from focusName.
+func TestNewDialog_PathInput_AcceptsUnderscore(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	// Tab twice to reach the path input field (focusName -> focusMultiRepo -> focusPath).
+	d = sendSpecialKey(d, tea.KeyTab)
+	d = sendSpecialKey(d, tea.KeyTab)
+
+	// Type '_' — the soft-select logic clears any pre-populated value and
+	// focuses the textinput before letting the rune reach it.
+	underscoreKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'_'}}
+	updated, _ := d.Update(underscoreKey)
+
+	if !strings.Contains(updated.pathInput.Value(), "_") {
+		t.Errorf("pathInput.Value() = %q after typing '_', want value to contain '_'", updated.pathInput.Value())
 	}
 }

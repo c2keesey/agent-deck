@@ -669,7 +669,7 @@ func sanitizeGroupName(name string) string {
 func (t *GroupTree) CreateGroup(name string) *Group {
 	// Sanitize name to prevent path traversal and security issues
 	sanitizedName := sanitizeGroupName(name)
-	path := strings.ToLower(strings.ReplaceAll(sanitizedName, " ", "-"))
+	path := strings.ReplaceAll(sanitizedName, " ", "-")
 	if _, exists := t.Groups[path]; exists {
 		return t.Groups[path]
 	}
@@ -699,7 +699,7 @@ func (t *GroupTree) CreateGroup(name string) *Group {
 func (t *GroupTree) CreateSubgroup(parentPath, name string) *Group {
 	// Sanitize name to prevent path traversal and security issues
 	sanitizedName := sanitizeGroupName(name)
-	childPath := strings.ToLower(strings.ReplaceAll(sanitizedName, " ", "-"))
+	childPath := strings.ReplaceAll(sanitizedName, " ", "-")
 	fullPath := parentPath + "/" + childPath
 
 	if _, exists := t.Groups[fullPath]; exists {
@@ -736,7 +736,7 @@ func (t *GroupTree) RenameGroup(oldPath, newName string) {
 
 	// Sanitize name to prevent path traversal and security issues
 	sanitizedName := sanitizeGroupName(newName)
-	newBasePath := strings.ToLower(strings.ReplaceAll(sanitizedName, " ", "-"))
+	newBasePath := strings.ReplaceAll(sanitizedName, " ", "-")
 
 	// Preserve parent path for subgroups
 	parentPath := getParentPath(oldPath)
@@ -823,23 +823,26 @@ func (t *GroupTree) DeleteGroup(path string) []*Instance {
 	// Add sessions from the main group
 	allMovedSessions = append(allMovedSessions, group.Sessions...)
 
-	// Move all sessions to default group
-	for _, sess := range allMovedSessions {
-		sess.GroupPath = DefaultGroupPath
-	}
-
-	// Ensure default group exists
-	defaultGroup, exists := t.Groups[DefaultGroupPath]
-	if !exists {
-		defaultGroup = &Group{
-			Name:     DefaultGroupName,
-			Path:     DefaultGroupPath,
-			Expanded: true,
-			Sessions: []*Instance{},
+	// Only touch the default group when there are sessions that need a new home.
+	// Otherwise deleting an empty non-default group would spuriously materialize
+	// a "My Sessions" group the user never asked for.
+	if len(allMovedSessions) > 0 {
+		for _, sess := range allMovedSessions {
+			sess.GroupPath = DefaultGroupPath
 		}
-		t.Groups[DefaultGroupPath] = defaultGroup
+
+		defaultGroup, exists := t.Groups[DefaultGroupPath]
+		if !exists {
+			defaultGroup = &Group{
+				Name:     DefaultGroupName,
+				Path:     DefaultGroupPath,
+				Expanded: true,
+				Sessions: []*Instance{},
+			}
+			t.Groups[DefaultGroupPath] = defaultGroup
+		}
+		defaultGroup.Sessions = append(defaultGroup.Sessions, allMovedSessions...)
 	}
-	defaultGroup.Sessions = append(defaultGroup.Sessions, allMovedSessions...)
 
 	// Remove the main group
 	delete(t.Groups, path)

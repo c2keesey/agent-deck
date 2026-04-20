@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"al.essio.dev/pkg/shellescape"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/BurntSushi/toml"
@@ -33,6 +34,13 @@ var (
 	mcpLog     = logging.ForComponent(logging.CompMCP)
 	perfLog    = logging.ForComponent(logging.CompPerf)
 )
+
+// execCommand is a swappable seam that defaults to exec.Command. Tests
+// override it to inject failure into specific launcher names without
+// mutating host PATH or systemd state. Production callers always read
+// the default. See TestStartCommandSpec_FallsBackToDirect in
+// tmux_fallback_test.go for the contract.
+var execCommand = exec.Command
 
 type tmuxThemeStyle struct {
 	windowStyle       string
@@ -107,11 +115,15 @@ func currentTmuxThemeStyle() tmuxThemeStyle {
 }
 
 func (s *Session) themedStatusRight(themeStyle tmuxThemeStyle) string {
+	return fmt.Sprintf("#[fg=%s]ctrl+q detach#[default] │ 📁 %s | %s ", themeStyle.hintColor, s.DisplayName, s.projectDisplayName())
+}
+
+func (s *Session) projectDisplayName() string {
 	folderName := filepath.Base(s.WorkDir)
 	if folderName == "" || folderName == "." {
 		folderName = "~"
 	}
-	return fmt.Sprintf("#[fg=%s]ctrl+q detach#[default] │ 📁 %s | %s ", themeStyle.hintColor, s.DisplayName, folderName)
+	return folderName
 }
 
 // ErrCaptureTimeout is returned when CapturePane exceeds its timeout.
@@ -272,6 +284,16 @@ func parseListWindowsOutput(output string) (map[string]int64, map[string][]Windo
 // RefreshExistingSessions is an alias for RefreshSessionCache for backwards compatibility
 func RefreshExistingSessions() {
 	RefreshSessionCache()
+}
+
+// HasSession is a lightweight public probe for session presence.
+// Exported so packages outside internal/tmux (e.g., the reviver) can answer
+// "does this tmux session exist right now?" without reaching into unexported
+// helpers. Runs a direct `tmux has-session -t <name>` — skips the cache on
+// purpose because the reviver's purpose is to detect a mismatch between our
+// cached view and ground truth.
+func HasSession(name string) bool {
+	return tmuxSessionExists(name)
 }
 
 // sessionExistsFromCache checks if a session exists using the cached data
@@ -789,29 +811,40 @@ func sanitizeSystemdUnitComponent(raw string) string {
 	return out
 }
 
-// bashCWrap returns the given command wrapped in `bash -c '…'` with
-// single quotes safely escaped via the POSIX `'\''` pattern. The result
+// bashCWrap returns the given command wrapped in `bash -c '...'` with
+// single quotes safely escaped using the POSIX shell quote-break pattern. The result
 // is a single shell word that can be passed to any `sh -c` invocation
 // (e.g. tmux's default shell-command delivery) and will always be
 // executed under bash, giving consistent semantics regardless of the
 // user's login shell.
 func bashCWrap(command string) string {
 	escaped := strings.ReplaceAll(command, `'`, `'\''`)
-	return "bash -c '" + escaped + "'"
+	return bashCPrefix + escaped + "'"
 }
+
+func isBashCWrapped(command string) bool {
+	trimmed := strings.TrimSpace(command)
+	return strings.HasPrefix(trimmed, bashCPrefix)
+}
+
+const (
+	bashBinary  = "bash"
+	bashCPrefix = "bash -c '"
+)
 
 func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	startWithInitialProcess := command != "" && s.RunCommandAsInitialProcess
 	args := []string{"new-session", "-d", "-s", s.Name, "-c", workDir}
 	if startWithInitialProcess {
-		// Always wrap the command in `bash -c '…'` so it runs under bash
-		// regardless of the user's default-shell. This guarantees fish users
-		// can launch sessions whose commands use bash syntax (inline env
-		// vars, `&&`, `$(...)`, etc.) — previously the wrapping was gated
-		// on `$(` or `session_id=` appearing in the command, which missed
-		// simple compound commands like `export COLORFGBG='0;15' && claude …`
-		// and caused those sessions to die immediately on fish (#526).
-		args = append(args, bashCWrap(command))
+		// Keep commands under bash for fish/zsh compatibility, but avoid
+		// double-wrapping payloads that are already `bash -c '…'`.
+		// wrapIgnoreSuspend() already returns that shape; re-wrapping it can
+		// corrupt quoting for nested payloads like docker exec bash -c ... .
+		if isBashCWrapped(command) {
+			args = append(args, command)
+		} else {
+			args = append(args, bashCWrap(command))
+		}
 	}
 
 	if !s.LaunchInUserScope {
@@ -822,6 +855,28 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	scopeArgs := []string{"--user", "--scope", "--quiet", "--collect", "--unit", unitName, "tmux"}
 	scopeArgs = append(scopeArgs, args...)
 	return "systemd-run", scopeArgs
+}
+
+// stripSystemdRunPrefix removes the leading systemd-run --user --scope wrap
+// from args produced by startCommandSpec when LaunchInUserScope is true,
+// returning the bare tmux args. Returns args unchanged if the shape doesn't
+// match — defensive against future startCommandSpec changes.
+//
+// Expected shape (matches startCommandSpec above):
+//
+//	[0]   "--user"
+//	[1]   "--scope"
+//	[2]   "--quiet"
+//	[3]   "--collect"
+//	[4]   "--unit"
+//	[5]   "<unit name>"
+//	[6]   "tmux"
+//	[7..] tmux args
+func stripSystemdRunPrefix(args []string) []string {
+	if len(args) >= 7 && args[6] == "tmux" {
+		return args[7:]
+	}
+	return args
 }
 
 // invalidateCache clears the CapturePane cache.
@@ -986,6 +1041,7 @@ func ReconnectSession(tmuxName, displayName, workDir, command string) *Session {
 	// Configure existing sessions
 	if sess.Exists() {
 		sess.ConfigureStatusBar()
+		sess.ConfigureTerminalTitle()
 		sess.configured = true
 	}
 
@@ -1091,6 +1147,7 @@ func (s *Session) EnsureConfigured() {
 
 	// Run deferred configuration
 	s.ConfigureStatusBar()
+	s.ConfigureTerminalTitle()
 	_ = s.EnableMouseMode()
 
 	s.configured = true
@@ -1103,6 +1160,46 @@ func (s *Session) IsConfigured() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.configured
+}
+
+// KillSessionsWithEnvValue kills agentdeck tmux sessions that have the given
+// environment variable set to the given value, excluding the session named
+// `excludeName`. This prevents duplicate tmux sessions running the same Claude
+// conversation (#596).
+func KillSessionsWithEnvValue(envKey, envValue, excludeName string) {
+	if envValue == "" {
+		return
+	}
+
+	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	if err != nil {
+		return
+	}
+
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if name == "" || name == excludeName {
+			continue
+		}
+		if !strings.HasPrefix(name, SessionPrefix) {
+			continue
+		}
+		val, err := exec.Command("tmux", "show-environment", "-t", name, envKey).Output()
+		if err != nil {
+			continue
+		}
+		// Output format: "KEY=value\n"
+		line := strings.TrimSpace(string(val))
+		if idx := strings.IndexByte(line, '='); idx >= 0 {
+			if line[idx+1:] == envValue {
+				statusLog.Warn("killing_duplicate_session",
+					slog.String("session", name),
+					slog.String("env_key", envKey),
+					slog.String("env_value", envValue),
+					slog.String("kept", excludeName))
+				_ = exec.Command("tmux", "kill-session", "-t", name).Run()
+			}
+		}
+	}
 }
 
 // generateShortID generates a short random ID for uniqueness
@@ -1307,6 +1404,10 @@ func isSocketAcceptingConnections(socketPath string) bool {
 // When RunCommandAsInitialProcess is true, command is passed directly to tmux
 // new-session and becomes the pane's initial process.
 func (s *Session) Start(command string) error {
+	// Defense in depth against the 2026-04-17 three-cascade bug.
+	// See assertTestTmuxIsolation for the full rationale.
+	assertTestTmuxIsolation()
+
 	s.Command = command
 	s.invalidateCache()
 	s.Created = time.Now()
@@ -1335,7 +1436,7 @@ func (s *Session) Start(command string) error {
 	// process. This avoids the slow shell-wait-sendkeys path (~2s pane ready poll).
 	// Commands containing bash-specific syntax are wrapped for fish compatibility.
 	launcher, args := s.startCommandSpec(workDir, command)
-	cmd := exec.Command(launcher, args...)
+	cmd := execCommand(launcher, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if launcher == "tmux" {
@@ -1348,14 +1449,32 @@ func (s *Session) Start(command string) error {
 				statusLog.Warn("tmux_start_retry_after_socket_recovery",
 					slog.String("session", s.Name),
 				)
-				output, err = exec.Command(launcher, args...).CombinedOutput()
+				output, err = execCommand(launcher, args...).CombinedOutput()
 			}
 		}
 	}
-	if err != nil {
-		if launcher == "systemd-run" {
-			return fmt.Errorf("failed to create tmux session via systemd user scope: %w (output: %s)", err, string(output))
+	if err != nil && launcher == "systemd-run" {
+		// systemd-run detection said yes but invocation failed (e.g. dbus
+		// down, lingering disabled, broken user manager). Log a structured
+		// warning and retry ONCE with the direct tmux launcher so session
+		// creation is never blocked. If the direct retry also fails, wrap
+		// both diagnostics in the returned error so operators can see why
+		// isolation was attempted and how the fallback broke.
+		statusLog.Warn("tmux_systemd_run_fallback",
+			slog.String("session", s.Name),
+			slog.String("error", err.Error()),
+			slog.String("output", string(output)))
+		directArgs := stripSystemdRunPrefix(args)
+		retryOutput, retryErr := execCommand("tmux", directArgs...).CombinedOutput()
+		if retryErr == nil {
+			output = retryOutput
+			err = nil
+		} else {
+			return fmt.Errorf("failed to create tmux session: systemd-run path: %w (output: %s); direct retry: %v (output: %s)",
+				err, string(output), retryErr, string(retryOutput))
 		}
+	}
+	if err != nil {
 		return fmt.Errorf("failed to create tmux session: %w (output: %s)", err, string(output))
 	}
 
@@ -1424,6 +1543,7 @@ func (s *Session) Start(command string) error {
 	// Configure status bar with session info for easy identification
 	// Shows: session title on left, project folder on right
 	s.ConfigureStatusBar()
+	s.ConfigureTerminalTitle()
 
 	// Wait for the pane shell to be ready before sending the command via send-keys.
 	// On WSL/Linux non-interactive contexts, pane initialisation can take 100-500ms and
@@ -1548,6 +1668,46 @@ func (s *Session) buildStatusBarArgs() []string {
 		return nil
 	}
 	return args
+}
+
+// buildTerminalTitleArgs returns the tmux command args for configuring the outer
+// terminal title shown by clients such as iTerm2. Session metadata user options
+// are always refreshed so custom title formats can reuse them.
+func (s *Session) buildTerminalTitleArgs() []string {
+	type option struct {
+		key   string
+		value string
+	}
+
+	defaults := []option{
+		{"@agentdeck_project_name", s.projectDisplayName()},
+		{"@agentdeck_display_name", s.DisplayName},
+	}
+	if _, overridden := s.OptionOverrides["set-titles"]; !overridden {
+		defaults = append(defaults, option{key: "set-titles", value: "on"})
+	}
+	if _, overridden := s.OptionOverrides["set-titles-string"]; !overridden {
+		defaults = append(defaults, option{key: "set-titles-string", value: "[#{@agentdeck_project_name}] #{@agentdeck_display_name}"})
+	}
+
+	args := make([]string, 0, len(defaults)*6)
+	for i, opt := range defaults {
+		if i > 0 {
+			args = append(args, ";")
+		}
+		args = append(args, "set-option", "-t", s.Name, opt.key, opt.value)
+	}
+	return args
+}
+
+// ConfigureTerminalTitle sets tmux options that drive the outer terminal tab or
+// window title for this session.
+func (s *Session) ConfigureTerminalTitle() {
+	args := s.buildTerminalTitleArgs()
+	if len(args) == 0 {
+		return
+	}
+	_ = exec.Command("tmux", args...).Run()
 }
 
 // ConfigureStatusBar sets up the tmux status bar with session info.
@@ -1818,25 +1978,11 @@ func (s *Session) RespawnPane(command string) error {
 	target := s.Name + ":" // Append colon to target the active pane
 	args := []string{"respawn-pane", "-k", "-t", target}
 	if command != "" {
-		// Wrap command in interactive shell to ensure aliases and shell configs are available
-		// tmux respawn-pane runs commands directly without loading ~/.bashrc or ~/.zshrc,
-		// so shell aliases (like 'cdw' for claude) won't work without this wrapper
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/bash"
+		wrapped, wrapErr := wrapRespawnCommand(command)
+		if wrapErr != nil {
+			return wrapErr
 		}
-
-		// IMPORTANT: Commands containing bash-specific syntax (like `session_id=$(...)`)
-		// must use bash, regardless of user's shell. This fixes fish shell compatibility (#47).
-		// Fish uses different syntax: `set var (...)` instead of `var=$(...)`.
-		// We detect bash-specific constructs and force bash for those commands.
-		if strings.Contains(command, "$(") || strings.Contains(command, "session_id=") {
-			shell = "/bin/bash"
-		}
-
-		// Use -i for interactive (loads aliases) and -c for command
-		wrappedCmd := fmt.Sprintf("%s -ic %q", shell, command)
-		args = append(args, wrappedCmd)
+		args = append(args, wrapped)
 	}
 
 	mcpLog.Debug("respawn_pane_executing", slog.Any("args", args))
@@ -1879,6 +2025,22 @@ func (s *Session) RespawnPane(command string) error {
 	s.mu.Unlock()
 
 	return nil
+}
+
+func wrapRespawnCommand(command string) (string, error) {
+	return wrapRespawnCommandWithResolver(command, exec.LookPath)
+}
+
+func wrapRespawnCommandWithResolver(command string, lookPath func(string) (string, error)) (string, error) {
+	bashPath, err := lookPath(bashBinary)
+	if err != nil {
+		return "", fmt.Errorf("bash not found in PATH: %w", err)
+	}
+	return buildBashLCCommand(bashPath, command), nil
+}
+
+func buildBashLCCommand(bashPath, command string) string {
+	return fmt.Sprintf("%s -lc %s", bashPath, shellescape.Quote(command))
 }
 
 // GetWindowActivity returns Unix timestamp of last tmux window activity

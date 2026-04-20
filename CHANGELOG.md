@@ -5,7 +5,62 @@ All notable changes to Agent Deck will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.7.13] - 2026-04-17
+
+### Fixed
+- **Cross-session `x` send-output transferred unpredictable content** (issue [#598](https://github.com/asheshgoplani/agent-deck/issues/598)): when the user pressed `x` to transfer output from session A to session B, the transferred text was often from a *prior* conversation rather than the most-recent assistant response. Root cause: `getSessionContent` read the last assistant message via `Instance.ClaudeSessionID`, but that stored ID goes stale every time Claude is resumed — it continues pointing at the prior JSONL while the live `CLAUDE_SESSION_ID` in tmux env holds the current UUID. The CLI `session output` path already used `GetLastResponseBestEffort` with stale-ID recovery; the TUI path didn't. Fix adds `Instance.RefreshLiveSessionIDs()` (Claude + Gemini) and routes `getSessionContent` through a testable `getSessionContentWithLive(inst, liveID)` helper that prefers the live tmux env ID over any stored value before the JSONL lookup. Tmux scrollback fallback is unchanged. Tests: `TestGetSessionContentWithLive_PrefersFreshIDOverStoredStaleID`, `TestGetSessionContentWithLive_KeepsStoredIDWhenLiveEmpty`, `TestGetSessionContentWithLive_NoOpForNonClaudeTool` in `internal/ui/send_output_content_test.go`; `TestInstance_RefreshLiveSessionIDs_NoOpWhenTmuxSessionNil`, `TestInstance_RefreshLiveSessionIDs_NoOpForNonAgenticTool` in `internal/session/instance_test.go`.
+
+## [1.7.10] - 2026-04-17
+
+### Fixed
+- **`session send --no-wait` reliability on freshly-launched Claude sessions** (issue [#616](https://github.com/asheshgoplani/agent-deck/issues/616)): the pre-v1.7.10 code skipped all readiness detection in `--no-wait` mode, then ran a 1.2-second verification loop. On cold Claude launches (where TUI mount takes 5-40s with MCPs), the loop counted startup-animation "active" status as submission success and returned before the composer rendered — leaving the pasted message typed-but-not-submitted. The 30-50% failure rate users reported is now 0% in 10 consecutive live-boundary runs. Fix has three layers: a 5s preflight barrier waiting for the Claude composer `❯` to render, a 500ms post-composer settle for React mount, and an extended 6s verification budget (from 1.2s). `maxFullResends=-1` is preserved — the #479 regression (double-send) still passes. Non-Claude tools skip the preflight (their prompt shapes differ). Tests: `TestSendNoWait_ReEntersWhenComposerRendersLate`, `TestAwaitComposerReadyBestEffort_*`, `TestSendWithRetryTarget_NoWait_BudgetSpansRealisticClaudeStartup` in `cmd/agent-deck/session_send_test.go`.
+
+## [1.7.6] - 2026-04-17
+
+### Fixed
+- **Priority inversion on `CLAUDE_CONFIG_DIR`**: explicit `[conductors.<name>.claude]` and `[groups."<name>".claude]` TOML overrides now beat the shell-wide `CLAUDE_CONFIG_DIR` env var. Previously, developer shells that exported `CLAUDE_CONFIG_DIR` via profile aliases (`cdp`/`cdw`) silently shadowed every per-conductor/per-group override — making config.toml overrides unreliable for the exact users most likely to use them. Profile/global fallbacks remain weaker than env (they're shell-wide too). Scope: `GetClaudeConfigDirForInstance`, `GetClaudeConfigDirSourceForInstance`, `IsClaudeConfigDirExplicitForInstance` in `internal/session/claude.go`. Group-less variants unchanged.
+- **Web terminal `TestTmuxPTYBridgeResize` -race flake**: added `ptmxMu sync.RWMutex` protecting the PTY file handle against concurrent Close/Resize. Previously intermittent on GH Actions release runs (v1.7.4, v1.7.5).
+
+## [1.5.4] - 2026-04-16
+
+### Added
+- Per-group Claude config overrides (`[groups."<name>".claude]`). (Base implementation by @alec-pinson in [PR #578](https://github.com/asheshgoplani/agent-deck/pull/578))
+- In-product feedback feature: CLI `agent-deck feedback`, TUI `Ctrl+E`, three-tier submit (GraphQL, clipboard, browser).
+
+### Fixed
+- Session persistence: tmux servers now survive SSH logout on Linux+systemd hosts via `launch_in_user_scope` default (v1.5.2 hotfix). ([docs/SESSION-PERSISTENCE-SPEC.md](docs/SESSION-PERSISTENCE-SPEC.md))
+- Custom-command Claude sessions (conductors) now resume from latest JSONL on restart.
+
+## [1.6.0] - 2026-04-16
+
+v1.6.0 is the Watcher Framework milestone. Event-driven automation via five adapter types (webhook, ntfy, GitHub, Slack, Gmail), a self-improving routing engine, health alerts bridge, and conductor-style on-disk layout.
+
+### Added
+- **Watcher engine** — event-driven automation framework with five adapters (webhook, ntfy, GitHub, Slack, Gmail), SQLite-backed dedup, HMAC-SHA256 verification, and self-improving routing via triage sessions. See `internal/watcher/`.
+- **Watcher health alerts bridge** — opt-in `[watcher.alerts]` config block wires engine health state to Telegram/Slack/Discord with per-(watcher x trigger) 15-minute debounce. See `internal/watcher/health_bridge.go`. Closes REQ-WF-3.
+- **Watcher folder hierarchy** — on-disk state reorganized to `~/.agent-deck/watcher/` (singular) mirroring the conductor folder pattern. Shared files (CLAUDE.md, POLICY.md, LEARNINGS.md, clients.json) at root, per-watcher subdirs (meta.json, state.json, task-log.md). Closes REQ-WF-6.
+- **Per-watcher health fields** — `agent-deck watcher list --json` now exposes `last_event_ts`, `error_count`, `health_status` per watcher.
+- **Watcher CLI** — 8 subcommands: create, start, stop, status, list, logs, import, install-skill.
+
+### Changed
+- **BREAKING: Watcher data directory renamed** — `~/.agent-deck/watchers/` is now `~/.agent-deck/watcher/` (singular). A compatibility symlink `watchers -> watcher/` is created automatically on first boot so existing scripts continue to work. The symlink will be removed in v1.7.0. Update any hardcoded paths.
+
+## [1.5.1] - 2026-04-13
+
+Patch release fixing 7 bugs reported by users and merging 3 community PRs.
+
+### Fixed
+- Clear host terminal scrollback on session detach. ([#419](https://github.com/asheshgoplani/agent-deck/issues/419))
+- Web terminal resize now uses pty.Setsize + tmux resize-window for correct dimensions. ([#568](https://github.com/asheshgoplani/agent-deck/pull/568))
+- Narrow controlSeqTimeout to ESC-only and ignore SIGINT during attach, fixing Ctrl+C forwarding. ([#571](https://github.com/asheshgoplani/agent-deck/pull/571))
+- Allow underscore character in TUI dialog text inputs. ([#573](https://github.com/asheshgoplani/agent-deck/pull/573))
+- Allow Esc to dismiss setup wizard on welcome step. ([#564](https://github.com/asheshgoplani/agent-deck/issues/564), [#566](https://github.com/asheshgoplani/agent-deck/pull/566))
+- Initialize branchAutoSet when worktree default_enabled is true. ([#561](https://github.com/asheshgoplani/agent-deck/issues/561), [#562](https://github.com/asheshgoplani/agent-deck/pull/562))
+- Harden sandbox runtime probes and respawn bash wrapping. ([#575](https://github.com/asheshgoplani/agent-deck/pull/575))
+- Preserve existing OpenCode session binding on restart. ([#576](https://github.com/asheshgoplani/agent-deck/pull/576))
+
+### Added
+- Arrow-key navigation for confirm dialogs. ([#557](https://github.com/asheshgoplani/agent-deck/pull/557))
 
 ## [1.5.0] - 2026-04-10
 

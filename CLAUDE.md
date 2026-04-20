@@ -108,3 +108,83 @@ TOML-based at `~/.agent-deck/profiles/<profile>/config.toml`. Key sections: `[cl
 ## Commit conventions
 
 Conventional commits: `feat:`, `fix:`, `perf:`, `docs:`, `refactor:`. Branch naming: `feature/`, `fix/`, `perf/`, `docs/`, `refactor/`.
+
+## Session persistence: mandatory test coverage
+
+Agent-deck has a recurring production failure where a single SSH logout on a Linux+systemd host destroys **every** managed tmux session. **As of v1.5.2, this class of bug is permanently test-gated.**
+
+### The eight required tests
+
+Any PR modifying session lifecycle paths MUST run `go test -run TestPersistence_ ./internal/session/... -race -count=1`. In addition, `bash scripts/verify-session-persistence.sh` MUST run end-to-end on a Linux+systemd host.
+
+### Paths under the mandate
+
+- `internal/tmux/**`, `internal/session/instance.go`, `internal/session/userconfig.go`, `internal/session/storage*.go`
+- `cmd/session_cmd.go`, `scripts/verify-session-persistence.sh`, this `CLAUDE.md` section
+
+### Forbidden changes without an RFC
+
+- Flipping `launch_in_user_scope` default back to `false` on Linux
+- Removing any of the eight `TestPersistence_*` tests
+- Adding a code path that starts a Claude session and ignores `Instance.ClaudeSessionID`
+
+## Feedback feature: mandatory test coverage
+
+The in-product feedback feature is covered by 23 tests. All must pass before any PR touching the feedback surface is merged.
+
+```
+go test ./internal/feedback/... ./internal/ui/... ./cmd/agent-deck/... -run "Feedback|Sender_" -race -count=1
+```
+
+Reintroducing `D_PLACEHOLDER` as `feedback.DiscussionNodeID` is a **blocker**. `TestSender_DiscussionNodeID_IsReal` catches this automatically.
+
+## Per-group config: mandatory test coverage
+
+Per-group config dir applies to custom-command sessions too; `TestPerGroupConfig_*` suite enforces this.
+
+## Watcher framework: mandatory test coverage
+
+Any commit touching watcher source code MUST pass:
+
+```bash
+go test ./internal/watcher/... -race -count=1 -timeout 120s
+go test ./cmd/agent-deck/... -run "Watcher" -race -count=1
+```
+
+### Watcher paths under the mandate
+
+- `internal/watcher/**` (engine, adapters, health bridge, layout, state, event log, router)
+- `cmd/agent-deck/watcher_cmd*.go` (CLI surface)
+- `internal/ui/watcher_panel.go` (TUI watcher panel)
+- `internal/statedb/statedb.go` (watcher rows in SQLite)
+- `cmd/agent-deck/assets/skills/watcher-creator/` (embedded skill)
+- `internal/session/watcher_meta.go` (watcher directory helpers)
+
+### Watcher structural changes requiring RFC
+
+- Removing or weakening the health bridge (`internal/watcher/health_bridge.go`)
+- Disabling SQLite dedup (INSERT OR IGNORE on `watcher_events`)
+- Weakening HMAC-SHA256 verification on the GitHub adapter
+- Changing the `~/.agent-deck/watcher/` folder layout (REQ-WF-6)
+
+### Skills + docs sync (REQ-WF-7)
+
+Any commit modifying `internal/watcher/layout.go` or `internal/session/watcher_meta.go` MUST also update embedded skills, README, and CHANGELOG. `TestSkillDriftCheck_WatcherCreator` enforces this at build time.
+
+### Integration harness
+
+```bash
+bash scripts/verify-watcher-framework.sh
+```
+
+## --no-verify mandate
+
+**`git commit --no-verify` is FORBIDDEN on source-modifying commits.** Metadata-only commits (`.planning/**`, `docs/**`, non-source `*.md`) MAY use `--no-verify` when hooks would no-op.
+
+## General rules
+
+- **Never `rm`** — use `trash`.
+- **Never commit with Claude attribution** — no "Generated with Claude Code" or "Co-Authored-By: Claude" lines.
+- **Never `git push`, `git tag`, `gh release`, `gh pr create/merge`** without explicit user approval.
+- **TDD always** — the regression test for a bug lands BEFORE the fix.
+- **Simplicity first** — every change minimal, targeted, no speculative refactoring.

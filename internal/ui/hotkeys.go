@@ -14,6 +14,7 @@ const (
 	hotkeyRename          = "rename"
 	hotkeyRestart         = "restart"
 	hotkeyHardRestart     = "hard_restart"
+	hotkeyRestartFresh    = "restart_fresh"
 	hotkeyDelete          = "delete"
 	hotkeyCloseSession    = "close_session"
 	hotkeyUndoDelete      = "undo_delete"
@@ -29,6 +30,8 @@ const (
 	hotkeySendOutput      = "send_output"
 	hotkeyExecShell       = "exec_shell"
 	hotkeyEditNotes       = "edit_notes"
+	hotkeyEditPaths       = "edit_paths"
+	hotkeyWatcherPanel    = "watcher_panel"
 	hotkeyWorktreeFinish  = "worktree_finish"
 	hotkeyCreateGroup     = "create_group"
 	hotkeySearch          = "search"
@@ -47,6 +50,7 @@ var hotkeyActionOrder = []string{
 	hotkeyRename,
 	hotkeyRestart,
 	hotkeyHardRestart,
+	hotkeyRestartFresh,
 	hotkeyDelete,
 	hotkeyCloseSession,
 	hotkeyUndoDelete,
@@ -62,6 +66,7 @@ var hotkeyActionOrder = []string{
 	hotkeySendOutput,
 	hotkeyExecShell,
 	hotkeyEditNotes,
+	hotkeyEditPaths,
 	hotkeyWorktreeFinish,
 	hotkeyCreateGroup,
 	hotkeySearch,
@@ -71,6 +76,7 @@ var hotkeyActionOrder = []string{
 	hotkeyReload,
 	hotkeyDetach,
 	hotkeyMRUCycle,
+	hotkeyWatcherPanel,
 }
 
 var defaultHotkeyBindings = map[string]string{
@@ -80,6 +86,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyRename:          "r",
 	hotkeyRestart:         "t",
 	hotkeyHardRestart:     "ctrl+t",
+	hotkeyRestartFresh:    "T",
 	hotkeyDelete:          "d",
 	hotkeyCloseSession:    "ctrl+x",
 	hotkeyUndoDelete:      "ctrl+z",
@@ -95,6 +102,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeySendOutput:      "x",
 	hotkeyExecShell:       "b",
 	hotkeyEditNotes:       "e",
+	hotkeyEditPaths:       "",
 	hotkeyWorktreeFinish:  "w",
 	hotkeyCreateGroup:     "g",
 	hotkeySearch:          "/",
@@ -104,6 +112,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyReload:          "ctrl+r",
 	hotkeyDetach:          "ctrl+q",
 	hotkeyMRUCycle:        "ctrl+w",
+	hotkeyWatcherPanel:    "",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{

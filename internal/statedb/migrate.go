@@ -52,6 +52,8 @@ type jsonInstanceData struct {
 	Notes            string          `json:"notes,omitempty"`
 	ToolOptionsJSON  json.RawMessage `json:"tool_options,omitempty"`
 	LoadedMCPNames   []string        `json:"loaded_mcp_names,omitempty"`
+	Channels         []string        `json:"channels,omitempty"`
+	ExtraArgs        []string        `json:"extra_args,omitempty"`
 	Sandbox          json.RawMessage `json:"sandbox,omitempty"`
 	SandboxContainer string          `json:"sandbox_container,omitempty"`
 }
@@ -80,6 +82,8 @@ type toolDataBlob struct {
 	LatestPrompt       string          `json:"latest_prompt,omitempty"`
 	Notes              string          `json:"notes,omitempty"`
 	LoadedMCPNames     []string        `json:"loaded_mcp_names,omitempty"`
+	Channels           []string        `json:"channels,omitempty"`
+	ExtraArgs          []string        `json:"extra_args,omitempty"`
 	ToolOptions        json.RawMessage `json:"tool_options,omitempty"`
 	Sandbox            json.RawMessage `json:"sandbox,omitempty"`
 	SandboxContainer   string          `json:"sandbox_container,omitempty"`
@@ -216,6 +220,8 @@ func MarshalToolData(
 	sshHost string, sshRemotePath string,
 	multiRepoEnabled bool, additionalPaths []string,
 	multiRepoTempDir string, multiRepoWorktrees []MultiRepoWorktreeData,
+	channels []string,
+	extraArgs []string,
 ) json.RawMessage {
 	td := toolDataBlob{
 		ClaudeSessionID:   claudeSessionID,
@@ -227,6 +233,8 @@ func MarshalToolData(
 		LatestPrompt:      latestPrompt,
 		Notes:             notes,
 		LoadedMCPNames:    loadedMCPNames,
+		Channels:          channels,
+		ExtraArgs:         extraArgs,
 		ToolOptions:       toolOptionsJSON,
 		Sandbox:           sandboxJSON,
 		SandboxContainer:  sandboxContainer,
@@ -269,6 +277,8 @@ func UnmarshalToolData(data json.RawMessage) (
 	sshHost string, sshRemotePath string,
 	multiRepoEnabled bool, additionalPaths []string,
 	multiRepoTempDir string, multiRepoWorktrees []MultiRepoWorktreeData,
+	channels []string,
+	extraArgs []string,
 ) {
 	if len(data) == 0 {
 		return
@@ -298,6 +308,8 @@ func UnmarshalToolData(data json.RawMessage) (
 	latestPrompt = td.LatestPrompt
 	notes = td.Notes
 	loadedMCPNames = td.LoadedMCPNames
+	channels = td.Channels
+	extraArgs = td.ExtraArgs
 	toolOptionsJSON = td.ToolOptions
 	sandboxJSON = td.Sandbox
 	sandboxContainer = td.SandboxContainer

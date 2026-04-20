@@ -137,6 +137,7 @@ func (h *HelpOverlay) View() string {
 	closeKey := h.key(hotkeyCloseSession, "Ctrl+X")
 	restartKey := h.key(hotkeyRestart, "t")
 	hardRestartKey := h.key(hotkeyHardRestart, "Ctrl+T")
+	restartFreshKey := h.key(hotkeyRestartFresh, "Shift+T")
 	renameKey := h.key(hotkeyRename, "r")
 	moveKey := h.key(hotkeyMoveToGroup, "o")
 	mcpKey := h.key(hotkeyMCPManager, "m")
@@ -150,7 +151,9 @@ func (h *HelpOverlay) View() string {
 	if cfg, _ := session.LoadUserConfig(); cfg != nil && !cfg.GetShowNotes() {
 		notesKey = ""
 	}
+	editPathsKey := h.key(hotkeyEditPaths, "p")
 	worktreeKey := h.key(hotkeyWorktreeFinish, "w")
+	watcherPanelKey := h.key(hotkeyWatcherPanel, "w")
 	groupKey := h.key(hotkeyCreateGroup, "g")
 	undoKey := h.key(hotkeyUndoDelete, "Ctrl+Z")
 	mruKey := h.key(hotkeyMRUCycle, "Ctrl+W")
@@ -182,6 +185,7 @@ func (h *HelpOverlay) View() string {
 				{renameKey, "Rename session"},
 				{restartKey, "Restart session"},
 				{hardRestartKey, "Hard restart (fresh session)"},
+				{restartFreshKey, "Restart with new session ID"},
 				{deleteKey, "Delete session"},
 				{closeKey, "Close session process"},
 				{undoKey, "Undo delete"},
@@ -196,6 +200,7 @@ func (h *HelpOverlay) View() string {
 				{copyKey, "Copy output to clipboard"},
 				{sendKey, "Send output to session"},
 				{execShellKey, "Exec shell in sandbox container"},
+				{editPathsKey, "Edit multi-repo paths"},
 				{notesKey, "Edit notes"},
 			},
 		},
@@ -205,6 +210,12 @@ func (h *HelpOverlay) View() string {
 				{worktreeKey, "Finish worktree (merge + cleanup)"},
 				{"n → w", "Create session in worktree"},
 				{"F → w", "Fork session into worktree"},
+			},
+		},
+		{
+			title: "WATCHERS",
+			items: [][2]string{
+				{watcherPanelKey, "Watcher panel"},
 			},
 		},
 		{
