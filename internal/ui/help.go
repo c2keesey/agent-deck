@@ -152,6 +152,7 @@ func (h *HelpOverlay) View() string {
 		notesKey = ""
 	}
 	editPathsKey := h.key(hotkeyEditPaths, "p")
+	editSessionKey := h.key(hotkeyEditSession, "P")
 	worktreeKey := h.key(hotkeyWorktreeFinish, "W")
 	watcherPanelKey := h.key(hotkeyWatcherPanel, "w")
 	groupKey := h.key(hotkeyCreateGroup, "g")
@@ -168,12 +169,21 @@ func (h *HelpOverlay) View() string {
 				{"k / Up", "Move up"},
 				{"Ctrl+u/d", "Half page up/down"},
 				{"Ctrl+f/b", "Full page up/down"},
-				{"gg / G", "Jump to top/bottom"},
+				{"gg / G", "Jump to top / global search"},
 				{"h / Left", "Collapse / parent"},
 				{"l / Right", "Expand / toggle"},
-				{"1-9", "Jump to group"},
+				{"1-9", "Jump to root group"},
 				{"Space", "Jump mode"},
 				{"Enter", "Attach / toggle"},
+			},
+		},
+		{
+			title: "GROUP NAVIGATION (v1.7.60)",
+			items: [][2]string{
+				{"Alt+j / Alt+k", "Next / prev session in current group"},
+				{"Alt+1 - Alt+9", "Jump to Nth session in current group"},
+				{"Alt+g / Alt+G", "First / last session in current group"},
+				{"Alt+/", "Filter search scoped to current group"},
 			},
 		},
 		{
@@ -196,9 +206,11 @@ func (h *HelpOverlay) View() string {
 				{reorderKeys, "Reorder up/down"},
 				{forkKeys, "Fork session (Claude only)"},
 				{copyKey, "Copy output to clipboard"},
+				{"C", "Copy preview info (Repo / Path / Branch)"},
 				{sendKey, "Send output to session"},
 				{execShellKey, "Exec shell in sandbox container"},
 				{editPathsKey, "Edit multi-repo paths"},
+				{editSessionKey, "Edit session settings (title/color/notes/command/...)"},
 				{notesKey, "Edit notes"},
 			},
 		},

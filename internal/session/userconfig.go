@@ -161,6 +161,11 @@ type UserConfig struct {
 	// Mirrors the opt-out in ~/.agent-deck/feedback-state.json so it is visible
 	// to the user and editable without running `agent-deck feedback`.
 	Feedback FeedbackSettings `toml:"feedback"`
+
+	// Terminal defines outer-terminal chrome settings — sequences agent-deck
+	// writes directly to the host terminal (iTerm2 badge, etc), distinct
+	// from anything tmux draws. Empty/absent uses defaults; see TerminalSettings.
+	Terminal TerminalSettings `toml:"terminal"`
 }
 
 // FeedbackSettings controls the in-product feedback prompts.
@@ -834,6 +839,47 @@ type WorktreeSettings struct {
 	// Set to "" to disable auto-prefixing (just the session name).
 	// Default: "feature/" when not set.
 	BranchPrefix *string `toml:"branch_prefix"`
+
+	// SetupTimeoutSeconds caps how long .agent-deck/worktree-setup.sh may run.
+	// Pointer (not plain int) so the loader can distinguish three cases:
+	//   nil         → field unset → 60s default (backward compat, GH #724)
+	//   *0          → explicit unlimited (no deadline) — #727 follow-up
+	//   *N (N > 0)  → N seconds
+	//   *N (N < 0)  → treated as unset (60s default)
+	// The `*0 = unlimited` convention matches standard CLI tooling (curl,
+	// systemd, docker). Reporter @Clindbergh flagged the v1.7.65 behaviour
+	// (`0 = default`) as counter-convention in the PR review for #727.
+	SetupTimeoutSeconds *int `toml:"setup_timeout_seconds"`
+}
+
+// DefaultWorktreeSetupTimeout is the fallback used when no explicit value is
+// configured. Kept small and visible so the git package can share it.
+const DefaultWorktreeSetupTimeout = 60 * time.Second
+
+// UnlimitedWorktreeSetupTimeout is the sentinel returned by SetupTimeout()
+// when the user has configured `setup_timeout_seconds = 0`. The git layer
+// interprets this as "no deadline" (context.Background() instead of
+// context.WithTimeout). Value chosen as 0 so the config value flows straight
+// through to the git layer unchanged.
+const UnlimitedWorktreeSetupTimeout time.Duration = 0
+
+// SetupTimeout returns the configured worktree-setup-script timeout.
+// Semantics (post-#727 follow-up):
+//   - field unset (nil) or negative → DefaultWorktreeSetupTimeout (60s)
+//   - explicit 0                    → UnlimitedWorktreeSetupTimeout (no deadline)
+//   - positive N                    → N seconds
+func (w WorktreeSettings) SetupTimeout() time.Duration {
+	if w.SetupTimeoutSeconds == nil {
+		return DefaultWorktreeSetupTimeout
+	}
+	v := *w.SetupTimeoutSeconds
+	if v < 0 {
+		return DefaultWorktreeSetupTimeout
+	}
+	if v == 0 {
+		return UnlimitedWorktreeSetupTimeout
+	}
+	return time.Duration(v) * time.Second
 }
 
 // Template returns the path template if set, or empty string if nil.
@@ -1058,6 +1104,15 @@ type TmuxSettings struct {
 	// Default: true (nil = use default true)
 	InjectStatusLine *bool `toml:"inject_status_line"`
 
+	// Mouse controls whether agent-deck enables tmux mouse mode on new
+	// sessions. When false, tmux `mouse on` is never set, so the terminal
+	// emulator keeps raw control of mouse events — required by the VS Code
+	// Linux integrated terminal to let users click-drag to select text
+	// (issue #730). Affects both the inline set-option during session
+	// creation and the separate EnableMouseMode() path used on reconnect.
+	// Default: true (nil = use default true, preserves pre-#730 behavior)
+	Mouse *bool `toml:"mouse"`
+
 	// LaunchInUserScope starts new tmux servers via `systemd-run --user --scope`
 	// so the tmux server lives under the user's systemd manager instead of the
 	// current login session scope. This keeps tmux alive when an SSH session
@@ -1120,6 +1175,30 @@ type TmuxSettings struct {
 	// Options is a map of tmux option names to values.
 	// These are passed to `tmux set-option -t <session>` after defaults.
 	Options map[string]string `toml:"options"`
+
+	// SocketName is the tmux `-L <name>` socket selector for every
+	// agent-deck tmux spawn (v1.7.50+, issue #687). Empty string — the
+	// default — keeps pre-v1.7.50 behavior byte-for-byte: agent-deck shares
+	// the user's default tmux server at $TMUX_TMPDIR/tmux-<uid>/default.
+	//
+	// Set this to isolate agent-deck onto its own tmux server so:
+	//   - `[tmux].inject_status_line`, bind-key, and global set-option
+	//     mutations stay on the agent-deck server and never touch the
+	//     user's interactive tmux config (the original #276 complaint);
+	//   - a `tmux kill-server` in the user's shell can't take agent-deck's
+	//     managed sessions down with it;
+	//   - `tmux -L <name> ls` from the shell shows exactly agent-deck's
+	//     sessions — no mixing with the user's own work sessions.
+	//
+	// Each Instance captures this value at creation time into
+	// Instance.TmuxSocketName; changing socket_name later does NOT migrate
+	// existing sessions (they remain reachable on their original socket
+	// until explicitly re-created). See docs/SOCKET_ISOLATION.md for the
+	// migration procedure.
+	//
+	// Precedence at Instance creation: CLI flag `--tmux-socket <name>`
+	// wins, else this config value, else empty.
+	SocketName string `toml:"socket_name"`
 }
 
 // GetInjectStatusLine returns whether to inject status line, defaulting to true.
@@ -1128,6 +1207,24 @@ func (t TmuxSettings) GetInjectStatusLine() bool {
 		return true
 	}
 	return *t.InjectStatusLine
+}
+
+// GetSocketName returns the trimmed `[tmux].socket_name` value, or "" when
+// unset, whitespace-only, or absent. Centralising the trim here means
+// every caller — tmux.SetDefaultSocketName at startup, CLI flag merging,
+// Instance creation — sees the same sanitised value.
+func (t TmuxSettings) GetSocketName() string {
+	return strings.TrimSpace(t.SocketName)
+}
+
+// GetMouse returns whether tmux mouse mode should be enabled, defaulting to
+// true. Issue #730: users on VS Code's Linux integrated terminal need mouse
+// OFF so the terminal can handle click-drag selection natively.
+func (t TmuxSettings) GetMouse() bool {
+	if t.Mouse == nil {
+		return true
+	}
+	return *t.Mouse
 }
 
 // GetLaunchInUserScope returns whether new tmux servers should be launched
@@ -2077,6 +2174,55 @@ func GetTmuxSettings() TmuxSettings {
 	return config.Tmux
 }
 
+// TerminalSettings controls outer-terminal chrome agent-deck writes directly
+// to the host terminal (bypassing tmux). These settings affect what the
+// terminal emulator displays — currently only iTerm2's badge.
+//
+// Example config.toml:
+//
+//	[terminal]
+//	iterm_badge = true
+type TerminalSettings struct {
+	// ITermBadge controls whether agent-deck sets the iTerm2 badge to the
+	// attached session's title for the duration of the attach, and refreshes
+	// it when Claude renames the session mid-attach. No-op outside iTerm2.
+	//
+	// AGENTDECK_ITERM_BADGE env var overrides this in either direction
+	// (=1/true/yes/on force on, =0/false/no/off force off; unset defers to
+	// this config). Caveat: env reliably reaches the attach/detach path
+	// (agent-deck reads its own env directly) but the rename-while-attached
+	// path runs in a hook subprocess spawned through agent-deck → tmux →
+	// Claude → hook, and Claude may filter custom env vars. For consistent
+	// behavior on both paths, prefer this config setting — every process
+	// re-reads it from disk, so propagation is independent of the spawn
+	// chain.
+	//
+	// Default: false (opt-in). Most users have their own iTerm2 badge scheme
+	// (e.g. host/cwd via shell PROMPT_COMMAND), so silently overwriting it on
+	// every attach is too presumptuous a default. Users who want the
+	// per-session badge set this to true explicitly.
+	ITermBadge *bool `toml:"iterm_badge"`
+}
+
+// GetITermBadge returns whether the iTerm2 badge integration is enabled,
+// defaulting to false (opt-in). Mirrors the GetInjectStatusLine pattern but
+// with the inverse default — see ITermBadge field doc for rationale.
+func (t TerminalSettings) GetITermBadge() bool {
+	if t.ITermBadge == nil {
+		return false
+	}
+	return *t.ITermBadge
+}
+
+// GetTerminalSettings returns terminal-chrome settings from config.
+func GetTerminalSettings() TerminalSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return TerminalSettings{}
+	}
+	return config.Terminal
+}
+
 // GetInstanceSettings returns instance behavior settings
 func GetInstanceSettings() InstanceSettings {
 	config, err := LoadUserConfig()
@@ -2278,6 +2424,12 @@ auto_cleanup = true
 # agent-deck stops mutating the global tmux notification bar / number key bindings
 # Default: true (agent-deck injects its own status bar with session info)
 # inject_status_line = false
+# mouse controls whether agent-deck enables tmux mouse mode.
+# Set this to false if your terminal (e.g. VS Code's Linux integrated terminal)
+# interprets mouse events at the terminal layer and you want click-drag text
+# selection to bypass tmux entirely. Issue #730.
+# Default: true (tmux mouse mode is enabled — scrolling, pane resize, selection in tmux)
+# mouse = false
 # launch_in_user_scope starts new tmux servers with systemd-run --user --scope
 # so they survive when the current login session is torn down (e.g. SSH logout).
 # Default: true on Linux+systemd hosts where 'systemd-run --user --version'
@@ -2304,6 +2456,21 @@ auto_cleanup = true
 # options = { "allow-passthrough" = "all", "history-limit" = "50000" }
 # Example: keep agent-deck notifications but use a 2-line status bar
 # options = { "status" = "2" }
+
+# Outer-terminal chrome (sequences agent-deck writes to the host terminal,
+# bypassing tmux). Currently controls the iTerm2 badge; future window-title
+# integrations will live in the same section.
+# [terminal]
+# iterm_badge sets the iTerm2 badge to the attached session's title for the
+# duration of the attach (cleared on detach), and refreshes it when Claude
+# renames the session mid-attach. Opt-in because most users already drive
+# the badge from their shell prompt. No-op outside iTerm2.
+# Override at runtime: AGENTDECK_ITERM_BADGE=1 forces on, =0 forces off.
+# Caveat: the env var reliably reaches the attach/detach path but is
+# unreliable for rename-while-attached (Claude may filter env vars when
+# spawning hook subprocesses). Prefer this config setting for both paths.
+# Default: false
+# iterm_badge = true
 
 # ============================================================================
 # MCP Server Definitions
