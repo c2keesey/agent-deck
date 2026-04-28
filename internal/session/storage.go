@@ -36,20 +36,21 @@ type StorageData struct {
 
 // InstanceData represents the serializable session data
 type InstanceData struct {
-	ID              string    `json:"id"`
-	Title           string    `json:"title"`
-	ProjectPath     string    `json:"project_path"`
-	GroupPath       string    `json:"group_path"`
-	Order           int       `json:"order"`
-	ParentSessionID string    `json:"parent_session_id,omitempty"` // Links to parent session (sub-session support)
-	IsConductor     bool      `json:"is_conductor,omitempty"`      // True if this session is a conductor orchestrator
-	Command         string    `json:"command"`
-	Wrapper         string    `json:"wrapper,omitempty"`
-	Tool            string    `json:"tool"`
-	Status          Status    `json:"status"`
-	CreatedAt       time.Time `json:"created_at"`
-	LastAccessedAt  time.Time `json:"last_accessed_at,omitempty"`
-	TmuxSession     string    `json:"tmux_session"`
+	ID                 string    `json:"id"`
+	Title              string    `json:"title"`
+	ProjectPath        string    `json:"project_path"`
+	GroupPath          string    `json:"group_path"`
+	Order              int       `json:"order"`
+	ParentSessionID    string    `json:"parent_session_id,omitempty"`    // Links to parent session (sub-session support)
+	IsConductor        bool      `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
+	NoTransitionNotify bool      `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
+	Command            string    `json:"command"`
+	Wrapper            string    `json:"wrapper,omitempty"`
+	Tool               string    `json:"tool"`
+	Status             Status    `json:"status"`
+	CreatedAt          time.Time `json:"created_at"`
+	LastAccessedAt     time.Time `json:"last_accessed_at,omitempty"`
+	TmuxSession        string    `json:"tmux_session"`
 
 	// Worktree support
 	WorktreePath     string `json:"worktree_path,omitempty"`
@@ -90,6 +91,9 @@ type InstanceData struct {
 	// User-supplied claude CLI tokens, appended to every start/resume/fork
 	// command. Persisted so restarts preserve custom flags like --agent/--model.
 	ExtraArgs []string `json:"extra_args,omitempty"`
+
+	// Color is an optional per-session TUI row tint (issue #391). Empty = no tint.
+	Color string `json:"color,omitempty"`
 
 	// Sandbox support
 	Sandbox          *SandboxConfig `json:"sandbox,omitempty"`
@@ -272,6 +276,21 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 	// Convert instances to database rows
 	rows := make([]*statedb.InstanceRow, len(instances))
 	for i, inst := range instances {
+		// Issue #666: belt-and-braces guard. Empty GroupPath should never
+		// reach SQLite — the load-time fallback at convertToInstances already
+		// covers legacy rows, but a regression in a write path (fork, move,
+		// direct mutation) could still slip through. Normalize here so the
+		// next load doesn't need to defend.
+		if inst.GroupPath == "" {
+			storageLog.Warn(
+				"empty_group_path_normalized_on_save",
+				slog.String("instance_id", inst.ID),
+				slog.String("title", inst.Title),
+				slog.String("project_path", inst.ProjectPath),
+				slog.String("normalized_to", DefaultGroupPath),
+			)
+			inst.GroupPath = DefaultGroupPath
+		}
 		tmuxName := ""
 		if inst.tmuxSession != nil {
 			tmuxName = inst.tmuxSession.Name
@@ -308,27 +327,29 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 			inst.MultiRepoTempDir, mrWorktrees,
 			inst.Channels,
 			inst.ExtraArgs,
+			inst.Color, // issue #391
 		)
 
 		rows[i] = &statedb.InstanceRow{
-			ID:              inst.ID,
-			Title:           inst.Title,
-			ProjectPath:     inst.ProjectPath,
-			GroupPath:       inst.GroupPath,
-			Order:           inst.Order,
-			Command:         inst.Command,
-			Wrapper:         inst.Wrapper,
-			Tool:            inst.Tool,
-			Status:          string(inst.Status),
-			TmuxSession:     tmuxName,
-			CreatedAt:       inst.CreatedAt,
-			LastAccessed:    inst.LastAccessedAt,
-			ParentSessionID: inst.ParentSessionID,
-			IsConductor:     inst.IsConductor,
-			WorktreePath:    inst.WorktreePath,
-			WorktreeRepo:    inst.WorktreeRepoRoot,
-			WorktreeBranch:  inst.WorktreeBranch,
-			ToolData:        toolData,
+			ID:                 inst.ID,
+			Title:              inst.Title,
+			ProjectPath:        inst.ProjectPath,
+			GroupPath:          inst.GroupPath,
+			Order:              inst.Order,
+			Command:            inst.Command,
+			Wrapper:            inst.Wrapper,
+			Tool:               inst.Tool,
+			Status:             string(inst.Status),
+			TmuxSession:        tmuxName,
+			CreatedAt:          inst.CreatedAt,
+			LastAccessed:       inst.LastAccessedAt,
+			ParentSessionID:    inst.ParentSessionID,
+			IsConductor:        inst.IsConductor,
+			NoTransitionNotify: inst.NoTransitionNotify,
+			WorktreePath:       inst.WorktreePath,
+			WorktreeRepo:       inst.WorktreeRepoRoot,
+			WorktreeBranch:     inst.WorktreeBranch,
+			ToolData:           toolData,
 		}
 	}
 
@@ -454,7 +475,8 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			mrEnabled2, addPaths2,
 			mrTempDir2, mrWorktrees2,
 			channels2,
-			extraArgs2 := statedb.UnmarshalToolData(r.ToolData)
+			extraArgs2,
+			color2 := statedb.UnmarshalToolData(r.ToolData)
 		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		instances[i] = &InstanceData{
@@ -465,6 +487,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			Order:              r.Order,
 			ParentSessionID:    r.ParentSessionID,
 			IsConductor:        r.IsConductor,
+			NoTransitionNotify: r.NoTransitionNotify,
 			Command:            r.Command,
 			Wrapper:            r.Wrapper,
 			Tool:               r.Tool,
@@ -499,6 +522,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			MultiRepoWorktrees: mrWorktrees2,
 			Channels:           channels2,
 			ExtraArgs:          extraArgs2,
+			Color:              color2,
 		}
 	}
 
@@ -555,7 +579,8 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			mrEnabled, addPaths,
 			mrTempDir, mrWorktrees,
 			channels,
-			extraArgs := statedb.UnmarshalToolData(r.ToolData)
+			extraArgs,
+			color := statedb.UnmarshalToolData(r.ToolData)
 		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		data.Instances[i] = &InstanceData{
@@ -566,6 +591,7 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			Order:              r.Order,
 			ParentSessionID:    r.ParentSessionID,
 			IsConductor:        r.IsConductor,
+			NoTransitionNotify: r.NoTransitionNotify,
 			Command:            r.Command,
 			Wrapper:            r.Wrapper,
 			Tool:               r.Tool,
@@ -600,6 +626,7 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			MultiRepoWorktrees: mrWorktrees,
 			Channels:           channels,
 			ExtraArgs:          extraArgs,
+			Color:              color,
 		}
 	}
 
@@ -746,6 +773,17 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 				instData.Command,
 				previousStatus,
 			)
+			// Issue #663: for multi-repo sessions ProjectPath is a symlink
+			// inside MultiRepoTempDir (see home.go:7255-7364), so the
+			// restart pane must cwd into the parent dir — not the symlink
+			// target (an individual source repo). Matches the creation-
+			// time assignment at home.go:7364. Without this, Claude's
+			// JSONL is written under a different encoded-path key and the
+			// next Start() silently mints a fresh session instead of
+			// resuming the prior conversation.
+			if instData.MultiRepoEnabled && instData.MultiRepoTempDir != "" {
+				tmuxSess.WorkDir = instData.MultiRepoTempDir
+			}
 			// Pass instance ID for activity hooks (enables real-time status updates)
 			tmuxSess.InstanceID = instData.ID
 			tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
@@ -754,10 +792,24 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			// Called automatically when user attaches to session
 		}
 
-		// Migrate old sessions without GroupPath
+		// Issue #666: a row with an empty group_path is the symptom of either
+		// (a) a legacy row from pre-GroupPath code or (b) a future regression
+		// in a write path. The old behavior re-derived via
+		// extractGroupPath(ProjectPath), which silently re-parented sessions
+		// to path-derived groups like "tmp" or "home" — the exact user-visible
+		// symptom of #666 ("session disappeared from its assigned group").
+		// The safe contract: route survivors to DefaultGroupPath and log, so
+		// the user sees the group in a known, recoverable place.
 		groupPath := instData.GroupPath
 		if groupPath == "" {
-			groupPath = extractGroupPath(instData.ProjectPath)
+			storageLog.Warn(
+				"empty_group_path_fallback",
+				slog.String("instance_id", instData.ID),
+				slog.String("title", instData.Title),
+				slog.String("project_path", instData.ProjectPath),
+				slog.String("fallback_group", DefaultGroupPath),
+			)
+			groupPath = DefaultGroupPath
 		}
 
 		// Expand tilde in project path (handles paths like ~/project saved from UI)
@@ -773,6 +825,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			Order:              instData.Order,
 			ParentSessionID:    instData.ParentSessionID,
 			IsConductor:        instData.IsConductor,
+			NoTransitionNotify: instData.NoTransitionNotify,
 			Command:            instData.Command,
 			Wrapper:            instData.Wrapper,
 			Tool:               instData.Tool,
@@ -798,6 +851,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			LoadedMCPNames:     instData.LoadedMCPNames,
 			Channels:           instData.Channels,
 			ExtraArgs:          instData.ExtraArgs,
+			Color:              instData.Color,
 			Sandbox:            instData.Sandbox,
 			SandboxContainer:   instData.SandboxContainer,
 			SSHHost:            instData.SSHHost,

@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
+	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -32,7 +34,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.7.20" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.7.41" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -496,6 +498,17 @@ func main() {
 	var groupScope string
 	groupScope, _ = extractGroupFlag(args)
 
+	// v1.7.41: record TUI launch for feedback-prompt pacing. Seeds
+	// FirstSeenAt on the very first launch and bumps LaunchCount on every
+	// subsequent launch, so feedback.ShouldShow can enforce the min-days +
+	// min-launches threshold for new users. Non-TUI subcommands (add, list,
+	// feedback, etc.) deliberately skip this so scripted usage doesn't
+	// inflate the counter.
+	if fbSt, _ := feedback.LoadState(); fbSt != nil {
+		feedback.RecordLaunch(fbSt, time.Now())
+		_ = feedback.SaveState(fbSt)
+	}
+
 	// Start TUI with the specified profile
 	homeModel := ui.NewHomeWithProfileAndMode(profile)
 	// Apply group scope if specified via --group / -g flag
@@ -924,6 +937,7 @@ func handleAdd(profile string, args []string) {
 	parent := fs.String("parent", "", "Parent session (creates sub-session, inherits group)")
 	parentShort := fs.String("p", "", "Parent session (short)")
 	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking (use 'session set-parent' later to link manually)")
+	noTransitionNotify := fs.Bool("no-transition-notify", false, "Suppress transition event notifications to parent session")
 	quickCreate := fs.Bool("quick", false, "Auto-generate session name (adjective-noun)")
 	quickCreateShort := fs.Bool("Q", false, "Auto-generate session name (short)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
@@ -1274,6 +1288,11 @@ func handleAdd(profile string, args []string) {
 		newInstance.SetParentWithPath(parentInstance.ID, parentInstance.ProjectPath)
 	}
 
+	// Suppress transition notifications if requested
+	if *noTransitionNotify {
+		newInstance.NoTransitionNotify = true
+	}
+
 	// Set command if provided
 	if sessionCommandInput != "" {
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
@@ -1545,6 +1564,7 @@ func handleList(profile string, args []string) {
 			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
 			Channels      []string  `json:"channels,omitempty"`
 			ExtraArgs     []string  `json:"extra_args,omitempty"`
+			Color         string    `json:"color,omitempty"` // issue #391
 		}
 		// Warm tmux pane-title cache + load hook statuses so the CLI
 		// reports the same Status the TUI and /api/menu do (issue #610).
@@ -1566,6 +1586,7 @@ func handleList(profile string, args []string) {
 				SSHRemotePath: inst.SSHRemotePath,
 				Channels:      inst.Channels,
 				ExtraArgs:     inst.ExtraArgs,
+				Color:         inst.Color,
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
@@ -1765,6 +1786,14 @@ func handleRemove(profile string, args []string) {
 			fmt.Println("Session removed from Agent Deck but may still be running in tmux")
 		}
 	}
+
+	// v1.7.21+: if this session was spawned via LaunchAs=service, the
+	// transient systemd-user service unit survives a plain `tmux
+	// kill-server` (Restart=on-failure would respawn it). Best-effort
+	// stop + reset-failed the unit here so `agent-deck remove` is truly
+	// terminal. No-op on non-service-mode sessions and on non-systemd
+	// hosts.
+	_ = inst.StopServiceUnit()
 
 	// Clean up worktree directory if this is a worktree session
 	if inst.IsWorktree() {
@@ -2553,7 +2582,7 @@ func printHelp() {
 	fmt.Println("  status           Show session status summary")
 	fmt.Println("  session          Manage session lifecycle")
 	fmt.Println("  mcp              Manage MCP servers")
-	fmt.Println("  skill            Manage Claude skills")
+	fmt.Println("  skill            Manage project skills")
 	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
 	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
 	fmt.Println("  group            Manage groups")
@@ -2645,7 +2674,7 @@ func printHelp() {
 	fmt.Println("  g          New group")
 	fmt.Println("  Enter      Attach to session")
 	fmt.Println("  m          MCP Manager")
-	fmt.Println("  s          Skills Manager (Claude)")
+	fmt.Println("  s          Skills Manager")
 	fmt.Println("  M          Move session to group")
 	fmt.Println("  r          Rename session/group")
 	fmt.Println("  R          Restart session")
@@ -2692,11 +2721,23 @@ func detectTool(cmd string) string {
 		return "gemini"
 	case strings.Contains(cmd, "codex"):
 		return "codex"
+	case hasCommandToken(cmd, "pi"):
+		return "pi"
+	case strings.Contains(cmd, "copilot"):
+		return "copilot"
 	case strings.Contains(cmd, "cursor"):
 		return "cursor"
 	default:
 		return "shell"
 	}
+}
+
+// hasCommandToken reports whether `want` appears as a whitespace-delimited
+// token in `cmd` (case-insensitive). Used for short, ambiguous tool names
+// like "pi" where strings.Contains would falsely match "epic", "tapioca",
+// etc. Longer names like "copilot" or "claude" don't need this.
+func hasCommandToken(cmd, want string) bool {
+	return slices.Contains(strings.Fields(strings.ToLower(cmd)), want)
 }
 
 // handleUninstall removes agent-deck from the system
