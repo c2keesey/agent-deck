@@ -522,6 +522,31 @@ weekly_limit = 200.00
 "custom-model" = { input_per_mtok = 1.0, output_per_mtok = 5.0 }
 ```
 
+#### Customizing the status-line cost segment
+
+The home status bar shows a brief cost line drawn from the seven windows below. The default renders `$X.XX today`; configure `cost_line_template` to surface different windows or a per-profile layout. Variables substitute as `$X.XX`; unknown placeholders pass through literally so typos surface in the output.
+
+| Variable | Window |
+|---|---|
+| `{cost_today}` | Today (00:00 local) |
+| `{cost_yesterday}` | Prior day |
+| `{cost_this_week}` | Monday-start of this week |
+| `{cost_last_week}` | Prior Monday to Sunday |
+| `{cost_this_month}` | First of this month |
+| `{cost_last_month}` | Prior calendar month |
+| `{cost_projected}` | Rolling 7-day average times 30 |
+
+```toml
+[costs]
+cost_line_template = "{cost_today} today | {cost_this_week} wk"
+cost_line_hide_when_zero = true   # default; hide when every recognized var is $0.00
+
+[profiles.work.costs]
+cost_line_template = "{cost_yesterday} yda | {cost_today} today | {cost_projected}/mo"
+```
+
+Resolution chain: `profiles.<active>.costs.cost_line_template > [costs].cost_line_template > hardcoded "{cost_today} today"`. Setting the template to an empty string explicitly disables the segment.
+
 ### Socket Isolation (v1.7.50+)
 
 Run agent-deck on its own tmux server so it never touches your interactive tmux's config, bindings, or sessions. Opt-in via a single config line:
@@ -612,6 +637,17 @@ agent-deck remote update dev      # specific remote
 ```
 
 Remote configuration is stored under `[remotes]` in `~/.agent-deck/config.toml`. All `remote` subcommands support `--json` output for scripting. Run `agent-deck remote --help` for the full flag reference.
+
+### Reaching services running inside remote sessions
+
+If you run a dev server, REPL, or web UI inside a remote session and want to reach it from your local browser, use **[Tailscale](https://tailscale.com)** rather than ad-hoc SSH port forwarding. Tailscale gives every machine on your tailnet a direct IP, so a service on `localhost:3000` of your remote box is reachable at `http://<remote-tailnet-ip>:3000` from your laptop with no `-L`/`-R` setup, no port collisions when multiple sessions share a remote, and no ControlMaster edge cases.
+
+Setup once:
+1. Install Tailscale on your local machine and on each remote: `curl -fsSL https://tailscale.com/install.sh | sh`
+2. `sudo tailscale up` on both ends, sign in with the same account
+3. Use the remote's tailnet IP (or MagicDNS name) in your browser
+
+This is why agent-deck does not ship native SSH `-L`/`-R` forwarding: Tailscale solves the same problem more robustly with no per-session configuration.
 
 ## Installation
 

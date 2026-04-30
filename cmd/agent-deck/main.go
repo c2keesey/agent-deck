@@ -36,7 +36,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.7.74" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.7.75" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -694,7 +694,7 @@ func main() {
 		liveMenuData := web.NewMemoryMenuData(fallbackMenuData)
 		homeModel.SetWebMenuData(liveMenuData)
 
-		server, err := buildWebServer(effectiveProfile, webArgs, liveMenuData)
+		server, err := buildWebServer(effectiveProfile, webArgs, liveMenuData, ui.NewWebMutator(homeModel))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: web server setup failed: %v\n", err)
 			os.Exit(1)
@@ -1222,18 +1222,10 @@ func handleAdd(profile string, args []string) {
 	}
 
 	if explicitPathProvided {
-		if rawPathArg == "." {
-			path, err = os.Getwd()
-			if err != nil {
-				fmt.Printf("Error: failed to get current directory: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			path, err = filepath.Abs(rawPathArg)
-			if err != nil {
-				fmt.Printf("Error: failed to resolve path: %v\n", err)
-				os.Exit(1)
-			}
+		path, err = resolveAddPath(rawPathArg)
+		if err != nil {
+			fmt.Printf("Error: failed to resolve path: %v\n", err)
+			os.Exit(1)
 		}
 	} else {
 		// No explicit path provided: use group default path first, then cwd fallback.
