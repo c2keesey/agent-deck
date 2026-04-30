@@ -36,7 +36,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.7.72" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.7.73" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -322,6 +322,9 @@ func main() {
 			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
+			return
+		case "inbox":
+			handleInbox(args[1:])
 			return
 		case "feedback":
 			handleFeedback(args[1:])
