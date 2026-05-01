@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Session reorder (`K` / `J`, `Shift+Up` / `Shift+Down`) required multiple key presses to produce a visible move when sub-sessions of different parents were interleaved in a group.** `MoveSessionUp` / `MoveSessionDown` swapped with the immediate slice neighbor, but the render path re-buckets sub-sessions under their parents, so a swap with a non-sibling produced zero visible change. Fixed by walking the slice for the previous/next session with the same `ParentSessionID` (top-level peers treat each other as siblings, sub-sessions reorder among same-parent siblings only). One key press now always produces a visible move when one is possible. Tests in `internal/session/groups_test.go` cover the interleaving case, the first-sibling no-op, and the top-level-skips-subs case.
+- **Help overlay (`?`) had broken column alignment when descriptions were longer than the description column.** `dialogWidth` defaulted to 48, leaving ~26-32 chars for descriptions; anything longer wrapped at column 0 and shredded the two-column layout (key | description). Fixed by raising `dialogWidth` to 70 by default (scaling to 80 on terminals ≥ 100 cols, shrinking only on narrow terminals) and adding a `wrapWithHangingIndent` helper so any description that still doesn't fit wraps with continuation lines aligned under the description column. The four worst offenders ("Next / prev session in current group", "Jump to Nth session in current group", "First / last session in current group", "Filter search scoped to current group") were also shortened (`current group` → `group`), as were "Edit session settings (title/color/notes/command/...)" and "Quick approve (send '1' to Claude session)". Test coverage for `wrapWithHangingIndent` in `internal/ui/help_test.go`.
+
+## [1.7.78] - 2026-05-01
+
+P0 hotfix for a data-loss bug in submodule worktree handling.
+
+### Fixed
+
+- **🚨 DATA LOSS: deleting a session whose worktree resolved to a submodule's gitdir destroyed the submodule's git data** ([PR #844](https://github.com/asheshgoplani/agent-deck/pull/844), thanks @plutohan for the catch and the fix). `git worktree list --porcelain` from inside a plain submodule reports the **gitdir** (`<super>/.git/modules/<name>`) as the worktree path for the main checkout, not the actual `<super>/<name>` working tree. Three flows (`agent-deck add -w`, `agent-deck launch -w`, TUI new-session with worktree enabled) consumed that path as `Instance.ProjectPath` and the tmux `-c` cwd. Sessions then dropped users inside the gitdir where source files don't exist, and worse — deleting the session via `session remove --force` invoked `RemoveWorktree(force=true)`, whose force-fallback called `os.RemoveAll(worktreePath)`, destroying the submodule's git history. Reproduced in the reporter's environment. Two-layer fix: (1) **prevention** — `parseWorktreeList` normalizes each non-bare entry through `git rev-parse --show-toplevel`, returning the actual working tree even when invoked from inside a gitdir; all three call sites and any future caller of `ListWorktrees` / `GetWorktreeForBranch` get the correct path; (2) **defense-in-depth** — `RemoveWorktree` refuses the `os.RemoveAll` fallback when the target path is structurally a git directory (`.git` basename, `.git/modules/<sub>`, `.git/worktrees/<wt>`, or bare repo via `IsBareRepo`). This catches stale session rows persisted before the prevention fix — they now error on delete instead of nuking git internals. 4 new tests cover the data-loss regression gate, the prevention invariant, and the defense-in-depth coverage of all gitdir-shaped paths. Out-of-scope follow-up flagged by reporter: TUI fork-with-reused-worktree path at `internal/ui/home.go:8441` updates `WorktreePath` but not `WorkDir`, leaving fork sessions with the originally-generated path as cwd — unrelated to submodules, separate concern.
+
+**If you create sessions in submodules, upgrade to v1.7.78 immediately** — the prevention fix stops new sessions from getting the broken path; the defense-in-depth catches existing stale session rows on delete.
+
+## [1.7.77] - 2026-05-01
+
+Hotfix re-cut of v1.7.76. The v1.7.76 tag exists on the repo but no binaries were ever published — release CI failed on a chunked-read edge case in the SS3 reader added in #840 (rebased from #815). v1.7.77 contains all of v1.7.76 plus the chunked-read fix.
+
+### Fixed
+
+- **`csiuReader` flushed lone ESC at chunk boundary, breaking SS3 detection across split reads** ([PR #842](https://github.com/asheshgoplani/agent-deck/pull/842)). When `\x1b` arrived in one Read() chunk and `OH` in the next, the translator emitted ESC immediately and treated `OH` as plain bytes, skipping the SS3 → CSI Home rewrite. Fix mirrors the existing ESC-O-at-buffer-end pattern: when not final, buffer the lone ESC and wait for the next chunk; on final flush emit ESC as-is to preserve standalone-escape semantics. `TestCSIuReader_SS3HomeEnd_ChunkedRead/SS3_Home_split_between_ESC_and_OH` (added in #840) now passes — locked the regression that blocked v1.7.76's release CI.
+
+(All v1.7.76 entries below carry forward unchanged — see "1.7.76" section for the polish + community-bug bundle that this release re-cuts.)
+
+## [1.7.76] - 2026-05-01
+
+Polish + community-bug bundle the day after v1.7.75. Three contributor fixes (Hristo, AdamiecRadek diagnosis, strofimovsky), three WebUI bug fixes from JMBattista combined into one PR, and a v1.7.74 follow-up I caught during production verification. All of #783/#784 + the busy-retry follow-up went through Claude+Codex dual-review (with codex trust pre-registration so peer review actually worked this time). Dual-review pipeline notes: codex-as-sibling topology works; codex-as-child-of-claude-worker hits sub-of-sub spawn limits.
+
+### Fixed
+
+- **Delete confirmation dialog focus trap broken; Enter re-fired the action** (thanks @JMBattista for [issue #784](https://github.com/asheshgoplani/agent-deck/issues/784)). The HTML `autofocus` attribute on the Cancel button was unreliable in Preact when the dialog re-rendered into an existing tree, so focus stayed on the row's Delete button — pressing Enter to "confirm cancel" instead re-triggered Delete (or worse, double-acted). Fix replaces `autofocus` with `useRef` + `useEffect(() => ref.current.focus(), [])`, adds `role="dialog"` + `aria-modal="true"` for a11y, and wires Esc keydown on the panel (Esc dismissal in `useKeyboardNav.js` preserved).
+
+- **Hover toolbar overlapped tool/cost labels in session list** (thanks @JMBattista for [issue #783](https://github.com/asheshgoplani/agent-deck/issues/783)). The absolute-positioned action toolbar (`absolute right-2`) covered the inline tool label rendered in flow when hovering a row. Fix introduces a single `toolbarVisible` predicate and applies `invisible` (preserves layout, hides paint) to the metadata spans when toolbar is showing.
+
+- **Disconnected sessions showed raw error tokens instead of actionable UX** (thanks @JMBattista for [issue #782](https://github.com/asheshgoplani/agent-deck/issues/782)). When a session's tmux died, the WebUI rendered `[error:TMUX_SESSION_NOT_FOUND]` repeatedly with no recovery path. Fix adds a `Hint` field to `wsServerMessage` with actionable copy on the error, stops the reconnect loop on that code, and renders a single fatal banner with a "Restart session" button that calls `POST /api/sessions/:id/restart`. Codex peer review caught a missing `reconnectKey` state — added to force terminal re-init after restart. Now reachable end-to-end since web mutations were re-enabled in v1.7.75 (#785).
+
+- **Session Analytics context bar showed wrong percentage for `claude-opus-4-7`** (thanks @AdamiecRadek for diagnosing [issue #836](https://github.com/asheshgoplani/agent-deck/issues/836)). The `Context [bar] N%` gauge rendered ~5x too high for opus-4-7 because the model→context-window prefix table in `internal/session/analytics.go` was missing the 4-7 entry, falling through to the 200K default. Concrete impact: 145K used → bar read 72.6% instead of correct 14.5%. Fix adds `{"claude-opus-4-7", 1000000}` placed before the 4.x fallback (table walk is order-sensitive) and extends `TestContextWindowForModel` with two 4-7 cases. AdamiecRadek's third clean model-spec data catch in this cycle (after #813 pricing and #818 templated cost line).
+
+- **TUI `New Session` dialog had no `copilot` preset; typing `copilot` created a shell session** (thanks @Hristo Dinkov for [PR #835](https://github.com/asheshgoplani/agent-deck/pull/835)). Same class of oversight as `pi` (fixed in v1.7.32 via #674): copilot was added as a first-class tool in v1.7.26 but two TUI call sites were missed. Fix adds `copilot` to both `createSessionTool`'s switch and `buildPresetCommands`' preset list, with regression tests for both.
+
+- **`scheduleBusyRetry`'s success path didn't terminate fingerprint, causing repeated `sent` re-fires** ([#824](https://github.com/asheshgoplani/agent-deck/issues/824) follow-up). Caught during v1.7.74 production verification: a child sitting in `waiting` while parent was busy would defer-retry, eventually succeed, but the queue still re-fired the same fingerprint up to 5 times because v1.7.74's `markTerminated` only ran on exhaustion (give up), not on success. Concrete evidence: child `384aa29c` had 5× `deferred_target_busy` + 5× `sent` records all at the same timestamp. Fix adds 1-line `n.markTerminated(event)` to the success branch + new `TestQueue_SuccessfulRetryMarksTerminated` regression. Codex peer agreed SAFE_TO_MERGE under sibling-topology.
+
+### Added
+
+- **Terminal navigation keys in session list** (thanks @strofimovsky for [PR #815](https://github.com/asheshgoplani/agent-deck/pull/815) → #840). Session list now accepts `Home` / `End` (jump to first / last item) and `PgUp` / `PgDn` (half-page aliases of existing `Ctrl+U` / `Ctrl+D`). Fills a gap where no single-key jump-to-bottom existed since `G` opens global search. `Home` / `End` also scroll the help overlay. Follows the same side-effect contract as the pagination handlers (preview scroll reset, navigation-activity mark, debounced preview fetch). PR was rebased onto current main (CHANGELOG conflict against v1.7.74/75 entries) preserving original authorship.
+
+- **iTerm2 SS3 Home/End fix for direct SSH** (companion to #840). iTerm2's default macOS profile emits Home/End as SS3 application-mode sequences (`ESC OH` / `ESC OF`) on direct SSH. Bubble Tea's decoder covers xterm/vt220/urxvt variants but not SS3 — `csiuReader.translate` now rewrites `ESC OH` → `ESC [H` and `ESC OF` → `ESC [F` before bytes reach Bubble Tea. All other `ESC O*` sequences pass through unchanged. Verified unchanged for iTerm2 → SSH → Screen path.
+
+- **Tailscale recommendation for reaching services in remote sessions** ([PR #832](https://github.com/asheshgoplani/agent-deck/pull/832)). New section in README's Remote Sessions docs explaining why agent-deck does not ship native SSH `-L`/`-R` port forwarding: Tailscale solves the same problem (reach a service on the remote box from your laptop) more robustly with no per-session config and no `ControlMaster` edge cases. Closes the documentation gap left by the maintainer-decline of #800/#792.
+
 ## [1.7.75] - 2026-04-30
 
 Community quality-of-life bundle. Four contributor PRs landing the day after the v1.7.74 hotfix: regression fix for web mutations broken since v1.7.71, an SSH start-failure cleanup compensation, an `add` ergonomics fix for SSH-piped paths, and a configurable cost status-line. All four were dual-reviewed (Claude + Codex peer reviewer) before merge — first run of the dual-model review pipeline.
@@ -60,6 +111,26 @@ Resilience pass. Nine community-and-internal PRs addressing real user-impacting 
 - **Bare ESC keypress lost in tmux attach quarantine; ESC followed by arrow arrived as Alt+Up** (thanks @amkopyt for [PR #812](https://github.com/asheshgoplani/agent-deck/pull/812)). `internal/termreply/filter.go` set `pendingEsc = true` on ESC and emitted nothing, waiting for the next byte to disambiguate CSI / SS3 / OSC. Real keyboard ESC has no follow-up byte, so the press stayed buffered indefinitely and later concatenated with the next keystroke's encoding. User-visible symptoms in Claude Code: bare ESC (interrupt) didn't fire, ESC ESC (jump-to-previous-message) didn't work, arrow keys appeared to reset the input. Fix flushes the lone ESC after a short timeout so it reaches the inner agent.
 
 - **Outdated Anthropic pricing data + missing entry for `claude-opus-4-7`** (thanks @AdamiecRadek for [issue #813](https://github.com/asheshgoplani/agent-deck/issues/813) → [PR #814](https://github.com/asheshgoplani/agent-deck/pull/814)). `claude-opus-4-6` was using legacy Opus 4 / 4.1 rates (3× the actual current rate, over-attributing every Opus 4.6 token), `claude-haiku-4-5` was at 80% of the published rates, and `claude-opus-4-7` was missing entirely (1240+ cost-event rows in the wild persisted at $0). Cost dashboard accuracy was wrong in both directions. Fix corrects all three plus adds a new `agent-deck costs recompute` CLI subcommand that recalculates `cost_microdollars` for every `cost_events` row using current pricing data (idempotent; supports `--dry-run`).
+### Added
+
+- **Terminal navigation keys in session list.** Session list now accepts
+  `Home` / `End` (jump to first / last item) and `PgUp` / `PgDn` (half-page
+  aliases of existing `Ctrl+U` / `Ctrl+D`). Fills a gap where no single-key
+  jump-to-bottom existed, since `G` opens global search. `Home` / `End` also
+  scroll the help overlay. Follows the same side-effect contract as the
+  pagination handlers (preview scroll reset, navigation-activity mark,
+  debounced preview fetch).
+
+### Fixed
+
+- **Home/End keys in TUI now work for iTerm2 over direct SSH.** iTerm2's
+  default macOS profile emits Home/End as SS3 application-mode sequences
+  (`ESC OH` / `ESC OF`) on direct SSH (no intermediate tmux or screen).
+  Bubble Tea's decoder covers the xterm, vt220, and urxvt Home/End
+  variants but not SS3 — `csiuReader.translate` now rewrites `ESC OH` to
+  `ESC [H` and `ESC OF` to `ESC [F` before bytes reach Bubble Tea. All
+  other `ESC O*` sequences pass through unchanged. Verified unchanged
+  for iTerm2 → SSH → Screen (already emitted vt220 `ESC [1~` / `ESC [4~`).
 
 ## [1.7.72] - 2026-04-28
 
