@@ -23,6 +23,7 @@ const (
 	hotkeySkillsManager   = "skills_manager"
 	hotkeyTogglePreview   = "toggle_preview"
 	hotkeyMarkUnread      = "mark_unread"
+	hotkeyQuickApprove    = "quick_approve"
 	hotkeyToggleYolo      = "toggle_yolo"
 	hotkeyQuickFork       = "quick_fork"
 	hotkeyForkWithOptions = "fork_with_options"
@@ -32,6 +33,7 @@ const (
 	hotkeyEditNotes       = "edit_notes"
 	hotkeyEditPaths       = "edit_paths"
 	hotkeyWatcherPanel    = "watcher_panel"
+	hotkeyEditSession     = "edit_session"
 	hotkeyWorktreeFinish  = "worktree_finish"
 	hotkeyCreateGroup     = "create_group"
 	hotkeySearch          = "search"
@@ -59,6 +61,7 @@ var hotkeyActionOrder = []string{
 	hotkeySkillsManager,
 	hotkeyTogglePreview,
 	hotkeyMarkUnread,
+	hotkeyQuickApprove,
 	hotkeyToggleYolo,
 	hotkeyQuickFork,
 	hotkeyForkWithOptions,
@@ -67,6 +70,7 @@ var hotkeyActionOrder = []string{
 	hotkeyExecShell,
 	hotkeyEditNotes,
 	hotkeyEditPaths,
+	hotkeyEditSession,
 	hotkeyWorktreeFinish,
 	hotkeyCreateGroup,
 	hotkeySearch,
@@ -95,6 +99,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeySkillsManager:   "s",
 	hotkeyTogglePreview:   "v",
 	hotkeyMarkUnread:      "u",
+	hotkeyQuickApprove:    "a",
 	hotkeyToggleYolo:      "y",
 	hotkeyQuickFork:       "f",
 	hotkeyForkWithOptions: "z",
@@ -103,6 +108,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyExecShell:       "b",
 	hotkeyEditNotes:       "e",
 	hotkeyEditPaths:       "",
+	hotkeyEditSession:     "",
 	hotkeyWorktreeFinish:  "w",
 	hotkeyCreateGroup:     "g",
 	hotkeySearch:          "/",

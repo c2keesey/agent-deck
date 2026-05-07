@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -243,6 +244,10 @@ func TestIsClaudeCompatible_CustomToolCommands(t *testing.T) {
 			"claude_env": {
 				Command: "ANTHROPIC_BASE_URL=https://example.com claude --continue",
 			},
+			"claude_wrapper": {
+				Command:        "claude-wrapper",
+				CompatibleWith: "claude",
+			},
 			"other": {
 				Command: "codex --model gpt-5",
 			},
@@ -263,8 +268,84 @@ func TestIsClaudeCompatible_CustomToolCommands(t *testing.T) {
 	if !IsClaudeCompatible("claude_env") {
 		t.Fatal("custom tool with env-prefixed Claude command should be Claude-compatible")
 	}
+	if !IsClaudeCompatible("claude_wrapper") {
+		t.Fatal("custom tool with compatible_with=claude should be Claude-compatible")
+	}
 	if IsClaudeCompatible("other") {
 		t.Fatal("non-Claude custom tool should not be Claude-compatible")
+	}
+}
+
+func TestIsCodexCompatible_CustomToolCommands(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", agentDeckDir, err)
+	}
+
+	cfg := &UserConfig{
+		Tools: map[string]ToolDef{
+			"my_codex_wrapper": {
+				Command:        "codex-wrapper",
+				CompatibleWith: "codex",
+			},
+			"my_codex_exact": {
+				Command: "CODEX_HOME=/tmp/codex codex --model gpt-5",
+			},
+			"other": {
+				Command: "codex-wrapper",
+			},
+		},
+	}
+
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	if !IsCodexCompatible("codex") {
+		t.Fatal("built-in codex should be Codex-compatible")
+	}
+	if !IsCodexCompatible("my_codex_wrapper") {
+		t.Fatal("custom tool with compatible_with=codex should be Codex-compatible")
+	}
+	if !IsCodexCompatible("my_codex_exact") {
+		t.Fatal("custom tool with env-prefixed exact codex command should be Codex-compatible")
+	}
+	if IsCodexCompatible("other") {
+		t.Fatal("wrapper without compatible_with should not be Codex-compatible")
+	}
+}
+
+func TestCreateExampleConfigDocumentsCompatibleWith(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+
+	if err := CreateExampleConfig(); err != nil {
+		t.Fatalf("CreateExampleConfig: %v", err)
+	}
+
+	configPath := filepath.Join(tmpDir, ".agent-deck", "config.toml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", configPath, err)
+	}
+	config := string(data)
+
+	for _, want := range []string{
+		`compatible_with - Built-in compatibility to mirror ("claude" or "codex")`,
+		`compatible_with = "codex"`,
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("example config missing %q", want)
+		}
 	}
 }
 
@@ -414,6 +495,46 @@ func TestSaveUserConfig(t *testing.T) {
 	}
 	if loaded.Logs.MaxSizeMB != 20 {
 		t.Errorf("MaxSizeMB: got %d, want %d", loaded.Logs.MaxSizeMB, 20)
+	}
+}
+
+func TestClaudeExtraArgsConfigRoundTrip(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	config := &UserConfig{
+		Claude: ClaudeSettings{
+			ExtraArgs:       []string{"--agent", "reviewer", "--model", "opus"},
+			UseChrome:       true,
+			UseTeammateMode: true,
+		},
+	}
+	if err := SaveUserConfig(config); err != nil {
+		t.Fatalf("SaveUserConfig failed: %v", err)
+	}
+
+	loaded, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig failed: %v", err)
+	}
+	want := []string{"--agent", "reviewer", "--model", "opus"}
+	if len(loaded.Claude.ExtraArgs) != len(want) {
+		t.Fatalf("Claude.ExtraArgs = %v, want %v", loaded.Claude.ExtraArgs, want)
+	}
+	for i := range want {
+		if loaded.Claude.ExtraArgs[i] != want[i] {
+			t.Fatalf("Claude.ExtraArgs[%d] = %q, want %q", i, loaded.Claude.ExtraArgs[i], want[i])
+		}
+	}
+	if !loaded.Claude.UseChrome {
+		t.Fatal("Claude.UseChrome = false, want true")
+	}
+	if !loaded.Claude.UseTeammateMode {
+		t.Fatal("Claude.UseTeammateMode = false, want true")
 	}
 }
 
@@ -1260,6 +1381,160 @@ inject_status_line = true
 	}
 }
 
+func TestGetTerminalSettings_ITermBadge_Default(t *testing.T) {
+	// Default (no config) should return false — opt-in. Most users drive
+	// the iTerm2 badge from their shell prompt, so silently overwriting it
+	// every attach is too presumptuous a default.
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(""), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTerminalSettings()
+	if settings.GetITermBadge() {
+		t.Error("GetITermBadge should default to false (opt-in) when not set")
+	}
+}
+
+func TestGetTerminalSettings_ITermBadge_False(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	configContent := `
+[terminal]
+iterm_badge = false
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTerminalSettings()
+	if settings.GetITermBadge() {
+		t.Error("GetITermBadge should be false when set to false")
+	}
+}
+
+func TestGetTerminalSettings_ITermBadge_True(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	configContent := `
+[terminal]
+iterm_badge = true
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTerminalSettings()
+	if !settings.GetITermBadge() {
+		t.Error("GetITermBadge should be true when set to true")
+	}
+}
+
+func TestGetTmuxSettings_Mouse_Default(t *testing.T) {
+	// Default (no config) should return true — preserves pre-#730 behavior
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(""), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTmuxSettings()
+	if !settings.GetMouse() {
+		t.Error("GetMouse should default to true when not set")
+	}
+}
+
+func TestGetTmuxSettings_Mouse_False(t *testing.T) {
+	// Explicit false disables tmux mouse capture so VS Code Linux terminal
+	// can select text natively (issue #730).
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	configContent := `
+[tmux]
+mouse = false
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTmuxSettings()
+	if settings.GetMouse() {
+		t.Error("GetMouse should be false when set to false")
+	}
+}
+
+func TestGetTmuxSettings_Mouse_True(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+
+	configPath := filepath.Join(agentDeckDir, "config.toml")
+	configContent := `
+[tmux]
+mouse = true
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	ClearUserConfigCache()
+
+	settings := GetTmuxSettings()
+	if !settings.GetMouse() {
+		t.Error("GetMouse should be true when set to true")
+	}
+}
+
 func TestGetTmuxSettings_LaunchInUserScope_Default(t *testing.T) {
 	tempDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
@@ -1505,5 +1780,155 @@ func TestWatcherAlertsSettingsDefaults(t *testing.T) {
 	var cfg UserConfig
 	if got := cfg.Watcher.Alerts.GetDebounceMinutes(); got != 15 {
 		t.Errorf("empty config: cfg.Watcher.Alerts.GetDebounceMinutes() = %d, want 15", got)
+	}
+}
+
+// TestDetachKey_ConfigurableViaToml exercises issue #434: the PTY-attach
+// detach byte is configurable from config.toml via BOTH [hotkeys].detach
+// (the canonical source) and [tmux].detach_key (the alias requested in #434,
+// kept in lockstep so users who think of detach as a tmux concern find it).
+//
+// Precedence (documented in TmuxSettings.DetachKey): explicit [hotkeys].detach
+// always wins; [tmux].detach_key applies only when [hotkeys].detach is absent
+// (so adding the alias NEVER changes behavior for a user who already set the
+// hotkey). Empty config preserves the built-in Ctrl+Q default.
+func TestDetachKey_ConfigurableViaToml(t *testing.T) {
+	cases := []struct {
+		name       string
+		toml       string
+		wantDetach string // "" means the key must be absent from the overrides
+	}{
+		{
+			name:       "empty_config_no_override",
+			toml:       ``,
+			wantDetach: "",
+		},
+		{
+			name: "hotkeys_detach_alone",
+			toml: `[hotkeys]
+detach = "ctrl+d"
+`,
+			wantDetach: "ctrl+d",
+		},
+		{
+			name: "tmux_detach_key_alone_acts_as_alias",
+			toml: `[tmux]
+detach_key = "ctrl+d"
+`,
+			wantDetach: "ctrl+d",
+		},
+		{
+			name: "hotkeys_wins_over_tmux_when_both_set",
+			toml: `[hotkeys]
+detach = "ctrl+b"
+
+[tmux]
+detach_key = "ctrl+d"
+`,
+			wantDetach: "ctrl+b",
+		},
+		{
+			name: "tmux_detach_key_whitespace_trimmed",
+			toml: `[tmux]
+detach_key = "  ctrl+d  "
+`,
+			wantDetach: "ctrl+d",
+		},
+		{
+			name: "empty_tmux_detach_key_is_ignored",
+			toml: `[tmux]
+detach_key = ""
+`,
+			wantDetach: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			originalHome := os.Getenv("HOME")
+			os.Setenv("HOME", tempDir)
+			defer os.Setenv("HOME", originalHome)
+			ClearUserConfigCache()
+			defer ClearUserConfigCache()
+
+			agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+			if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			configPath := filepath.Join(agentDeckDir, "config.toml")
+			if err := os.WriteFile(configPath, []byte(tc.toml), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			overrides := GetHotkeyOverrides()
+			got, present := overrides["detach"]
+
+			if tc.wantDetach == "" {
+				if present && got != "" {
+					t.Fatalf("detach override: unexpected value %q present, wanted absent", got)
+				}
+				return
+			}
+			if !present {
+				t.Fatalf("detach override: missing in result, wanted %q", tc.wantDetach)
+			}
+			if got != tc.wantDetach {
+				t.Fatalf("detach override: got %q, want %q", got, tc.wantDetach)
+			}
+		})
+	}
+}
+
+func TestUserConfig_TransitionEventsDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `
+[notifications]
+enabled = true
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	// When not set, TransitionEvents should be nil (defaults to true via getter)
+	if config.Notifications.TransitionEvents != nil {
+		t.Errorf("TransitionEvents should be nil when not set, got %v", *config.Notifications.TransitionEvents)
+	}
+	if !config.Notifications.GetTransitionEventsEnabled() {
+		t.Error("GetTransitionEventsEnabled() should return true when nil")
+	}
+}
+
+func TestUserConfig_TransitionEventsExplicitFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `
+[notifications]
+enabled = true
+transition_events = false
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if config.Notifications.TransitionEvents == nil {
+		t.Fatal("TransitionEvents should not be nil when explicitly set")
+	}
+	if *config.Notifications.TransitionEvents != false {
+		t.Error("TransitionEvents should be false when explicitly set to false")
+	}
+	if config.Notifications.GetTransitionEventsEnabled() {
+		t.Error("GetTransitionEventsEnabled() should return false when explicitly false")
 	}
 }

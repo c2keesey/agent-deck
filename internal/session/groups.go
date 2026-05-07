@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -556,38 +557,63 @@ func (t *GroupTree) MoveGroupDown(path string) {
 	}
 }
 
-// MoveSessionUp moves a session up within its group
+// MoveSessionUp moves a session up among its visual siblings: top-level
+// sessions (empty ParentSessionID) reorder among other top-level sessions
+// in the same group; sub-sessions reorder among other sub-sessions of the
+// same parent. Non-siblings interleaved in the flat slice are skipped, so
+// a single call always produces a visible change when one is possible.
 func (t *GroupTree) MoveSessionUp(inst *Instance) {
 	group, exists := t.Groups[inst.GroupPath]
 	if !exists {
 		return
 	}
 
+	currentIdx, prevSiblingIdx := -1, -1
 	for i, s := range group.Sessions {
-		if s.ID == inst.ID && i > 0 {
-			group.Sessions[i], group.Sessions[i-1] = group.Sessions[i-1], group.Sessions[i]
+		if s.ID == inst.ID {
+			currentIdx = i
 			break
 		}
+		if s.ParentSessionID == inst.ParentSessionID {
+			prevSiblingIdx = i
+		}
 	}
+	if currentIdx < 0 || prevSiblingIdx < 0 {
+		return
+	}
+	group.Sessions[currentIdx], group.Sessions[prevSiblingIdx] = group.Sessions[prevSiblingIdx], group.Sessions[currentIdx]
+
 	// Normalize Order for all sessions in group
 	for i, s := range group.Sessions {
 		s.Order = i
 	}
 }
 
-// MoveSessionDown moves a session down within its group
+// MoveSessionDown moves a session down among its visual siblings.
+// See MoveSessionUp for the sibling-aware semantics; this is the symmetric
+// case that swaps with the next same-parent session in the slice.
 func (t *GroupTree) MoveSessionDown(inst *Instance) {
 	group, exists := t.Groups[inst.GroupPath]
 	if !exists {
 		return
 	}
 
+	currentIdx, nextSiblingIdx := -1, -1
 	for i, s := range group.Sessions {
-		if s.ID == inst.ID && i < len(group.Sessions)-1 {
-			group.Sessions[i], group.Sessions[i+1] = group.Sessions[i+1], group.Sessions[i]
+		if s.ID == inst.ID {
+			currentIdx = i
+			continue
+		}
+		if currentIdx >= 0 && s.ParentSessionID == inst.ParentSessionID {
+			nextSiblingIdx = i
 			break
 		}
 	}
+	if currentIdx < 0 || nextSiblingIdx < 0 {
+		return
+	}
+	group.Sessions[currentIdx], group.Sessions[nextSiblingIdx] = group.Sessions[nextSiblingIdx], group.Sessions[currentIdx]
+
 	// Normalize Order for all sessions in group
 	for i, s := range group.Sessions {
 		s.Order = i
@@ -791,6 +817,92 @@ func (t *GroupTree) RenameGroup(oldPath, newName string) {
 	t.Expanded[newPath] = group.Expanded
 
 	t.rebuildGroupList()
+}
+
+// MoveGroupTo reparents a group (and its entire subtree) under destParentPath.
+// An empty destParentPath promotes the group to root level. Returns an error
+// for: unknown source, source == DefaultGroupPath, unknown destParent,
+// destParent == source or its descendant (circular), or a collision at the
+// target path. Same-parent call is a no-op.
+//
+// This is the engine behind the #447 "group change" CLI / TUI.
+func (t *GroupTree) MoveGroupTo(sourcePath, destParentPath string) error {
+	if sourcePath == "" {
+		return fmt.Errorf("source group path is required")
+	}
+	if sourcePath == DefaultGroupPath {
+		return fmt.Errorf("the default group %q cannot be moved", DefaultGroupPath)
+	}
+
+	src, ok := t.Groups[sourcePath]
+	if !ok {
+		return fmt.Errorf("source group %q does not exist", sourcePath)
+	}
+
+	if destParentPath != "" {
+		if _, ok := t.Groups[destParentPath]; !ok {
+			return fmt.Errorf("destination parent group %q does not exist", destParentPath)
+		}
+	}
+
+	if destParentPath == sourcePath ||
+		strings.HasPrefix(destParentPath, sourcePath+"/") {
+		return fmt.Errorf("cannot move %q under itself or its descendant %q", sourcePath, destParentPath)
+	}
+
+	baseName := sourcePath
+	if idx := strings.LastIndex(sourcePath, "/"); idx >= 0 {
+		baseName = sourcePath[idx+1:]
+	}
+	currentParent := getParentPath(sourcePath)
+	if currentParent == destParentPath {
+		return nil
+	}
+
+	newPath := baseName
+	if destParentPath != "" {
+		newPath = destParentPath + "/" + baseName
+	}
+	if _, collide := t.Groups[newPath]; collide {
+		return fmt.Errorf("target path %q already exists", newPath)
+	}
+
+	subgroupsToRewrite := make(map[string]*Group)
+	for path, g := range t.Groups {
+		if strings.HasPrefix(path, sourcePath+"/") {
+			newSubPath := newPath + path[len(sourcePath):]
+			if _, collide := t.Groups[newSubPath]; collide {
+				return fmt.Errorf("target subpath %q already exists", newSubPath)
+			}
+			for _, sess := range g.Sessions {
+				sess.GroupPath = newSubPath
+			}
+			g.Path = newSubPath
+			subgroupsToRewrite[path] = g
+		}
+	}
+
+	for _, sess := range src.Sessions {
+		sess.GroupPath = newPath
+	}
+	src.Path = newPath
+
+	delete(t.Groups, sourcePath)
+	t.Groups[newPath] = src
+	expanded := t.Expanded[sourcePath]
+	delete(t.Expanded, sourcePath)
+	t.Expanded[newPath] = expanded
+
+	for oldSubPath, g := range subgroupsToRewrite {
+		delete(t.Groups, oldSubPath)
+		t.Groups[g.Path] = g
+		e := t.Expanded[oldSubPath]
+		delete(t.Expanded, oldSubPath)
+		t.Expanded[g.Path] = e
+	}
+
+	t.rebuildGroupList()
+	return nil
 }
 
 // DeleteGroup deletes a group, all its subgroups, and moves all sessions to default

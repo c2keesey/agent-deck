@@ -91,6 +91,9 @@ type UserConfig struct {
 	// Codex defines Codex CLI integration settings
 	Codex CodexSettings `toml:"codex"`
 
+	// Copilot defines GitHub Copilot CLI integration settings (Issue #556)
+	Copilot CopilotSettings `toml:"copilot"`
+
 	// Worktree defines git worktree preferences
 	Worktree WorktreeSettings `toml:"worktree"`
 
@@ -153,6 +156,36 @@ type UserConfig struct {
 
 	// Watcher defines event watcher settings
 	Watcher WatcherSettings `toml:"watcher"`
+
+	// Feedback defines in-product feedback prompt settings (v1.7.38+).
+	// Mirrors the opt-out in ~/.agent-deck/feedback-state.json so it is visible
+	// to the user and editable without running `agent-deck feedback`.
+	Feedback FeedbackSettings `toml:"feedback"`
+
+	// Terminal defines outer-terminal chrome settings — sequences agent-deck
+	// writes directly to the host terminal (iTerm2 badge, etc), distinct
+	// from anything tmux draws. Empty/absent uses defaults; see TerminalSettings.
+	Terminal TerminalSettings `toml:"terminal"`
+
+	// Web defines `agent-deck web` HTTP server settings.
+	Web WebSettings `toml:"web"`
+}
+
+// WebSettings configures the `agent-deck web` HTTP server.
+type WebSettings struct {
+	// MutationsEnabled controls whether POST/PATCH/DELETE endpoints accept
+	// requests. nil (omitted) defaults to true. Forced off by --read-only.
+	MutationsEnabled *bool `toml:"mutations_enabled"`
+}
+
+// FeedbackSettings controls the in-product feedback prompts.
+// When Disabled is true, neither the auto-prompt (TUI) nor the post-launch
+// auto-trigger (CLI, if any) will fire. Explicit `agent-deck feedback`
+// invocations still run but show a re-enable prompt first. v1.7.38+.
+type FeedbackSettings struct {
+	// Disabled suppresses all passive feedback prompts when true.
+	// Defaults to false. Set by RecordOptOut paths; cleared on re-enable.
+	Disabled bool `toml:"disabled"`
 }
 
 // OpenClawSettings configures the OpenClaw gateway connection.
@@ -204,6 +237,10 @@ func (rc RemoteConfig) GetProfile() string {
 type ProfileSettings struct {
 	// Claude defines Claude Code overrides for a specific profile.
 	Claude ProfileClaudeSettings `toml:"claude"`
+	// Costs defines profile-specific cost-tracking overrides.
+	// Nil pointer means "no [profiles.<name>.costs] block in TOML"; the
+	// resolver falls through to global [costs] settings.
+	Costs *ProfileCosts `toml:"costs"`
 }
 
 // ProfileClaudeSettings defines profile-specific Claude overrides.
@@ -435,6 +472,21 @@ type NotificationsConfig struct {
 	// Minimal shows a compact icon+count summary instead of session names: ● 2 │ ◐ 3 │ ○ 1
 	// When true, key bindings (Ctrl+b 1-6) are disabled. ShowAll is ignored. (default: false)
 	Minimal bool `toml:"minimal"`
+
+	// TransitionEvents controls whether the transition daemon sends tmux messages
+	// to parent sessions when a child transitions (e.g., running → waiting).
+	// Default: true (nil = true). Set to false to suppress dispatch globally.
+	// Per-session override: Instance.NoTransitionNotify
+	TransitionEvents *bool `toml:"transition_events"`
+}
+
+// GetTransitionEventsEnabled returns whether transition event dispatch is enabled.
+// Defaults to true when unset (nil).
+func (n NotificationsConfig) GetTransitionEventsEnabled() bool {
+	if n.TransitionEvents == nil {
+		return true
+	}
+	return *n.TransitionEvents
 }
 
 // InstanceSettings configures multiple agent-deck instance behavior
@@ -624,6 +676,17 @@ type ClaudeSettings struct {
 	// Default: false
 	AutoMode bool `toml:"auto_mode"`
 
+	// ExtraArgs are user-supplied Claude CLI flags used as the New Session
+	// dialog default. They are persisted as discrete TOML array entries and
+	// copied to Instance.ExtraArgs when a Claude session is created.
+	ExtraArgs []string `toml:"extra_args"`
+
+	// UseChrome enables --chrome by default for Claude sessions.
+	UseChrome bool `toml:"use_chrome"`
+
+	// UseTeammateMode enables --teammate-mode tmux by default for Claude sessions.
+	UseTeammateMode bool `toml:"use_teammate_mode"`
+
 	// EnvFile is a .env file specific to Claude sessions
 	// Sourced AFTER global [shell].env_files
 	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
@@ -764,6 +827,15 @@ type CodexSettings struct {
 	UseHappy bool `toml:"use_happy"`
 }
 
+// CopilotSettings defines GitHub Copilot CLI configuration (Issue #556).
+// Binary: `copilot` from @github/copilot (GA 2026-02-25).
+// Doc: https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli
+type CopilotSettings struct {
+	// EnvFile is a .env file specific to Copilot sessions (sourced before
+	// the `copilot` command runs, like [gemini].env_file). Optional.
+	EnvFile string `toml:"env_file"`
+}
+
 // WorktreeSettings contains git worktree preferences.
 type WorktreeSettings struct {
 	// AutoCleanup: remove worktree when session is deleted
@@ -792,6 +864,47 @@ type WorktreeSettings struct {
 	// Set to "" to disable auto-prefixing (just the session name).
 	// Default: "feature/" when not set.
 	BranchPrefix *string `toml:"branch_prefix"`
+
+	// SetupTimeoutSeconds caps how long .agent-deck/worktree-setup.sh may run.
+	// Pointer (not plain int) so the loader can distinguish three cases:
+	//   nil         → field unset → 60s default (backward compat, GH #724)
+	//   *0          → explicit unlimited (no deadline) — #727 follow-up
+	//   *N (N > 0)  → N seconds
+	//   *N (N < 0)  → treated as unset (60s default)
+	// The `*0 = unlimited` convention matches standard CLI tooling (curl,
+	// systemd, docker). Reporter @Clindbergh flagged the v1.7.65 behaviour
+	// (`0 = default`) as counter-convention in the PR review for #727.
+	SetupTimeoutSeconds *int `toml:"setup_timeout_seconds"`
+}
+
+// DefaultWorktreeSetupTimeout is the fallback used when no explicit value is
+// configured. Kept small and visible so the git package can share it.
+const DefaultWorktreeSetupTimeout = 60 * time.Second
+
+// UnlimitedWorktreeSetupTimeout is the sentinel returned by SetupTimeout()
+// when the user has configured `setup_timeout_seconds = 0`. The git layer
+// interprets this as "no deadline" (context.Background() instead of
+// context.WithTimeout). Value chosen as 0 so the config value flows straight
+// through to the git layer unchanged.
+const UnlimitedWorktreeSetupTimeout time.Duration = 0
+
+// SetupTimeout returns the configured worktree-setup-script timeout.
+// Semantics (post-#727 follow-up):
+//   - field unset (nil) or negative → DefaultWorktreeSetupTimeout (60s)
+//   - explicit 0                    → UnlimitedWorktreeSetupTimeout (no deadline)
+//   - positive N                    → N seconds
+func (w WorktreeSettings) SetupTimeout() time.Duration {
+	if w.SetupTimeoutSeconds == nil {
+		return DefaultWorktreeSetupTimeout
+	}
+	v := *w.SetupTimeoutSeconds
+	if v < 0 {
+		return DefaultWorktreeSetupTimeout
+	}
+	if v == 0 {
+		return UnlimitedWorktreeSetupTimeout
+	}
+	return time.Duration(v) * time.Second
 }
 
 // Template returns the path template if set, or empty string if nil.
@@ -850,6 +963,12 @@ type GlobalSearchSettings struct {
 type ToolDef struct {
 	// Command is the shell command to run
 	Command string `toml:"command"`
+
+	// CompatibleWith opts this tool into compatibility behavior for a built-in
+	// tool even when the configured command is a wrapper script rather than the
+	// literal executable name. Supported values currently include "claude" and
+	// "codex".
+	CompatibleWith string `toml:"compatible_with"`
 
 	// Wrapper is an optional command that wraps the tool command.
 	// Use {command} placeholder to include the tool command, or omit it to replace the command.
@@ -1010,6 +1129,15 @@ type TmuxSettings struct {
 	// Default: true (nil = use default true)
 	InjectStatusLine *bool `toml:"inject_status_line"`
 
+	// Mouse controls whether agent-deck enables tmux mouse mode on new
+	// sessions. When false, tmux `mouse on` is never set, so the terminal
+	// emulator keeps raw control of mouse events — required by the VS Code
+	// Linux integrated terminal to let users click-drag to select text
+	// (issue #730). Affects both the inline set-option during session
+	// creation and the separate EnableMouseMode() path used on reconnect.
+	// Default: true (nil = use default true, preserves pre-#730 behavior)
+	Mouse *bool `toml:"mouse"`
+
 	// LaunchInUserScope starts new tmux servers via `systemd-run --user --scope`
 	// so the tmux server lives under the user's systemd manager instead of the
 	// current login session scope. This keeps tmux alive when an SSH session
@@ -1021,6 +1149,27 @@ type TmuxSettings struct {
 	// config.toml is always honored. Pointer type is required to distinguish
 	// "field absent" from "explicit false".
 	LaunchInUserScope *bool `toml:"launch_in_user_scope"`
+
+	// LaunchAs selects the spawn form for new tmux servers (v1.7.21+).
+	// Valid values (case-insensitive, whitespace-trimmed):
+	//   "scope"   — systemd-run --user --scope (PR #467 legacy behavior)
+	//   "service" — systemd-run --user --unit <NAME>.service with
+	//               Type=forking + Restart=on-failure. Adds auto-restart
+	//               if the tmux daemon dies unexpectedly (OOM, SIGKILL,
+	//               kernel signal). Opt-in defense-in-depth.
+	//   "direct"  — plain `tmux new-session` (no systemd isolation).
+	//   "auto"    — service where systemd-user manager is available,
+	//               else direct.
+	//   ""        — unset (default): defer to LaunchInUserScope.
+	//
+	// LaunchAs, when non-empty and valid, takes precedence over
+	// LaunchInUserScope. Unknown values are ignored (fall through to
+	// LaunchInUserScope) so a config typo doesn't silently opt the user
+	// onto an unintended spawn path.
+	//
+	// This is additive — v1.7.20 users get zero behavior change until
+	// they explicitly set launch_as.
+	LaunchAs *string `toml:"launch_as"`
 
 	// WindowStyleOverride sets the tmux window-style (and window-active-style) for
 	// all sessions, overriding the theme default. Use "default" to let your terminal
@@ -1036,9 +1185,45 @@ type TmuxSettings struct {
 	// the new session starts with a clean buffer.
 	ClearOnRestart bool `toml:"clear_on_restart"`
 
+	// DetachKey overrides the PTY-attach detach key (issue #434). Accepts
+	// the same lowercase "ctrl+<letter>" form as `[hotkeys].detach` (e.g.
+	// "ctrl+d"). When set to a non-empty string, it becomes an alias for
+	// `[hotkeys].detach`. Precedence: explicit `[hotkeys].detach` always
+	// wins; `[tmux].detach_key` is used only when `[hotkeys].detach` is
+	// absent. Empty string (default) preserves the built-in Ctrl+Q.
+	//
+	// Why the alias exists: #434 reporters asked for a `[tmux]` section
+	// entry because they think of the detach as a tmux-attach concern.
+	// Keeping `[hotkeys].detach` authoritative avoids two sources of truth.
+	DetachKey string `toml:"detach_key"`
+
 	// Options is a map of tmux option names to values.
 	// These are passed to `tmux set-option -t <session>` after defaults.
 	Options map[string]string `toml:"options"`
+
+	// SocketName is the tmux `-L <name>` socket selector for every
+	// agent-deck tmux spawn (v1.7.50+, issue #687). Empty string — the
+	// default — keeps pre-v1.7.50 behavior byte-for-byte: agent-deck shares
+	// the user's default tmux server at $TMUX_TMPDIR/tmux-<uid>/default.
+	//
+	// Set this to isolate agent-deck onto its own tmux server so:
+	//   - `[tmux].inject_status_line`, bind-key, and global set-option
+	//     mutations stay on the agent-deck server and never touch the
+	//     user's interactive tmux config (the original #276 complaint);
+	//   - a `tmux kill-server` in the user's shell can't take agent-deck's
+	//     managed sessions down with it;
+	//   - `tmux -L <name> ls` from the shell shows exactly agent-deck's
+	//     sessions — no mixing with the user's own work sessions.
+	//
+	// Each Instance captures this value at creation time into
+	// Instance.TmuxSocketName; changing socket_name later does NOT migrate
+	// existing sessions (they remain reachable on their original socket
+	// until explicitly re-created). See docs/SOCKET_ISOLATION.md for the
+	// migration procedure.
+	//
+	// Precedence at Instance creation: CLI flag `--tmux-socket <name>`
+	// wins, else this config value, else empty.
+	SocketName string `toml:"socket_name"`
 }
 
 // GetInjectStatusLine returns whether to inject status line, defaulting to true.
@@ -1047,6 +1232,24 @@ func (t TmuxSettings) GetInjectStatusLine() bool {
 		return true
 	}
 	return *t.InjectStatusLine
+}
+
+// GetSocketName returns the trimmed `[tmux].socket_name` value, or "" when
+// unset, whitespace-only, or absent. Centralising the trim here means
+// every caller — tmux.SetDefaultSocketName at startup, CLI flag merging,
+// Instance creation — sees the same sanitised value.
+func (t TmuxSettings) GetSocketName() string {
+	return strings.TrimSpace(t.SocketName)
+}
+
+// GetMouse returns whether tmux mouse mode should be enabled, defaulting to
+// true. Issue #730: users on VS Code's Linux integrated terminal need mouse
+// OFF so the terminal can handle click-drag selection natively.
+func (t TmuxSettings) GetMouse() bool {
+	if t.Mouse == nil {
+		return true
+	}
+	return *t.Mouse
 }
 
 // GetLaunchInUserScope returns whether new tmux servers should be launched
@@ -1059,6 +1262,23 @@ func (t TmuxSettings) GetLaunchInUserScope() bool {
 		return *t.LaunchInUserScope
 	}
 	return isSystemdUserScopeAvailable()
+}
+
+// GetLaunchAs returns the canonicalised launch mode string parsed from
+// config.toml's [tmux].launch_as key. Returns "" if the field is unset
+// or contains an unknown value (in which case downstream callers fall
+// back to LaunchInUserScope). v1.7.21+.
+func (t TmuxSettings) GetLaunchAs() string {
+	if t.LaunchAs == nil {
+		return ""
+	}
+	v := strings.ToLower(strings.TrimSpace(*t.LaunchAs))
+	switch v {
+	case "scope", "service", "direct", "auto":
+		return v
+	default:
+		return ""
+	}
 }
 
 // systemdUserScopeAvailable caches the result of probing whether
@@ -1279,6 +1499,24 @@ var defaultUserConfig = UserConfig{
 	MCPs:  make(map[string]MCPDef),
 }
 
+// cloneDefaultUserConfig returns a fresh shallow copy of defaultUserConfig with
+// independent Tools/MCPs maps, so callers mutating the returned value cannot
+// leak into later LoadUserConfig() calls. Introduced with v1.7.38's feedback
+// opt-out work after a cross-test mutation leak (cfg.Feedback.Disabled=true)
+// corrupted the shared global between parallel test cases.
+func cloneDefaultUserConfig() UserConfig {
+	c := defaultUserConfig
+	c.Tools = make(map[string]ToolDef, len(defaultUserConfig.Tools))
+	for k, v := range defaultUserConfig.Tools {
+		c.Tools[k] = v
+	}
+	c.MCPs = make(map[string]MCPDef, len(defaultUserConfig.MCPs))
+	for k, v := range defaultUserConfig.MCPs {
+		c.MCPs[k] = v
+	}
+	return c
+}
+
 // Cache for user config. Invalidated when config.toml's mtime advances past
 // the snapshot taken at cache time, so long-running processes (TUI, web,
 // notify-daemon) pick up external edits without requiring a full restart.
@@ -1333,13 +1571,15 @@ func LoadUserConfig() (*UserConfig, error) {
 	}
 
 	if pathErr != nil {
-		userConfigCache = &defaultUserConfig
+		fresh := cloneDefaultUserConfig()
+		userConfigCache = &fresh
 		userConfigCacheMtime = time.Time{}
 		return userConfigCache, nil
 	}
 
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		userConfigCache = &defaultUserConfig
+		fresh := cloneDefaultUserConfig()
+		userConfigCache = &fresh
 		userConfigCacheMtime = time.Time{}
 		return userConfigCache, nil
 	}
@@ -1348,7 +1588,8 @@ func LoadUserConfig() (*UserConfig, error) {
 	if _, err := toml.DecodeFile(configPath, &config); err != nil {
 		// Cache default to prevent hot-looping on a broken file, but still
 		// return the error so the caller can surface it.
-		userConfigCache = &defaultUserConfig
+		fresh := cloneDefaultUserConfig()
+		userConfigCache = &fresh
 		userConfigCacheMtime = currentMtime
 		return userConfigCache, fmt.Errorf("config.toml parse error: %w", err)
 	}
@@ -1468,12 +1709,34 @@ func IsClaudeCompatible(toolName string) bool {
 		return true
 	}
 	if def := GetToolDef(toolName); def != nil {
-		return isClaudeCommand(def.Command)
+		return strings.EqualFold(strings.TrimSpace(def.CompatibleWith), "claude") || isClaudeCommand(def.Command)
+	}
+	return false
+}
+
+// IsCodexCompatible returns true if the tool is "codex" or a custom tool
+// whose underlying command is "codex". Use this for capability gates
+// where custom tools wrapping Codex should get full Codex functionality
+// without losing their configured tool identity.
+func IsCodexCompatible(toolName string) bool {
+	if toolName == "codex" {
+		return true
+	}
+	if def := GetToolDef(toolName); def != nil {
+		return strings.EqualFold(strings.TrimSpace(def.CompatibleWith), "codex") || isCodexCommand(def.Command)
 	}
 	return false
 }
 
 func isClaudeCommand(command string) bool {
+	return isCommand(command, "claude")
+}
+
+func isCodexCommand(command string) bool {
+	return isCommand(command, "codex")
+}
+
+func isCommand(command, wantBase string) bool {
 	fields := strings.Fields(strings.TrimSpace(command))
 	if len(fields) == 0 {
 		return false
@@ -1494,7 +1757,7 @@ func isClaudeCommand(command string) bool {
 	base := filepath.Base(cmdToken)
 	base = strings.TrimSuffix(base, ".exe")
 	base = strings.TrimSuffix(base, ".EXE")
-	return strings.EqualFold(base, "claude")
+	return strings.EqualFold(base, wantBase)
 }
 
 func isShellEnvAssignment(token string) bool {
@@ -1544,14 +1807,9 @@ func GetCustomToolNames() []string {
 		return nil
 	}
 
-	builtins := map[string]bool{
-		"claude": true, "gemini": true, "opencode": true,
-		"codex": true, "pi": true, "shell": true, "cursor": true, "aider": true,
-	}
-
 	var names []string
 	for name := range config.Tools {
-		if !builtins[name] {
+		if !isBuiltinToolName(name) {
 			names = append(names, name)
 		}
 	}
@@ -1560,6 +1818,15 @@ func GetCustomToolNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func isBuiltinToolName(toolName string) bool {
+	switch toolName {
+	case "claude", "gemini", "opencode", "codex", "copilot", "pi", "shell", "cursor", "aider":
+		return true
+	default:
+		return false
+	}
 }
 
 // GetToolIcon returns the icon for a tool (custom or built-in)
@@ -1579,6 +1846,8 @@ func GetToolIcon(toolName string) string {
 		return "🌐"
 	case "codex":
 		return "💻"
+	case "copilot":
+		return "🐙"
 	case "pi":
 		return "π"
 	case "cursor":
@@ -1650,19 +1919,54 @@ func GetDefaultTool() string {
 	return config.DefaultTool
 }
 
+// GetWebMutationsEnabled returns whether `agent-deck web` should accept
+// mutating HTTP requests (POST/PATCH/DELETE). Defaults to true when the
+// `[web].mutations_enabled` key is omitted from config.toml.
+func GetWebMutationsEnabled() bool {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil || config.Web.MutationsEnabled == nil {
+		return true
+	}
+	return *config.Web.MutationsEnabled
+}
+
 // GetHotkeyOverrides returns user-configured hotkey overrides from config.toml.
-// Returns nil when unset.
+//
+// Merge order (issue #434):
+//  1. Start from the `[hotkeys]` table.
+//  2. If `[tmux].detach_key` is set AND the caller has not already set
+//     `[hotkeys].detach`, layer tmux.detach_key into the hotkeys map as the
+//     "detach" action. Explicit `[hotkeys].detach` always wins so there is
+//     exactly one authoritative source of truth when both are present.
+//
+// Returns nil only when nothing is configured in either table.
 func GetHotkeyOverrides() map[string]string {
 	config, err := LoadUserConfig()
-	if err != nil || config == nil || len(config.Hotkeys) == 0 {
+	if err != nil || config == nil {
 		return nil
 	}
-	out := make(map[string]string, len(config.Hotkeys))
+
+	out := make(map[string]string, len(config.Hotkeys)+1)
 	for action, key := range config.Hotkeys {
 		out[action] = key
 	}
+
+	if tmuxKey := strings.TrimSpace(config.Tmux.DetachKey); tmuxKey != "" {
+		if _, alreadySet := out[hotkeyDetachAction]; !alreadySet {
+			out[hotkeyDetachAction] = tmuxKey
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
 	return out
 }
+
+// hotkeyDetachAction is the canonical action name used by [hotkeys].detach.
+// Duplicated from internal/ui/hotkeys.go::hotkeyDetach to avoid an import
+// cycle (session <- ui). If the UI constant ever changes, update here too.
+const hotkeyDetachAction = "detach"
 
 // GetTheme returns the current theme, defaulting to "dark"
 func GetTheme() string {
@@ -1906,6 +2210,55 @@ func GetTmuxSettings() TmuxSettings {
 	return config.Tmux
 }
 
+// TerminalSettings controls outer-terminal chrome agent-deck writes directly
+// to the host terminal (bypassing tmux). These settings affect what the
+// terminal emulator displays — currently only iTerm2's badge.
+//
+// Example config.toml:
+//
+//	[terminal]
+//	iterm_badge = true
+type TerminalSettings struct {
+	// ITermBadge controls whether agent-deck sets the iTerm2 badge to the
+	// attached session's title for the duration of the attach, and refreshes
+	// it when Claude renames the session mid-attach. No-op outside iTerm2.
+	//
+	// AGENTDECK_ITERM_BADGE env var overrides this in either direction
+	// (=1/true/yes/on force on, =0/false/no/off force off; unset defers to
+	// this config). Caveat: env reliably reaches the attach/detach path
+	// (agent-deck reads its own env directly) but the rename-while-attached
+	// path runs in a hook subprocess spawned through agent-deck → tmux →
+	// Claude → hook, and Claude may filter custom env vars. For consistent
+	// behavior on both paths, prefer this config setting — every process
+	// re-reads it from disk, so propagation is independent of the spawn
+	// chain.
+	//
+	// Default: false (opt-in). Most users have their own iTerm2 badge scheme
+	// (e.g. host/cwd via shell PROMPT_COMMAND), so silently overwriting it on
+	// every attach is too presumptuous a default. Users who want the
+	// per-session badge set this to true explicitly.
+	ITermBadge *bool `toml:"iterm_badge"`
+}
+
+// GetITermBadge returns whether the iTerm2 badge integration is enabled,
+// defaulting to false (opt-in). Mirrors the GetInjectStatusLine pattern but
+// with the inverse default — see ITermBadge field doc for rationale.
+func (t TerminalSettings) GetITermBadge() bool {
+	if t.ITermBadge == nil {
+		return false
+	}
+	return *t.ITermBadge
+}
+
+// GetTerminalSettings returns terminal-chrome settings from config.
+func GetTerminalSettings() TerminalSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return TerminalSettings{}
+	}
+	return config.Terminal
+}
+
 // GetInstanceSettings returns instance behavior settings
 func GetInstanceSettings() InstanceSettings {
 	config, err := LoadUserConfig()
@@ -1995,6 +2348,8 @@ func CreateExampleConfig() error {
 # delete = "d"
 # close_session = "D"
 # restart = "R"
+# detach = "ctrl+d"   # PTY-attach detach key, default ctrl+q (issue #434).
+                      # Alias [tmux].detach_key exists; [hotkeys].detach wins.
 
 # Attach-return project path sync (optional)
 # [instances]
@@ -2017,6 +2372,11 @@ func CreateExampleConfig() error {
 # dangerous_mode = true
 # Launch Claude via happy by default (default: false)
 # use_happy = true
+# Extra Claude CLI flags remembered from the New Session dialog
+# extra_args = ["--agent", "reviewer"]
+# Enable Chrome / teammate mode by default
+# use_chrome = false
+# use_teammate_mode = false
 
 # Gemini CLI integration
 # [gemini]
@@ -2105,6 +2465,12 @@ auto_cleanup = true
 # agent-deck stops mutating the global tmux notification bar / number key bindings
 # Default: true (agent-deck injects its own status bar with session info)
 # inject_status_line = false
+# mouse controls whether agent-deck enables tmux mouse mode.
+# Set this to false if your terminal (e.g. VS Code's Linux integrated terminal)
+# interprets mouse events at the terminal layer and you want click-drag text
+# selection to bypass tmux entirely. Issue #730.
+# Default: true (tmux mouse mode is enabled — scrolling, pane resize, selection in tmux)
+# mouse = false
 # launch_in_user_scope starts new tmux servers with systemd-run --user --scope
 # so they survive when the current login session is torn down (e.g. SSH logout).
 # Default: true on Linux+systemd hosts where 'systemd-run --user --version'
@@ -2117,6 +2483,12 @@ auto_cleanup = true
 # clear_on_restart clears the tmux scrollback buffer when a session is restarted.
 # When false (default), previous output is preserved. When true, scrollback is wiped.
 # clear_on_restart = true
+# detach_key overrides the PTY-attach detach key (default Ctrl+Q, issue #434).
+# Same format as [hotkeys].detach — lowercase "ctrl+<letter>". Useful when your
+# editor (e.g. Neovim) uses Ctrl+Q for another binding. [hotkeys].detach is the
+# canonical source; [tmux].detach_key is an alias applied only when hotkeys.detach
+# is absent. Both live options, documented so users find the one they look for.
+# detach_key = "ctrl+d"
 # Override tmux options applied to every session (applied after defaults).
 # agent-deck does NOT set history-limit by default, so your tmux.conf value is used.
 # Options matching agent-deck's managed keys (status, status-style,
@@ -2125,6 +2497,21 @@ auto_cleanup = true
 # options = { "allow-passthrough" = "all", "history-limit" = "50000" }
 # Example: keep agent-deck notifications but use a 2-line status bar
 # options = { "status" = "2" }
+
+# Outer-terminal chrome (sequences agent-deck writes to the host terminal,
+# bypassing tmux). Currently controls the iTerm2 badge; future window-title
+# integrations will live in the same section.
+# [terminal]
+# iterm_badge sets the iTerm2 badge to the attached session's title for the
+# duration of the attach (cleared on detach), and refreshes it when Claude
+# renames the session mid-attach. Opt-in because most users already drive
+# the badge from their shell prompt. No-op outside iTerm2.
+# Override at runtime: AGENTDECK_ITERM_BADGE=1 forces on, =0 forces off.
+# Caveat: the env var reliably reaches the attach/detach path but is
+# unreliable for rename-while-attached (Claude may filter env vars when
+# spawning hook subprocesses). Prefer this config setting for both paths.
+# Default: false
+# iterm_badge = true
 
 # ============================================================================
 # MCP Server Definitions
@@ -2218,6 +2605,7 @@ auto_cleanup = true
 # Each tool can have:
 #   command      - The shell command to run
 #   icon         - Emoji/symbol shown in the UI
+#   compatible_with - Built-in compatibility to mirror ("claude" or "codex")
 #   busy_patterns - Strings that indicate the tool is processing
 
 # Example: Add a custom AI tool
@@ -2239,6 +2627,12 @@ auto_cleanup = true
 # dangerous_mode = true
 # dangerous_flag = "--dangerously-skip-permissions"
 # env = { ANTHROPIC_BASE_URL = "https://api.example.com/v4", API_KEY = "your-key" }
+
+# Example: Custom Codex wrapper that should restart and detect status like Codex
+# [tools.my-codex]
+# command = "codex-wrapper"
+# compatible_with = "codex"
+# icon = "C"
 
 # ============================================================================
 # Status Detection Pattern Overrides (Advanced)
@@ -2332,11 +2726,76 @@ func GetMCPDef(name string) *MCPDef {
 
 // CostsSettings configures cost tracking, budgets, and pricing overrides.
 type CostsSettings struct {
-	Currency      string          `toml:"currency"`
-	Timezone      string          `toml:"timezone"`
-	RetentionDays int             `toml:"retention_days"`
-	Budgets       BudgetSettings  `toml:"budgets"`
-	Pricing       PricingSettings `toml:"pricing"`
+	Currency      string `toml:"currency"`
+	Timezone      string `toml:"timezone"`
+	RetentionDays int    `toml:"retention_days"`
+	// CostLineTemplate overrides the home status-bar cost segment.
+	// Three-state pointer: nil falls through to the next layer
+	// (profile -> global -> hardcoded); explicit empty string disables.
+	CostLineTemplate *string `toml:"cost_line_template"`
+	// CostLineHideWhenZero hides the segment when every recognized variable
+	// in the active template renders to $0.00. Three-state pointer; default
+	// is true (preserves the legacy "no events, no segment" behavior).
+	CostLineHideWhenZero *bool           `toml:"cost_line_hide_when_zero"`
+	Budgets              BudgetSettings  `toml:"budgets"`
+	Pricing              PricingSettings `toml:"pricing"`
+}
+
+// ProfileCosts holds per-profile overrides for cost-related settings.
+// Pointer fields use the same fall-through semantics as CostsSettings.
+type ProfileCosts struct {
+	CostLineTemplate     *string `toml:"cost_line_template"`
+	CostLineHideWhenZero *bool   `toml:"cost_line_hide_when_zero"`
+}
+
+// defaultCostLineTemplate is the hardcoded fallback that preserves the
+// pre-template status-bar segment exactly: render today's total and hide
+// when zero events have been recorded.
+const defaultCostLineTemplate = "{cost_today} today"
+
+// ResolveCostLineTemplate returns the active status-bar cost-line template
+// and hide-when-zero flag, applying the resolution chain:
+//
+//	profile.costs > [costs] > hardcoded "{cost_today} today" (template, default true for hide)
+//
+// Pointer semantics:
+//   - nil at any level falls through to the next level
+//   - explicit empty string for template disables the segment (returned as "")
+//   - explicit bool for hide_when_zero is honored at that level
+//
+// Safe to call with cfg == nil; returns the hardcoded default + true.
+func ResolveCostLineTemplate(cfg *UserConfig, profile string) (template string, hideWhenZero bool) {
+	template = defaultCostLineTemplate
+	hideWhenZero = true
+
+	if cfg == nil {
+		return
+	}
+
+	var profileCosts *ProfileCosts
+	if cfg.Profiles != nil {
+		if p, ok := cfg.Profiles[profile]; ok {
+			profileCosts = p.Costs
+		}
+	}
+
+	// Template: profile (set) > global (set) > hardcoded
+	switch {
+	case profileCosts != nil && profileCosts.CostLineTemplate != nil:
+		template = *profileCosts.CostLineTemplate
+	case cfg.Costs.CostLineTemplate != nil:
+		template = *cfg.Costs.CostLineTemplate
+	}
+
+	// Hide flag: profile (set) > global (set) > true
+	switch {
+	case profileCosts != nil && profileCosts.CostLineHideWhenZero != nil:
+		hideWhenZero = *profileCosts.CostLineHideWhenZero
+	case cfg.Costs.CostLineHideWhenZero != nil:
+		hideWhenZero = *cfg.Costs.CostLineHideWhenZero
+	}
+
+	return
 }
 
 type BudgetSettings struct {

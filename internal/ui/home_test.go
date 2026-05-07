@@ -82,6 +82,82 @@ func TestApplyCreateSessionToolOverrides_NonGeminiNoop(t *testing.T) {
 	}
 }
 
+func TestPersistClaudeDialogDefaults(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpHome := t.TempDir()
+	os.Setenv("HOME", tmpHome)
+	session.ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		session.ClearUserConfigCache()
+	}()
+
+	persistClaudeDialogDefaults(&session.ClaudeOptions{
+		SkipPermissions:      false,
+		AllowSkipPermissions: true,
+		AutoMode:             true,
+		UseChrome:            true,
+		UseTeammateMode:      true,
+	}, []string{"--agent", "reviewer", "", " --model "})
+	cfg, err := session.LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig: %v", err)
+	}
+	want := []string{"--agent", "reviewer", "--model"}
+	if len(cfg.Claude.ExtraArgs) != len(want) {
+		t.Fatalf("Claude.ExtraArgs = %v, want %v", cfg.Claude.ExtraArgs, want)
+	}
+	for i := range want {
+		if cfg.Claude.ExtraArgs[i] != want[i] {
+			t.Fatalf("Claude.ExtraArgs[%d] = %q, want %q", i, cfg.Claude.ExtraArgs[i], want[i])
+		}
+	}
+	if cfg.Claude.DangerousMode == nil || *cfg.Claude.DangerousMode {
+		t.Fatalf("Claude.DangerousMode = %v, want explicit false", cfg.Claude.DangerousMode)
+	}
+	if !cfg.Claude.AllowDangerousMode {
+		t.Fatal("Claude.AllowDangerousMode = false, want true")
+	}
+	if !cfg.Claude.AutoMode {
+		t.Fatal("Claude.AutoMode = false, want true")
+	}
+	if !cfg.Claude.UseChrome {
+		t.Fatal("Claude.UseChrome = false, want true")
+	}
+	if !cfg.Claude.UseTeammateMode {
+		t.Fatal("Claude.UseTeammateMode = false, want true")
+	}
+
+	persistClaudeDialogDefaults(&session.ClaudeOptions{}, nil)
+	cfg, err = session.LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig after clear: %v", err)
+	}
+	if cfg.Claude.ExtraArgs != nil {
+		t.Fatalf("Claude.ExtraArgs should clear to nil, got %v", cfg.Claude.ExtraArgs)
+	}
+}
+
+// Co-credit @masta-g3 (PR #674): TUI session creation must produce
+// Tool="pi" rather than Tool="shell" with Command="pi", matching the
+// tmux/userconfig wiring already present.
+func TestCreateSessionTool_Pi(t *testing.T) {
+	tool, command := createSessionTool("pi")
+	if tool != "pi" || command != "pi" {
+		t.Fatalf("createSessionTool(\"pi\") = (%q, %q), want (\"pi\", \"pi\")", tool, command)
+	}
+}
+
+// TUI session creation must produce Tool="copilot" rather than
+// Tool="shell" with Command="copilot", matching the tmux/userconfig
+// wiring already present since v1.7.26.
+func TestCreateSessionTool_Copilot(t *testing.T) {
+	tool, command := createSessionTool("copilot")
+	if tool != "copilot" || command != "copilot" {
+		t.Fatalf("createSessionTool(\"copilot\") = (%q, %q), want (\"copilot\", \"copilot\")", tool, command)
+	}
+}
+
 func TestHomeInit(t *testing.T) {
 	home := NewHome()
 	cmd := home.Init()
@@ -1261,7 +1337,12 @@ func TestRemoteRestartReturnsRemoteCommand(t *testing.T) {
 	_ = h
 }
 
-func TestRemoteSelectionNOpensNewDialog(t *testing.T) {
+// TestRemoteSelectionNOpensNewDialog was removed with the #743 fix: it
+// codified d9a5de8's broken contract (n on a remote session opens the local
+// dialog). The regression guard now lives in
+// TestRegression743_NOnRemoteSession_QuickCreatesNoDialog.
+
+func TestSelectedRemotePreviewTarget(t *testing.T) {
 	home := NewHome()
 	home.width = 100
 	home.height = 30
@@ -1270,16 +1351,18 @@ func TestRemoteSelectionNOpensNewDialog(t *testing.T) {
 	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
 	home.cursor = 0
 
-	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
-	h, ok := model.(*Home)
+	remoteName, sessionID, previewKey, ok := home.selectedRemotePreviewTarget()
 	if !ok {
-		t.Fatal("handleMainKey should return *Home")
+		t.Fatal("selectedRemotePreviewTarget should resolve remote selection")
 	}
-	if cmd != nil {
-		t.Fatal("pressing n on remote selection should not execute remote attach command")
+	if remoteName != "myserver" {
+		t.Fatalf("remoteName = %q, want %q", remoteName, "myserver")
 	}
-	if !h.newDialog.IsVisible() {
-		t.Fatal("pressing n on remote selection should open new session dialog")
+	if sessionID != "remote-123" {
+		t.Fatalf("sessionID = %q, want %q", sessionID, "remote-123")
+	}
+	if previewKey != "remote:myserver:remote-123" {
+		t.Fatalf("previewKey = %q, want %q", previewKey, "remote:myserver:remote-123")
 	}
 }
 
@@ -1307,24 +1390,136 @@ func TestRemoteSelectionQuickCreateStillRunsRemoteCommand(t *testing.T) {
 	}
 }
 
-func TestRemoteGroupSelectionNOpensNewDialog(t *testing.T) {
+func TestRenderRemotePreviewIncludesCachedResponse(t *testing.T) {
 	home := NewHome()
 	home.width = 100
 	home.height = 30
 
-	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteGroup, RemoteName: "myserver", Path: "remotes/myserver"}}
-	home.cursor = 0
+	remote := session.RemoteSessionInfo{
+		ID:     "remote-123",
+		Title:  "remote-session",
+		Status: "waiting",
+		Path:   "/srv/project",
+	}
+	item := session.Item{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}
 
-	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
-	h, ok := model.(*Home)
+	home.previewCache[remotePreviewCacheKey("myserver", "remote-123")] = "Remote answer"
+
+	rendered := home.renderRemotePreview(item, 80, 20)
+	if !strings.Contains(rendered, "Last response") {
+		t.Fatalf("rendered preview should include last response header, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "Remote answer") {
+		t.Fatalf("rendered preview should include cached remote response, got: %q", rendered)
+	}
+}
+
+// TestRemoteGroupSelectionNOpensNewDialog was removed with the #743 fix —
+// see the note on TestRemoteSelectionNOpensNewDialog above. Guard lives in
+// TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog.
+
+func TestRenderRemotePreviewShowsEmptyStateAfterFetch(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:     "remote-123",
+		Title:  "remote-session",
+		Status: "waiting",
+		Path:   "/srv/project",
+	}
+	item := session.Item{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}
+	key := remotePreviewCacheKey("myserver", "remote-123")
+
+	home.previewCache[key] = ""
+	home.previewCacheTime[key] = time.Now()
+
+	rendered := home.renderRemotePreview(item, 80, 20)
+	if !strings.Contains(rendered, "No response available yet.") {
+		t.Fatalf("rendered preview should show empty-state copy after a fetch, got: %q", rendered)
+	}
+	if strings.Contains(rendered, "Fetching remote preview...") {
+		t.Fatalf("rendered preview should not keep showing the loading state after an empty fetch, got: %q", rendered)
+	}
+}
+
+func TestRenderRemotePreviewTruncatesCachedResponseLines(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:     "remote-123",
+		Title:  "remote-session",
+		Status: "running",
+		Path:   "/srv/project",
+	}
+	item := session.Item{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}
+
+	lines := make([]string, 250)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line-%03d", i)
+	}
+	home.previewCache[remotePreviewCacheKey("myserver", "remote-123")] = strings.Join(lines, "\n")
+
+	rendered := home.renderRemotePreview(item, 80, 20)
+	if strings.Contains(rendered, "line-049") {
+		t.Fatalf("rendered preview should drop lines outside the retained tail, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "line-050") || !strings.Contains(rendered, "line-249") {
+		t.Fatalf("rendered preview should retain the last 200 lines, got: %q", rendered)
+	}
+}
+
+func TestRenderRemotePreviewTruncatesCachedResponseBytes(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{
+		ID:     "remote-123",
+		Title:  "remote-session",
+		Status: "running",
+		Path:   "/srv/project",
+	}
+	item := session.Item{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}
+
+	prefix := "TRUNCATE-ME"
+	tail := "KEEP-TAIL"
+	content := prefix + strings.Repeat("x", 20*1024) + tail
+	home.previewCache[remotePreviewCacheKey("myserver", "remote-123")] = content
+
+	rendered := home.renderRemotePreview(item, 80, 20)
+	if strings.Contains(rendered, prefix) {
+		t.Fatalf("rendered preview should drop content beyond the byte cap, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, tail) {
+		t.Fatalf("rendered preview should keep the most recent content, got: %q", rendered)
+	}
+}
+
+func TestPreviewFetchedMsgUpdatesCacheTimeOnError(t *testing.T) {
+	home := NewHome()
+	key := remotePreviewCacheKey("myserver", "remote-123")
+	home.previewFetchingID = key
+	before := time.Now()
+
+	model, _ := home.Update(previewFetchedMsg{previewKey: key, err: fmt.Errorf("fetch failed")})
+	updated := model.(*Home)
+
+	if updated.previewFetchingID != "" {
+		t.Fatal("previewFetchingID should be cleared after fetch completion")
+	}
+	cacheTime, ok := updated.previewCacheTime[key]
 	if !ok {
-		t.Fatal("handleMainKey should return *Home")
+		t.Fatal("preview cache time should be recorded even when fetch fails")
 	}
-	if cmd != nil {
-		t.Fatal("pressing n on remote group should not execute remote attach command")
+	if cacheTime.Before(before) {
+		t.Fatalf("preview cache time %v should be at or after %v", cacheTime, before)
 	}
-	if !h.newDialog.IsVisible() {
-		t.Fatal("pressing n on remote group should open new session dialog")
+	if _, ok := updated.previewCache[key]; ok {
+		t.Fatal("preview content should not be cached when fetch fails")
 	}
 }
 
@@ -1808,7 +2003,13 @@ func TestMouseYToItemIndex(t *testing.T) {
 			home := newTestHomeWithItems(100, 30, items)
 			home.viewOffset = tc.viewOffset
 			if tc.banners {
-				home.updateInfo = &update.UpdateInfo{Available: true, CurrentVersion: "1.0", LatestVersion: "2.0"}
+				// v1.7.59: the update banner now renders via ShouldNudge,
+				// which requires ReleasesBehind > NudgeThreshold. Any
+				// value >5 flips the same banner path this test measured.
+				home.updateInfo = &update.UpdateInfo{
+					Available: true, CurrentVersion: "1.0", LatestVersion: "2.0",
+					ReleasesBehind: 30,
+				}
 				home.maintenanceMsg = "test maintenance"
 			}
 
@@ -2487,4 +2688,314 @@ func TestScopedGroupPaths(t *testing.T) {
 			t.Error("scopedGroupPaths should not include 'personal' when scoped to 'work'")
 		}
 	}
+}
+
+func TestStatusUpdateMsg_PreservesSelectedSessionAcrossRebuild(t *testing.T) {
+	h := newAttachReturnTestHome()
+	s1 := session.NewInstanceWithGroup("first", "/tmp/first", "work")
+	s1.ID = "s1"
+	s2 := session.NewInstanceWithGroup("second", "/tmp/second", "work")
+	s2.ID = "s2"
+	setAttachReturnTestInstances(h, []*session.Instance{s1, s2})
+
+	h.groupTree = session.NewGroupTree([]*session.Instance{s2, s1})
+
+	model, _ := h.Update(statusUpdateMsg{})
+	home := model.(*Home)
+
+	if got := selectedSessionID(home); got != s2.ID {
+		t.Fatalf("selected session = %q, want %q", got, s2.ID)
+	}
+}
+
+func TestStatusUpdateMsg_FollowsNotificationSwitchSession(t *testing.T) {
+	h := newAttachReturnTestHome()
+	s1 := session.NewInstanceWithGroup("first", "/tmp/first", "work")
+	s1.ID = "s1"
+	s2 := session.NewInstanceWithGroup("second", "/tmp/second", "work")
+	s2.ID = "s2"
+	setAttachReturnTestInstances(h, []*session.Instance{s1, s2})
+
+	h.lastNotifSwitchID = s1.ID
+	h.groupTree = session.NewGroupTree([]*session.Instance{s2, s1})
+
+	model, _ := h.Update(statusUpdateMsg{})
+	home := model.(*Home)
+
+	if got := selectedSessionID(home); got != s1.ID {
+		t.Fatalf("selected session = %q, want switched session %q", got, s1.ID)
+	}
+	if home.lastNotifSwitchID != "" {
+		t.Fatalf("lastNotifSwitchID = %q, want cleared", home.lastNotifSwitchID)
+	}
+}
+
+func TestAttachReturnGraceSuppressesPreviewRefresh(t *testing.T) {
+	h := NewHome()
+	now := time.Now()
+	h.beginAttachReturnGrace(now)
+
+	if !h.shouldSuppressPreviewRefresh(now.Add(attachReturnPreviewGrace / 2)) {
+		t.Fatal("expected preview refresh suppression during attach-return grace period")
+	}
+	if h.shouldSuppressPreviewRefresh(now.Add(attachReturnPreviewGrace + 100*time.Millisecond)) {
+		t.Fatal("expected preview refresh suppression to expire after grace period")
+	}
+	if hotUntil := time.Unix(0, h.navigationHotUntil.Load()); !hotUntil.After(now) {
+		t.Fatal("expected navigation hot window after attach return")
+	}
+}
+
+func newAttachReturnTestHome() *Home {
+	h := NewHome()
+	h.width = 100
+	h.height = 30
+	h.initialLoading = false
+	return h
+}
+
+func setAttachReturnTestInstances(h *Home, instances []*session.Instance) {
+	h.instancesMu.Lock()
+	h.instances = instances
+	h.instanceByID = make(map[string]*session.Instance, len(instances))
+	for _, inst := range instances {
+		h.instanceByID[inst.ID] = inst
+	}
+	h.instancesMu.Unlock()
+	h.groupTree = session.NewGroupTree(instances)
+	h.rebuildFlatItems()
+	h.moveCursorToSession(instances[len(instances)-1].ID)
+}
+
+func selectedSessionID(h *Home) string {
+	if h.cursor < 0 || h.cursor >= len(h.flatItems) {
+		return ""
+	}
+	item := h.flatItems[h.cursor]
+	if item.Type == session.ItemTypeSession && item.Session != nil {
+		return item.Session.ID
+	}
+	return ""
+}
+
+// TestHandleMainKeyQuickApproveWaitingSession verifies that pressing the
+// quick-approve hotkey on a waiting session returns the home model without
+// panicking. With no attached tmux session the send is a no-op, which is the
+// behavior we want to confirm for the happy path.
+func TestHandleMainKeyQuickApproveWaitingSession(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := &session.Instance{
+		ID:     "session-waiting",
+		Title:  "Waiting Session",
+		Tool:   "claude",
+		Status: session.StatusWaiting,
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if _, ok := model.(*Home); !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+}
+
+// TestHandleMainKeyQuickApproveOnRunningSession verifies the handler also
+// works on a running session (no status guard). Bash-tool permission prompts
+// in Claude Code leave the session in StatusRunning, so this is the common
+// case in practice.
+func TestHandleMainKeyQuickApproveOnRunningSession(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := &session.Instance{
+		ID:     "session-running",
+		Title:  "Running Session",
+		Tool:   "claude",
+		Status: session.StatusRunning,
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if _, ok := model.(*Home); !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+}
+
+// TestHandleMainKeyQuickApproveOnGroupItem verifies the handler does not
+// crash when the cursor is on a non-session item such as a group.
+func TestHandleMainKeyQuickApproveOnGroupItem(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	home.flatItems = []session.Item{
+		{Type: session.ItemTypeGroup, Path: "personal", Group: &session.Group{Name: "Personal"}},
+	}
+	home.cursor = 0
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if _, ok := model.(*Home); !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+}
+
+// TestHandleMainKeyQuickApproveSkipsNonClaudeTool verifies the tool guard:
+// pressing the hotkey on a non-Claude session (e.g. a shell pane) is a
+// silent no-op so a stray press cannot dump a "1" into a vim/shell buffer.
+func TestHandleMainKeyQuickApproveSkipsNonClaudeTool(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := &session.Instance{
+		ID:     "session-shell",
+		Title:  "Shell Session",
+		Tool:   "shell",
+		Status: session.StatusRunning,
+	}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: inst}}
+	home.cursor = 0
+	home.instanceByID[inst.ID] = inst
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if _, ok := model.(*Home); !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+}
+
+// TestRegression743_NOnRemoteSession_QuickCreatesNoDialog guards #743.
+// v1.7.68 shipped d9a5de8 which removed the remote early-return from the `n`
+// key handler, so pressing `n` on a remote session opened the local
+// newDialog and created a LOCAL session instead of a remote one. Restoring
+// the pre-d9a5de8 behavior: `n` on a remote-session cursor issues the remote
+// quick-create command and does NOT open the local new-session dialog.
+func TestRegression743_NOnRemoteSession_QuickCreatesNoDialog(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if cmd == nil {
+		t.Fatal("pressing n on a remote session must issue the remote quick-create command (was local dialog)")
+	}
+	if h.newDialog.IsVisible() {
+		t.Fatal("pressing n on a remote session must NOT open the local new-session dialog")
+	}
+}
+
+// TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog — same contract for
+// cursor on a remote group header row.
+func TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteGroup, RemoteName: "myserver", Path: "remotes/myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	h, ok := model.(*Home)
+	if !ok {
+		t.Fatal("handleMainKey should return *Home")
+	}
+	if cmd == nil {
+		t.Fatal("pressing n on a remote group must issue the remote quick-create command")
+	}
+	if h.newDialog.IsVisible() {
+		t.Fatal("pressing n on a remote group must NOT open the local new-session dialog")
+	}
+}
+
+// TestHome_TerminalNavigationKeys verifies the PgUp/PgDn/Home/End bindings
+// added alongside the existing vi-style pagination (#38). PgUp/PgDn are
+// half-page aliases of Ctrl+U/Ctrl+D; Home/End jump to the first/last item
+// (End fills the gap where no single-key jump-to-bottom existed, since G
+// opens global search).
+func TestHome_TerminalNavigationKeys(t *testing.T) {
+	// Build a 100-item list so pagination + absolute jumps have room to move.
+	items := make([]session.Item, 100)
+	for i := range items {
+		items[i] = session.Item{
+			Type:    session.ItemTypeSession,
+			Session: &session.Instance{ID: fmt.Sprintf("s%d", i), Title: fmt.Sprintf("S%d", i)},
+			Level:   0,
+		}
+	}
+
+	const width, height = 100, 30
+
+	// Compute half-page from the actual getVisibleHeight so the test
+	// stays correct if the viewport formula changes.
+	h0 := newTestHomeWithItems(width, height, items)
+	halfPage := h0.getVisibleHeight() / 2
+	if halfPage < 1 {
+		halfPage = 1
+	}
+	last := len(items) - 1
+
+	tests := []struct {
+		name        string
+		key         tea.KeyMsg
+		startCursor int
+		wantCursor  int
+	}{
+		{"PgUp from middle", tea.KeyMsg{Type: tea.KeyPgUp}, 50, 50 - halfPage},
+		{"PgUp clamps at top", tea.KeyMsg{Type: tea.KeyPgUp}, 0, 0},
+		{"PgDown from middle", tea.KeyMsg{Type: tea.KeyPgDown}, 10, 10 + halfPage},
+		{"PgDown clamps at bottom", tea.KeyMsg{Type: tea.KeyPgDown}, last, last},
+		{"Home from middle", tea.KeyMsg{Type: tea.KeyHome}, 50, 0},
+		{"Home at top no-op", tea.KeyMsg{Type: tea.KeyHome}, 0, 0},
+		{"End from middle", tea.KeyMsg{Type: tea.KeyEnd}, 5, last},
+		{"End at bottom no-op", tea.KeyMsg{Type: tea.KeyEnd}, last, last},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTestHomeWithItems(width, height, items)
+			h.cursor = tc.startCursor
+			h.previewScrollOffset = 42 // non-zero to verify reset contract
+			updated, _ := h.Update(tc.key)
+			got := updated.(*Home).cursor
+			if got != tc.wantCursor {
+				t.Fatalf("cursor = %d, want %d (halfPage=%d)", got, tc.wantCursor, halfPage)
+			}
+			if updated.(*Home).previewScrollOffset != 0 {
+				t.Fatalf("previewScrollOffset = %d, want 0 (nav handlers must reset)",
+					updated.(*Home).previewScrollOffset)
+			}
+		})
+	}
+
+	t.Run("End on empty list does not crash", func(t *testing.T) {
+		h := newTestHomeWithItems(width, height, nil)
+		updated, _ := h.Update(tea.KeyMsg{Type: tea.KeyEnd})
+		got := updated.(*Home).cursor
+		if got != 0 {
+			t.Fatalf("cursor = %d, want 0 on empty list", got)
+		}
+	})
+
+	t.Run("Home on empty list does not crash", func(t *testing.T) {
+		h := newTestHomeWithItems(width, height, nil)
+		updated, _ := h.Update(tea.KeyMsg{Type: tea.KeyHome})
+		got := updated.(*Home).cursor
+		if got != 0 {
+			t.Fatalf("cursor = %d, want 0 on empty list", got)
+		}
+	})
 }
