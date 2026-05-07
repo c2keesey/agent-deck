@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-05-07
+
+Hotfix bundle on top of v1.8.2. Three contributor PRs: a TUI inline-title regression and two conductor heartbeat-rules improvements bringing the OS heartbeat path to parity with `bridge.py`.
+
+### Fixed
+
+- **Inline pane title vanished between refreshes when the tmux pane-info cache went stale** ([PR #877](https://github.com/asheshgoplani/agent-deck/pull/877), thanks @borng). `refreshSessionRenderSnapshot` reads `tmux.GetCachedPaneInfo` on every rebuild, but only `backgroundStatusUpdate` refreshes that cache. When other rebuild paths (e.g. `processStatusUpdate`) ran past the 4 s freshness threshold, `GetCachedPaneInfo` returned `ok=false` and the rebuild zeroed `paneTitle` — the inline task suffix added in #474 (Claude `/rename`, spinner state) blinked to empty between successful ticks. Fixed by falling back to the previous snapshot's `paneTitle` on cache miss; the fallback re-reads the latest snapshot inside the per-instance branch to narrow the read-store race between concurrent rebuild goroutines. Adds two regression tests: `TestRefreshSessionRenderSnapshot_PaneTitleUpdatesEachRefresh` (fresh-cache contract) and `TestRefreshSessionRenderSnapshot_PaneTitlePreservedWhenCacheStale` (the regression pin, fails on un-fixed code).
+
+- **`HEARTBEAT_RULES.md` silently ignored on hosts using the OS heartbeat daemon** ([PR #886](https://github.com/asheshgoplani/agent-deck/pull/886), thanks @nlenepveu). PR #218 externalized heartbeat policy into `HEARTBEAT_RULES.md` but only wired it into `conductor/bridge.py`. The second heartbeat path — `heartbeat.sh` generated from `conductorHeartbeatScript` and scheduled by systemd/launchd — never read the file, and bridge.py auto-disables its own loop when the OS daemon is detected. Net effect: on the default Linux/macOS path the rules existed, the docs referenced them, and the script that actually fired ignored them. Fixed by resolving `HEARTBEAT_RULES.md` with the same triple fallback (per-conductor → per-profile → global), appending the rules after a blank line when the file is non-empty, and switching the message prefix from `Heartbeat:` to `[HEARTBEAT]` to match bridge.py and the conductor template docs. `MigrateConductorHeartbeatScripts` rewrites `heartbeat.sh` automatically — no user action required.
+
+- **No way to point a conductor at a project-repo `HEARTBEAT_RULES.md` without copying** ([PR #887](https://github.com/asheshgoplani/agent-deck/pull/887), thanks @nlenepveu). `agent-deck conductor setup` already supported `--policy-md` for `POLICY.md`, but the equivalent for the heartbeat rules file was missing even though both share the same per-conductor → per-profile → global lookup order. Added `--heartbeat-rules-md`, a direct mirror of `--policy-md`: it creates a symlink at `~/.agent-deck/conductor/<name>/HEARTBEAT_RULES.md` pointing at the user-supplied path, claiming the highest-precedence slot in the lookup order. Wired through `cmd/agent-deck/conductor_cmd.go` (flag + Usage block alongside `--policy-md`) and `internal/session/conductor.go` (`SetupConductor` / `SetupConductorWithAgent` accept `customHeartbeatRulesMD`, slotted right after `customPolicyMD`, reusing `createSymlinkWithExpansion` for `~` handling).
+
+## [1.8.2] - 2026-05-07
+
+Three real-bug fixes addressing top items from the priority survey: size-guard regression, tmux SIGSEGV adoption from a contributor branch, and TUI/web profile resolution divergence.
+
+### Fixed
+
+- **Size-guard rejected new sessions created by Claude `/clear`** ([#856](https://github.com/asheshgoplani/agent-deck/issues/856), [PR #883](https://github.com/asheshgoplani/agent-deck/pull/883)). Reported by @ZDreamer2. After `/clear` Claude wrote a fresh smaller jsonl that the size-guard refused to rebind to, leaving the TUI stuck on the old session. Fixed by adding an mtime-newer escape hatch: if the candidate jsonl is older by ≥5 s and the new one isn't, rebind regardless of byte size — preserves all existing flap-protection (where files seed within microseconds) while letting legitimate user-initiated `/clear` events through.
+
+- **tmux SIGSEGV during ControlPipe shutdown on macOS Mac** ([#816](https://github.com/asheshgoplani/agent-deck/issues/816), [PR #882](https://github.com/asheshgoplani/agent-deck/pull/882), thanks @tarekrached). Cherry-picked from @tarekrached's `tarek/controlpipe-eof-clean-shutdown` branch — he ran 36/36 stress trials clean. Switches `ControlPipe.Close()` from a SIGTERM-then-grace fallback to a stdin EOF fast path with a 200 ms grace before falling back to soft-kill. Eliminates the upstream tmux #4980-class crash in real workflows.
+
+- **TUI and web showed different sessions for the same user when `AGENTDECK_PROFILE` was set in env but not in `config.json` `default_profile`** ([#881](https://github.com/asheshgoplani/agent-deck/issues/881) [PR #884](https://github.com/asheshgoplani/agent-deck/pull/884)). The TUI/CLI inherit `AGENTDECK_PROFILE` from the parent shell; the web server read only `default_profile` from config. Same DB, two views — trust-killer. Fixed by unifying resolution: web now consults `AGENTDECK_PROFILE` first (matches TUI/CLI), falling back to `config.json`. Single source of truth.
+
+## [1.8.1] - 2026-05-06
+
+Hotfix bundle on top of v1.8.0. Five focused bug fixes — three from external contributors, two from accumulated triage.
+
+### Fixed
+
+- **`agent-deck session send` could silently drop prompts to sub-sessions** ([#876](https://github.com/asheshgoplani/agent-deck/issues/876), [PR #879](https://github.com/asheshgoplani/agent-deck/pull/879)). Reported by @DOKoenegras (v1.7.71). The verification loop in `sendWithRetryTarget` tracked positive delivery signals (active-status, paste-marker, message-in-pane) but treated their absence as success. Under timing races (sub-session spawned in quick succession, inner Claude TUI's input handler not yet mounted), every signal genuinely fails to fire and the loop returns `nil` after exhausting its 15s budget. Fixed by adding opt-in `verifyDelivery` to `sendRetryOptions`; default-on for the CLI's `defaultSendOptions()` and `noWaitSendOptions()` paths. When set, the loop now returns an error referencing #876 if no positive evidence is observed. Six new regression tests in `cmd/agent-deck/session_send_test.go`; two confirmed TDD red→green.
+
+- **`bridge.py` failed to import on Python 3.8 (default WSL Ubuntu 20.04)** ([#864](https://github.com/asheshgoplani/agent-deck/issues/864), [PR #878](https://github.com/asheshgoplani/agent-deck/pull/878)). Reported by @JMBattista. Runtime use of `Coroutine` from `collections.abc` (PEP 585 subscript) failed on Python 3.8 with `TypeError: 'ABCMeta' object is not subscriptable`. Fixed by importing `Coroutine` from `typing` instead. Added `conductor/tests/test_python_compat.py` (AST scan for runtime PEP 585 subscripts) and `.github/workflows/python-compat.yml` (matrix on Python 3.8/3.9/3.10/3.11/3.12) so this can't regress.
+
+- **Homebrew install verification** ([#873](https://github.com/asheshgoplani/agent-deck/issues/873), [PR #878](https://github.com/asheshgoplani/agent-deck/pull/878)). Reported by @Wolfsrudel. Live infrastructure was already healthy on v1.8.0 (goreleaser brews block fired correctly, formula present at `asheshgoplani/homebrew-tap`); the original report predates that fix. Added `scripts/verify-homebrew-install.sh` (8 checks: tap reachable, formula present, version matches latest release, all asset URLs resolve, README install command unchanged) and `.github/workflows/homebrew-verify.yml` (runs on PRs touching install docs / goreleaser, on every release tag, weekly cron) so future drift gets caught.
+
+- **TOCTOU race in worktree setup script executable-bit dispatch** ([PR #861](https://github.com/asheshgoplani/agent-deck/pull/861), thanks @spawnia). `buildSetupCmd` re-stat'd the script after `findWorktreeSetupScript` had already statted it, opening a window where mode bits could change between calls. Fix captures `os.FileMode` once at discovery and threads it through. Internal-only signature change; public `CreateWorktreeWithSetup` API unchanged. New test `TestFindWorktreeSetupScript_PresentExecutable` validates the captured mode.
+
+- **`~` in worktree `path_template` was treated as a literal directory** ([PR #863](https://github.com/asheshgoplani/agent-deck/pull/863), thanks @spawnia). `resolveTemplate` did not expand `~` so configured paths like `~/.agent-deck/worktrees/{repo}/{branch}` resolved to nonsense like `/home/user/project/~/.agent-deck/worktrees/...`. `GenerateWorktreePath` already had the right expansion; this realigns `resolveTemplate` with it. Includes a regression test that fails with the literal-`~` path before the fix.
+
+- **`%` filter exclude-set is now configurable; active-filter hint is highlighted** ([PR #874](https://github.com/asheshgoplani/agent-deck/pull/874), thanks @borng). Resolves [#491](https://github.com/asheshgoplani/agent-deck/issues/491) / [#516](https://github.com/asheshgoplani/agent-deck/issues/516). Adds `[display].active_filter_excludes` config — default `["error", "stopped"]` preserves existing behavior; opt in to `["error"]` to keep stopped/closed sessions visible. The pill bar's dim state, `matchesStatusFilter`, and per-frame hint render all consult the same exclude set. The `$` keybinding alignment between TUI/MD docs/UI hint is a follow-up; see borng's comment on PR #874.
+
+## [1.8.0] - 2026-05-06
+
+WebUI redesign — five-zone responsive layout. Ships PR-B ([PR #860](https://github.com/asheshgoplani/agent-deck/pull/860)) on top of every accumulated v1.7.81-v1.7.83 hotfix that the redesign was originally targeted at. Users running v1.7.83 still saw the pre-redesign UI; v1.8.0 is the version where the new shell actually reaches them.
+
+### Added
+
+- **Five-zone AppShell** — top bar, left rail, main pane, right rail, mobile tab bar. Replaces the prior two-pane layout. Tablet (~820px) and phone (<720px) breakpoints documented in the playwright `chromium-tablet` / `chromium-phone` projects.
+- **RightRail panel** — pulled session-context affordances out of the main pane into a dedicated rail (toggleable on tablet, hidden on phone in favor of the bottom tab bar).
+- **MobileTabs** — bottom tab bar that surfaces the rail/main switching that desktop gets via the side rails.
+- **CommandPalette redesign** — restyled chrome consistent with the new dialog system.
+- **Restyled dialogs** — `CreateSession`, `Confirm`, `GroupName` move to the new design tokens; new dialog header/footer rhythm.
+- **Restyled panels** — `Toast`, `ToastHistoryDrawer`, `SettingsPanel`, `EmptyState`, `TerminalPanel` chrome, `CostDashboard` chrome.
+- **Design tokens** — `internal/web/static/app/design-tokens.css` extracts color / spacing / radius primitives consumed by the redesigned components. Tailwind output regenerated against the new source globs.
+- **`/api/profiles` + `/api/system/stats`** — new GET endpoints powering `ProfileDropdown` (display-only by design) and the redesigned `StubPane`.
+
+### Changed
+
+- **Pre-redesign components removed.** The legacy two-pane chrome and its assets are gone — there is no `?legacy` toggle. Anyone pinning to an older bundle should pin to the v1.7.83 release artifacts.
+- **Visual-baseline screenshots regenerated** for the new shell across desktop/tablet/phone projects.
+
+### Fixed
+
+- **Cold-load `profileSignal` no longer flashes "personal" before the API resolves** — initial render now defers the dropdown label until `/api/profiles` responds, so users on a non-personal profile don't see a one-frame flicker.
+- **`TerminalPane` stays mounted across tab switches** — orphan signal exports that survived the redesign port were removed; tab switches now preserve PTY state instead of remounting and dropping the connection.
+
+### Notes
+
+- **Profile switcher is display-only.** `ProfileDropdown` shows the active profile but does not switch profiles from the web UI. Switching is still done via the `-p` / `--profile` flag at `agent-deck` invocation time. Surfacing read-only state was a deliberate scoping choice for v1.8.0.
+- **Bundles every v1.7.81-v1.7.83 hotfix.** Multi-client tmux size mismatch ([#866](https://github.com/asheshgoplani/agent-deck/pull/866)), web `/api/sessions` waiting-status divergence ([#867](https://github.com/asheshgoplani/agent-deck/pull/867)), `TestTmuxPTYBridgeResize` CI skip ([#871](https://github.com/asheshgoplani/agent-deck/pull/871)) are all included — those releases shipped on top of the pre-redesign UI; v1.8.0 is where they meet the new shell.
+- **Stack stays Preact + htm + signals.** No framework rewrite, no new dependencies. The redesign reorganizes layout and chrome only.
+
+## [1.7.83] - 2026-05-06
+
+Unblocks the release pipeline that failed twice on `TestTmuxPTYBridgeResize`.
+
+### Fixed
+
+- **CI-only test flake blocking goreleaser** ([PR #871](https://github.com/asheshgoplani/agent-deck/pull/871)). `TestTmuxPTYBridgeResize` asserts a WebSocket resize message propagates through the bridge's attach-client PTY all the way to the tmux session geometry. On CI's headless GitHub Actions runner, the attach-client PTY never reaches the requested 120×40 size — `pty.Setsize` is called locally but tmux's view of the client size stays at 80×24. Verified-working on real PTYs (macOS/Linux desktops). The production fix shipped in #866 stays covered by `Session.Start` tests in `internal/tmux`. This is a CI-environment workaround, not a production code change. Skipped only when `CI=true` or `GITHUB_ACTIONS=true`. Surfaced when v1.7.81 and v1.7.82 release pipelines both failed on this test.
+
+Note: v1.7.81 and v1.7.82 tags exist on GitHub but no Release was ever published for either — both phantom tags. v1.7.83 is the proper landing of all three accumulated hotfixes (size-mismatch, status-divergence, CI test fix).
+
+## [1.7.82] - 2026-05-05
+
+Bundled hotfix release. Supersedes the v1.7.81 tag: that tag was created but no GitHub Release was ever published — the goreleaser pipeline failed on a CI-only test bug ([run 25395639116](https://github.com/asheshgoplani/agent-deck/actions/runs/25395639116)) before the binaries could be uploaded. v1.7.82 ships the v1.7.81-intended multi-client tmux size fix, the test fix that unblocks the release pipeline, and a separately-discovered status-divergence fix for the web UI.
+
+### Fixed
+
+- **Multi-client size mismatch ("dots in the window") between web UI and direct tmux clients** ([PR #866](https://github.com/asheshgoplani/agent-deck/pull/866)). Two contributing bugs combined: tmux's default `window-size latest` policy snapped the window to whichever client most recently sent input, and `(*tmuxPTYBridge).Resize` issued an explicit `tmux resize-window -x N -y M` on every browser FitAddon resize, which per `man tmux` implicitly flips the session option to `window-size=manual`. Together this dragged native attach clients (Ghostty, iTerm) to the web viewport's geometry and pinned them there. Fixed in two places: `internal/tmux/tmux.go` now sets `window-size=largest` (session) + `aggressive-resize=on` (window) per session at `Session.Start`, gated through the existing `[tmux] options` config-override mechanism so users can opt out; `internal/web/terminal_bridge.go` no longer issues `tmux resize-window` from `Resize` (the local `pty.Setsize` keeps xterm.js's grid correct), and the `-f ignore-size` flag was dropped from `tmuxAttachCommand` (no longer needed since the web client now participates in the `largest` arbitration alongside native clients). Smaller clients see clipped content rather than dragging the window. New integration test `TestSession_MultiClientSizePolicy_Integration` asserts both options are set after `Session.Start`. See tmux issue [#2594](https://github.com/tmux/tmux/issues/2594) for the upstream pattern. *(Originally targeted v1.7.81; the release pipeline failed on the test bug below before the binaries shipped.)*
+
+- **`TestTmuxPTYBridgeResize` failed in the CI release pipeline, blocking the v1.7.81 goreleaser run** ([PR #869](https://github.com/asheshgoplani/agent-deck/pull/869)). The test created its tmux session manually without the `window-size=largest` option that the production code path now sets at `Session.Start` (PR #866). On CI's headless tmux, the default `window-size latest` policy interacts differently with the test's resize sequencing than on a developer machine, surfacing a flake that local runs never saw. Fix sets `window-size=largest` on the test session up-front so the test environment matches production. Verified with `go test -run TestTmuxPTYBridgeResize ./internal/web/` locally and on CI.
+
+- **Web `/api/sessions` reported `error` for sessions whose hook file said `waiting`, while `agent-deck list --json` reported `waiting` for the same sessions at the same instant** ([PR #867](https://github.com/asheshgoplani/agent-deck/pull/867)). Root cause: the live web reads from `MemoryMenuData`, an in-memory snapshot pushed by the TUI's `publishWebSessionStates`. The TUI's view of `Instance.hookStatus` is fed by `StatusFileWatcher` (inotify); when an inotify event is dropped (queue overflow under load — 1100+ hook files in `~/.agent-deck/hooks/` is enough to hit this in steady state) the TUI's `hookStatus` stays stale, the hook fast-path freshness window expires, `Instance.UpdateStatus` falls through to tmux pane heuristics, and the published Status flips to `error`. The CLI does not have this gap because `agent-deck list --json` reads each hook file from disk per call via `session.RefreshInstancesForCLIStatus`. Fix adds `internal/web/snapshot_hook_refresh.go` that re-applies the hook fast-path Status mapping (matching `Instance.UpdateStatus`'s switch on `hookStatus`) to the cached `MenuSnapshot` before the GET handlers (`/api/sessions`, `/api/menu`, `/api/session/{id}`) serialize it. Stopped sessions are never overridden (user-intentional). Fresh hooks (within the 2-min `hookFastPathWindow`) override any non-stopped state. Stale `waiting` hooks specifically override snapshot=`error` because Claude's "waiting" state is durable across hook event gaps — a Stop hook that fired hours ago without a follow-up UserPromptSubmit means Claude is still at the prompt, exactly the case the CLI captures via tmux pane-title heuristics that the web cannot reach without per-request subprocesses. Live before/after on a system with 21 waiting sessions: web reported `waiting=0` before the fix, `waiting=21` after (CLI reported 21 throughout).
+
+  Test coverage in `internal/web/snapshot_hook_refresh_test.go`: a regression test (`TestParity_WaitingStatusFlowsThroughHandler`) reproduces the exact production divergence by seeding a snapshot with `Status: StatusError` and an in-memory hook overlay saying `waiting`, then asserting `GET /api/sessions` returns `waiting`; this test fails before the fix and passes after. A property test (`TestRefreshSnapshotHookStatuses_NoHookFilePreservesAllStatuses` and the parallel `TestParity_AllStatusesPreservedThroughGetSessions`) iterates all six `session.Status` enum values (`StatusRunning`, `StatusWaiting`, `StatusIdle`, `StatusError`, `StatusStarting`, `StatusStopped`) and asserts each round-trips through the API unchanged when no hook overlay applies — locking the contract that adding a new Status without wiring the web fails the build. Plus targeted unit tests for stale/fresh override semantics, stopped-stickiness, and shell-tool no-op.
+
+### Notes
+
+- **v1.7.81 was a phantom tag.** The git tag `v1.7.81` exists in the repository (created by [PR #868](https://github.com/asheshgoplani/agent-deck/pull/868) merging) but no GitHub Release was ever published under that tag because the goreleaser workflow failed on the `TestTmuxPTYBridgeResize` test (now fixed in PR #869). The tag is left in place as a historical record. v1.7.82 is the proper landing of the v1.7.81-intended fixes plus the test fix and one additional status-divergence fix.
+
+## [1.7.81] - 2026-05-05
+
+Hotfix for a multi-client tmux size-negotiation bug that caused dot-filled void cells when the web UI and direct `tmux attach` clients were both connected to the same agent-deck session at different geometries.
+
+### Fixed
+
+- **Multi-client size mismatch ("dots in the window") between web UI and direct tmux clients.** Two contributing bugs combined: tmux's default `window-size latest` policy snapped the window to whichever client most recently sent input, and `(*tmuxPTYBridge).Resize` issued an explicit `tmux resize-window -x N -y M` on every browser FitAddon resize, which per `man tmux` implicitly flips the session option to `window-size=manual`. Together this dragged native attach clients (Ghostty, iTerm) to the web viewport's geometry and pinned them there. Fixed in two places: `internal/tmux/tmux.go` now sets `window-size=largest` (session) + `aggressive-resize=on` (window) per session at `Session.Start`, gated through the existing `[tmux] options` config-override mechanism so users can opt out; `internal/web/terminal_bridge.go` no longer issues `tmux resize-window` from `Resize` (the local `pty.Setsize` keeps xterm.js's grid correct), and the `-f ignore-size` flag was dropped from `tmuxAttachCommand` (no longer needed since the web client now participates in the `largest` arbitration alongside native clients). Smaller clients see clipped content rather than dragging the window. New integration test `TestSession_MultiClientSizePolicy_Integration` asserts both options are set after `Session.Start`. See tmux issue [#2594](https://github.com/tmux/tmux/issues/2594) for the upstream pattern.
+
+## [1.7.80] - 2026-05-05
+
+WebUI overhaul Phase 1 + one small Claude-session UX fix.
+
+### Added
+
+- **WebUI test infrastructure + TUI⇄web parity matrix (PR-A of WebUI overhaul, [PR #804](https://github.com/asheshgoplani/agent-deck/pull/804)).** Foundation PR for the WebUI redesign — pure test infrastructure with no design changes. Adds Vitest unit tests (`tests/web/unit/`, jsdom + @testing-library/preact, 11 specs against `api.js` + `state.js`), Playwright e2e + screenshot regression (`tests/web/e2e/`, 279 specs across 3 viewports — smoke, parity-actions with behavioral assertions for groups/settings/cost/push, parity-state, visual baselines), an in-memory web fixture binary (`tests/web/fixtures/cmd/web-fixture/main.go`) hardened against stale-server false-passes (OS-allocated ephemeral port + 16-byte random startup token + pid verification via `/__fixture/whoami`), the TUI ↔ web parity matrix at `tests/web/PARITY_MATRIX.md` cataloging 47 actions and ~50 state fields (surfaces a 64% action gap and 76% state-field gap from TUI to web) — tests now iterate the full matrix instead of a hard-coded subset, fail explicitly when any TUI/web row drifts, a Go runtime sync-invariant test at `internal/web/parity_test.go` that fires actions through both the HTTP surface and the mutator and asserts equal observable state including group create/rename/delete, `Makefile` targets (`test-web`, `test-web-unit`, `test-web-e2e`, `test-web-install`), and a `.github/workflows/web-tests.yml` CI workflow. Lifecycle endpoints get positive parity tests; missing endpoints get "stay missing" regression guards so any silent addition fails the build until the matrix is updated in lockstep. Three rounds of dual-review (Claude + Codex sibling-topology) drove the test-fidelity hardening. Stack stays Preact + htm + signals (already vendored). PR-B (visual redesign) builds on top of this.
+
+### Fixed
+
+- **Persist Claude New Session defaults** ([PR #853](https://github.com/asheshgoplani/agent-deck/pull/853), thanks @yaroshevych). Three new TOML keys on `[claude]` (`extra_args`, `use_chrome`, `use_teammate_mode`) persisted on Claude session creation and replayed via `SetDefaults`. Backward compatible: missing keys load as zero values. Note: every New Session creation now overwrites `cfg.Claude.DangerousMode / AllowDangerousMode / AutoMode` with whatever the dialog held — by design, but a hand-edited `dangerous_mode = true` in `config.toml` will flip if the box is unchecked.
+
 ## [1.7.79] - 2026-05-01
 
 Two TUI polish fixes from @AdamiecRadek (their 5th and 6th PR landing this week — #813→#814 pricing, #818→#819 cost line, #836→#837 context window, #846, #847).
