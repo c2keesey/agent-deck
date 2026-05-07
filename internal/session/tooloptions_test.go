@@ -229,8 +229,10 @@ func TestNewClaudeOptions_WithConfig(t *testing.T) {
 	dangerousModeBool := true
 	config := &UserConfig{
 		Claude: ClaudeSettings{
-			DangerousMode: &dangerousModeBool,
-			UseHappy:      true,
+			DangerousMode:   &dangerousModeBool,
+			UseHappy:        true,
+			UseChrome:       true,
+			UseTeammateMode: true,
 		},
 	}
 
@@ -244,6 +246,12 @@ func TestNewClaudeOptions_WithConfig(t *testing.T) {
 	}
 	if !opts.UseHappy {
 		t.Error("expected UseHappy=true when config.Claude.UseHappy=true")
+	}
+	if !opts.UseChrome {
+		t.Error("expected UseChrome=true")
+	}
+	if !opts.UseTeammateMode {
+		t.Error("expected UseTeammateMode=true")
 	}
 }
 
