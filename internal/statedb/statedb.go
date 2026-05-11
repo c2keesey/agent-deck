@@ -127,6 +127,10 @@ type GroupRow struct {
 	Expanded    bool
 	Order       int
 	DefaultPath string
+	// MaxConcurrent caps simultaneous running sessions in this group (v1.9.1).
+	// 0 = unlimited (legacy default for groups predating this field); 1 = serial
+	// (default for newly-created groups); N>=2 = bounded parallelism.
+	MaxConcurrent int
 }
 
 // StatusRow holds status + acknowledgment for a session.
@@ -261,17 +265,29 @@ func (s *StateDB) Migrate() error {
 		return fmt.Errorf("statedb: create instances: %w", err)
 	}
 
-	// groups table
+	// groups table.
+	// max_concurrent (v1.9.1): caps simultaneous running sessions in the
+	// group. DEFAULT 0 preserves backward compat (legacy unlimited) for any
+	// row inserted before this column existed; newly-created groups set 1.
 	if _, err := tx.Exec(`
 		CREATE TABLE IF NOT EXISTS groups (
-			path         TEXT PRIMARY KEY,
-			name         TEXT NOT NULL,
-			expanded     INTEGER NOT NULL DEFAULT 1,
-			sort_order   INTEGER NOT NULL DEFAULT 0,
-			default_path TEXT NOT NULL DEFAULT ''
+			path           TEXT PRIMARY KEY,
+			name           TEXT NOT NULL,
+			expanded       INTEGER NOT NULL DEFAULT 1,
+			sort_order     INTEGER NOT NULL DEFAULT 0,
+			default_path   TEXT NOT NULL DEFAULT '',
+			max_concurrent INTEGER NOT NULL DEFAULT 0
 		)
 	`); err != nil {
 		return fmt.Errorf("statedb: create groups: %w", err)
+	}
+
+	// ALTER for pre-existing databases (idempotent: ignore "duplicate column").
+	if _, err := tx.Exec(`ALTER TABLE groups ADD COLUMN max_concurrent INTEGER NOT NULL DEFAULT 0`); err != nil {
+		// SQLite returns "duplicate column name" when the column already exists.
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("statedb: add groups.max_concurrent: %w", err)
+		}
 	}
 
 	// instance heartbeats
@@ -509,7 +525,18 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 // SaveInstances inserts or replaces multiple instances in a single transaction.
 // It also removes any rows from the database that are not in the provided list,
 // ensuring deleted sessions don't reappear on reload.
+//
+// Wrapped in withBusyRetry because parallel writers (CLI + TUI + heartbeat
+// daemons) contend on the WAL writer slot. The whole save is idempotent at
+// the row level (INSERT OR REPLACE + DELETE WHERE NOT IN), so retrying the
+// outer transaction on SQLITE_BUSY is safe. Part of the v1.9.1 #909 fix.
 func (s *StateDB) SaveInstances(insts []*InstanceRow) error {
+	return withBusyRetry(func() error {
+		return s.saveInstancesOnce(insts)
+	})
+}
+
+func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 	// Pre-fetch existing tool_data per instance ID so we can preserve any
 	// keys not modeled by the typed schema (e.g., manually-set
 	// clear_on_compact). Without this merge, every INSERT OR REPLACE
@@ -667,9 +694,32 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 }
 
 // DeleteInstance removes an instance by ID.
+//
+// Wrapped in withBusyRetry because parallel `agent-deck rm` invocations
+// (e.g. xargs -P 14) all contend on the same WAL writer slot. Without
+// retry, transient SQLITE_BUSY silently drops the DELETE while the CLI
+// still reports success — the silent-loss half of issue #909.
 func (s *StateDB) DeleteInstance(id string) error {
-	_, err := s.db.Exec("DELETE FROM instances WHERE id = ?", id)
-	return err
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec("DELETE FROM instances WHERE id = ?", id)
+		return err
+	})
+}
+
+// InstanceExists returns true iff a row with the given id is present.
+// Used by the rm path's post-commit verify (issue #909) to detect
+// resurrection by a concurrent SaveInstances rewrite.
+func (s *StateDB) InstanceExists(id string) (bool, error) {
+	row := s.db.QueryRow("SELECT 1 FROM instances WHERE id = ? LIMIT 1", id)
+	var one int
+	err := row.Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // UpdateInstanceField updates a single column for a given instance.
@@ -696,8 +746,8 @@ func (s *StateDB) SaveGroups(groups []*GroupRow) error {
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO groups (path, name, expanded, sort_order, default_path)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO groups (path, name, expanded, sort_order, default_path, max_concurrent)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -709,7 +759,7 @@ func (s *StateDB) SaveGroups(groups []*GroupRow) error {
 		if g.Expanded {
 			expanded = 1
 		}
-		if _, err := stmt.Exec(g.Path, g.Name, expanded, g.Order, g.DefaultPath); err != nil {
+		if _, err := stmt.Exec(g.Path, g.Name, expanded, g.Order, g.DefaultPath, g.MaxConcurrent); err != nil {
 			return err
 		}
 	}
@@ -720,7 +770,7 @@ func (s *StateDB) SaveGroups(groups []*GroupRow) error {
 // LoadGroups returns all groups ordered by sort_order.
 func (s *StateDB) LoadGroups() ([]*GroupRow, error) {
 	rows, err := s.db.Query(`
-		SELECT path, name, expanded, sort_order, default_path
+		SELECT path, name, expanded, sort_order, default_path, max_concurrent
 		FROM groups ORDER BY sort_order
 	`)
 	if err != nil {
@@ -732,7 +782,7 @@ func (s *StateDB) LoadGroups() ([]*GroupRow, error) {
 	for rows.Next() {
 		g := &GroupRow{}
 		var expanded int
-		if err := rows.Scan(&g.Path, &g.Name, &expanded, &g.Order, &g.DefaultPath); err != nil {
+		if err := rows.Scan(&g.Path, &g.Name, &expanded, &g.Order, &g.DefaultPath, &g.MaxConcurrent); err != nil {
 			return nil, err
 		}
 		g.Expanded = expanded != 0
