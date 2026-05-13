@@ -972,6 +972,24 @@ func handleSessionShow(profile string, args []string) {
 		if len(inst.Channels) > 0 {
 			jsonData["channels"] = inst.Channels
 		}
+
+		// Plugins (RFC docs/rfc/PLUGIN_ATTACH.md §10.5) — surface when
+		// non-empty so downstream tooling can introspect per-session
+		// enabledPlugins state without parsing the scratch settings.json.
+		if len(inst.Plugins) > 0 {
+			jsonData["plugins"] = inst.Plugins
+		}
+		// Surface the auto-link opt-out (RFC §4.7) when set, so tooling
+		// can distinguish "user disabled auto-link" from "no plugins".
+		if inst.PluginChannelLinkDisabled {
+			jsonData["plugin_channel_link_disabled"] = true
+		}
+		// AutoLinkedChannels (RFC §4.7, G4/C2 fix) — internal-ish state
+		// for ownership tracking, but exposing in JSON helps downstream
+		// tooling distinguish auto-linked vs user-managed channels.
+		if len(inst.AutoLinkedChannels) > 0 {
+			jsonData["auto_linked_channels"] = inst.AutoLinkedChannels
+		}
 	}
 
 	if tmuxSession := inst.GetTmuxSession(); tmuxSession != nil {
@@ -1025,6 +1043,19 @@ func handleSessionShow(profile string, args []string) {
 			}
 			sb.WriteString(fmt.Sprintf("MCPs:    %s\n", strings.Join(mcpParts, ", ")))
 		}
+
+		// Channels and Plugins (RFC docs/rfc/PLUGIN_ATTACH.md). Surfaced
+		// for claude sessions so users can verify per-session topology
+		// without parsing state.db or the scratch settings.json.
+		if len(inst.Channels) > 0 {
+			sb.WriteString(fmt.Sprintf("Channels:%s\n", " "+strings.Join(inst.Channels, ", ")))
+		}
+		if len(inst.Plugins) > 0 {
+			sb.WriteString(fmt.Sprintf("Plugins: %s\n", strings.Join(inst.Plugins, ", ")))
+			if inst.PluginChannelLinkDisabled {
+				sb.WriteString("         (auto-channel-link disabled — RFC §4.7)\n")
+			}
+		}
 	}
 
 	if inst.NoTransitionNotify {
@@ -1076,6 +1107,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  tool               Tool type (claude, gemini, shell, etc.)")
 		fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
 		fmt.Println("  channels           Comma-separated plugin channel ids (claude only)")
+		fmt.Println("  plugins            Comma-separated plugin catalog names (claude only) — see [plugins.<name>] in ~/.agent-deck/config.toml")
 		fmt.Println("  extra-args         Extra claude CLI tokens (claude only; use `-- --flag value` for tokens starting with -; persisted plaintext — no secrets)")
 		fmt.Println("  color              Optional TUI row tint: '#RRGGBB' or ANSI '0'..'255' or '' (issue #391)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
@@ -1713,6 +1745,7 @@ func handleSessionSend(profile string, args []string) {
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready (send immediately)")
 	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output")
 	stream := fs.Bool("stream", false, "Stream JSONL events (Claude only) to stdout instead of returning a snapshot")
+	draft := fs.Bool("draft", false, "Pre-fill the prompt without submitting (incompatible with --wait/--stream/--no-wait)")
 	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for completion (used with --wait)")
 	streamIdle := fs.Duration("stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
@@ -1731,6 +1764,7 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  agent-deck session send my-project \"run tests\" --wait")
 		fmt.Println("  agent-deck session send my-project \"quick ping\" --no-wait")
 		fmt.Println("  agent-deck session send my-project \"trace progress\" --stream")
+		fmt.Println("  agent-deck session send my-project \"cwd: /path/to/dir\" --draft")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -1748,6 +1782,11 @@ func handleSessionSend(profile string, args []string) {
 
 	if *stream && *wait {
 		out.Error("--stream and --wait are mutually exclusive", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	if *draft && (*wait || *stream || *noWait) {
+		out.Error("--draft is incompatible with --wait, --stream, and --no-wait", ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -1805,6 +1844,22 @@ func handleSessionSend(profile string, args []string) {
 	// Record send time before the actual send so we can verify output freshness.
 	// Captured early to avoid false negatives from clock skew.
 	sentAt := time.Now()
+
+	// --draft: type text into the prompt without pressing Enter, letting the
+	// user review and submit manually.
+	if *draft {
+		if err := executeDraft(tmuxSess, message); err != nil {
+			out.Error(fmt.Sprintf("failed to pre-fill prompt: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		out.Success(fmt.Sprintf("Pre-filled prompt in '%s'", inst.Title), map[string]interface{}{
+			"success":       true,
+			"session_id":    inst.ID,
+			"session_title": inst.Title,
+			"message":       message,
+		})
+		return
+	}
 
 	// Send message atomically (text + Enter in single tmux invocation).
 	// --no-wait: skip full readiness waiting, but run a capped preflight
@@ -1909,6 +1964,16 @@ func defaultSendOptions() sendRetryOptions {
 // doesn't start processing within a reasonable time.
 func sendWithRetry(tmuxSess *tmux.Session, message string, skipVerify bool) error {
 	return sendWithRetryTarget(tmuxSess, message, skipVerify, defaultSendOptions())
+}
+
+// draftSender is implemented by *tmux.Session for the --draft path.
+type draftSender interface {
+	SendKeysChunked(string) error
+}
+
+// executeDraft pre-fills the prompt without pressing Enter.
+func executeDraft(target draftSender, message string) error {
+	return target.SendKeysChunked(message)
 }
 
 // noWaitSendOptions returns the verification-loop options used by the

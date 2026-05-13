@@ -20,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/BurntSushi/toml"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -204,6 +205,7 @@ type Home struct {
 	confirmDialog        *ConfirmDialog        // For confirming destructive actions
 	helpOverlay          *HelpOverlay          // For showing keyboard shortcuts
 	mcpDialog            *MCPDialog            // For managing MCPs
+	pluginDialog         *PluginDialog         // For managing per-session Claude Code plugins (RFC PLUGIN_ATTACH.md)
 	editPathsDialog      *EditPathsDialog      // For editing multi-repo paths
 	editSessionDialog    *EditSessionDialog    // For editing session settings (title/color/notes/command/...)
 	skillDialog          *SkillDialog          // For managing project skills
@@ -746,6 +748,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		confirmDialog:        NewConfirmDialog(),
 		helpOverlay:          NewHelpOverlay(),
 		mcpDialog:            NewMCPDialog(),
+		pluginDialog:         NewPluginDialog(),
 		editPathsDialog:      NewEditPathsDialog(),
 		editSessionDialog:    NewEditSessionDialog(),
 		skillDialog:          NewSkillDialog(),
@@ -1978,7 +1981,7 @@ func (h *Home) startWatcherEngine() tea.Cmd {
 		adapterCfg := watcher.AdapterConfig{
 			Type:     row.Type,
 			Name:     row.Name,
-			Settings: map[string]string{},
+			Settings: loadWatcherSourceSettings(row.Name),
 		}
 		eng.RegisterAdapter(row.ID, adapter, adapterCfg, maxSilenceMinutes)
 	}
@@ -1994,6 +1997,29 @@ func (h *Home) startWatcherEngine() tea.Cmd {
 		listenForWatcherEvent(eng.EventCh()),
 		listenForWatcherHealth(eng.HealthCh()),
 	)
+}
+
+// loadWatcherSourceSettings reads the [source] table from
+// ~/.agent-deck/watcher/<name>/watcher.toml into a map[string]string suitable for
+// AdapterConfig.Settings. Returns an empty (non-nil) map on any error so the engine
+// falls back to per-adapter defaults instead of failing to register.
+func loadWatcherSourceSettings(name string) map[string]string {
+	out := map[string]string{}
+	dir, err := session.WatcherNameDir(name)
+	if err != nil {
+		return out
+	}
+	path := filepath.Join(dir, "watcher.toml")
+	var cfg struct {
+		Source map[string]string `toml:"source"`
+	}
+	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+		return out
+	}
+	for k, v := range cfg.Source {
+		out[k] = v
+	}
+	return out
 }
 
 // propagateThemeToSessions updates COLORFGBG in all running tmux sessions
@@ -3241,6 +3267,54 @@ func (h *Home) triggerStatusUpdate() {
 	}
 }
 
+func (h *Home) refreshAttachedSessionStatus(sessionID string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+
+	h.instancesMu.RLock()
+	inst := h.instanceByID[sessionID]
+	h.instancesMu.RUnlock()
+	if inst == nil {
+		return
+	}
+
+	// Attach return is the one moment where stale hook files are most visible:
+	// Claude/Codex may have exited via /q without writing a fresh "dead" hook.
+	// Force the attached session through the live tmux path before the list is
+	// redrawn so the status icon reflects a dead pane immediately.
+	inst.ClearHookStatus()
+	if h.hookWatcher != nil {
+		h.hookWatcher.ClearHookStatus(inst.ID)
+	}
+	inst.ForceNextStatusCheck()
+
+	if inst.GetTmuxSession() != nil {
+		tmux.RefreshSessionCache()
+		tmux.RefreshPaneInfoCache()
+	}
+
+	oldStatus := inst.GetStatusThreadSafe()
+	_ = inst.UpdateStatus()
+	newStatus := inst.GetStatusThreadSafe()
+	if newStatus != oldStatus {
+		h.cachedStatusCounts.valid.Store(false)
+		h.publishCurrentSessionStates()
+		if db := statedb.GetGlobal(); db != nil {
+			_ = db.WriteStatus(inst.ID, string(newStatus), inst.GetToolThreadSafe())
+		}
+	}
+	h.refreshSessionRenderSnapshot(nil)
+}
+
+func (h *Home) publishCurrentSessionStates() {
+	h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(h.instances))
+	copy(instances, h.instances)
+	h.instancesMu.RUnlock()
+	h.publishWebSessionStates(instances)
+}
+
 // processStatusUpdate implements round-robin status updates (Priority 1A + 1B)
 // Called by the background worker goroutine
 // Instead of updating ALL sessions every tick (which causes lag with 100+ sessions),
@@ -4227,6 +4301,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.isAttaching.Store(false) // Atomic store for thread safety
 		now := time.Now()
 		h.beginAttachReturnGrace(now)
+		// Reconcile the attached session synchronously before the normal delayed
+		// refresh so an exited pane does not render as still running for a tick.
+		h.refreshAttachedSessionStatus(msg.attachedSessionID)
 
 		selectedBefore := h.captureSelectedItemIdentity()
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
@@ -4286,7 +4363,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// resets mouse reporting), restore legacy keyboard reporting (tmux's
 		// extended-keys setting leaves Kitty/modifyOtherKeys on the outer terminal;
 		// see RestoreLegacyKeyboardCmd for the full rationale), and schedule a
-		// delayed refresh so the main menu reflects attach-return state changes.
+		// delayed repaint for any pane-title/content cache changes that settle just
+		// after tmux restores the outer client.
 		return h, tea.Batch(
 			tea.EnableMouseCellMotion,
 			RestoreLegacyKeyboardCmd(os.Stdout),
@@ -4296,7 +4374,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case attachReturnRefreshMsg:
 		selectedBefore := h.captureSelectedItemIdentity()
 		tmux.RefreshSessionCache()
+		tmux.RefreshPaneInfoCache()
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
+		h.refreshSessionRenderSnapshot(nil)
 		return h, nil
 
 	case previewDebounceMsg:
@@ -4874,6 +4954,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.mcpDialog.IsVisible() {
 			return h.handleMCPDialogKey(msg)
+		}
+		if h.pluginDialog.IsVisible() {
+			return h.handlePluginDialogKey(msg)
 		}
 		if h.editPathsDialog.IsVisible() {
 			return h.handleEditPathsDialogKey(msg)
@@ -5481,7 +5564,7 @@ func (h *Home) hasModalVisible() bool {
 		h.watcherPanel.IsVisible() || // hotkeyWatcherPanel overlay
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
-		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.skillDialog.IsVisible() ||
+		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
 		h.geminiModelDialog.IsVisible() || h.sessionPickerDialog.IsVisible() ||
 		h.worktreeFinishDialog.IsVisible() || h.editPathsDialog.IsVisible() ||
 		h.editSessionDialog.IsVisible() ||
@@ -6037,6 +6120,45 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "shift+left":
+		// Promote: outdent a sub-session to top-level peer in the same group.
+		// Top-level sessions and groups are unaffected. Cross-group moves
+		// stay on M.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				sessionID := item.Session.ID
+				h.groupTree.PromoteSession(item.Session)
+				h.rebuildFlatItems()
+				h.moveCursorToSession(sessionID)
+				if h.cursor >= len(h.flatItems) {
+					h.cursor = max(0, len(h.flatItems)-1)
+				}
+				h.saveInstances()
+			}
+		}
+		return h, nil
+
+	case "shift+right":
+		// Demote: nest the cursor's top-level session under the previous
+		// top-level peer as that peer's last child. No-op when already a
+		// sub-session, when the session has its own children (single-level
+		// nesting only), or when there is no previous peer in the group.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				sessionID := item.Session.ID
+				h.groupTree.DemoteSession(item.Session)
+				h.rebuildFlatItems()
+				h.moveCursorToSession(sessionID)
+				if h.cursor >= len(h.flatItems) {
+					h.cursor = max(0, len(h.flatItems)-1)
+				}
+				h.saveInstances()
+			}
+		}
+		return h, nil
+
 	case "p":
 		// Edit multi-repo paths
 		if h.cursor < len(h.flatItems) {
@@ -6068,6 +6190,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				(session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
 				h.mcpDialog.SetSize(h.width, h.height)
 				if err := h.mcpDialog.Show(item.Session.ProjectPath, item.Session.ID, item.Session.Tool); err != nil {
+					h.setError(err)
+				}
+			}
+		}
+		return h, nil
+
+	case "L":
+		// Plugin Manager — claude-only (RFC docs/rfc/PLUGIN_ATTACH.md).
+		// Mirrors the MCP-manager UX (`m`): toggleable list of catalog
+		// plugins from ~/.agent-deck/config.toml. Apply persists via
+		// session.SetField(FieldPlugins,...) and triggers restart.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil &&
+				session.IsClaudeCompatible(item.Session.Tool) {
+				h.pluginDialog.SetSize(h.width, h.height)
+				if err := h.pluginDialog.Show(item.Session); err != nil {
 					h.setError(err)
 				}
 			}
@@ -7261,6 +7400,59 @@ func (h *Home) handleMCPDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	default:
 		h.mcpDialog.Update(msg)
+		return h, nil
+	}
+}
+
+// handlePluginDialogKey routes key events to the plugin manager dialog.
+// Apply path: persist via session.SetField(FieldPlugins,...) and restart
+// the session to reload claude's enabledPlugins from the per-session
+// scratch settings.json. RFC: docs/rfc/PLUGIN_ATTACH.md.
+func (h *Home) handlePluginDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		// Persist if anything changed; otherwise just close.
+		if !h.pluginDialog.HasChanged() {
+			h.pluginDialog.Hide()
+			return h, nil
+		}
+		sessionID := h.pluginDialog.GetSessionID()
+		newNames := h.pluginDialog.SelectedPluginNames()
+
+		var targetInst *session.Instance
+		h.instancesMu.RLock()
+		for _, inst := range h.instances {
+			if inst.ID == sessionID {
+				targetInst = inst
+				break
+			}
+		}
+		h.instancesMu.RUnlock()
+		if targetInst == nil {
+			h.pluginDialog.Hide()
+			return h, nil
+		}
+
+		oldValue, _, mutErr := session.SetField(targetInst, session.FieldPlugins, strings.Join(newNames, ","), nil)
+		if mutErr != nil {
+			h.setError(mutErr)
+			return h, nil
+		}
+		_ = oldValue
+		h.forceSaveInstances()
+		h.pluginDialog.Hide()
+
+		if targetInst.CanRestart() && !h.hasActiveAnimation(targetInst.ID) {
+			return h, h.restartSession(targetInst)
+		}
+		return h, nil
+
+	case "esc":
+		h.pluginDialog.Hide()
+		return h, nil
+
+	default:
+		h.pluginDialog.Update(msg)
 		return h, nil
 	}
 }
@@ -9379,6 +9571,9 @@ func (h *Home) View() string {
 	}
 	if h.mcpDialog.IsVisible() {
 		return h.mcpDialog.View()
+	}
+	if h.pluginDialog.IsVisible() {
+		return h.pluginDialog.View()
 	}
 	if h.editSessionDialog.IsVisible() {
 		return h.editSessionDialog.View()
