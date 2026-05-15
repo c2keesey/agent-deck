@@ -258,7 +258,13 @@ func handleLaunch(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Resolve parent session if specified
+	// Resolve parent session if specified.
+	// Issue #972: when no explicit -g is passed, prefer the cwd-derived
+	// project group over the parent's group, so conductor-spawned children
+	// land in the project group (e.g. `agent-deck`) instead of the
+	// conductor's own group (`conductor`). The parent group is now a
+	// fallback for path mappings that produce no group.
+	cwdDerivedGroup := session.GroupPathForProject(path)
 	var parentInstance *session.Instance
 	if sessionParent != "" {
 		var errMsg string
@@ -271,11 +277,11 @@ func handleLaunch(profile string, args []string) {
 			out.Error("cannot create sub-session of a sub-session (single level only)", ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
-		sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+		sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided)
 	} else if !*noParent {
 		parentInstance = resolveAutoParentInstance(instances)
 		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+			sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided)
 		} else {
 			parentInstance = nil
 		}
@@ -447,6 +453,15 @@ func handleLaunch(profile string, args []string) {
 		)
 		return
 	}
+
+	// Issue #955: strip TELEGRAM_STATE_DIR from the agent-deck CLI
+	// process env before the tmux server inherits it on the first
+	// `new-session`. No-op for conductors and explicit telegram
+	// channel owners — they legitimately own the bot token. Sits
+	// above the S8 exec-layer (env -u TELEGRAM_STATE_DIR claude …)
+	// so even non-claude descendants of the pane (Bash-tool spawns,
+	// fork claudes, restart respawn) start with a clean env.
+	session.ScrubProcessEnvForChildLaunch(newInstance)
 
 	// Start the session.
 	// - default: StartWithMessage waits for readiness and delivers initial prompt

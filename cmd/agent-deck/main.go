@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -36,7 +37,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.5" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.8" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -855,30 +856,40 @@ func extractSelectFlag(args []string) (string, []string) {
 // Go's flag package stops parsing at the first non-flag argument,
 // so "add . -c claude" would fail to parse -c without this fix.
 // This reorders to "add -c claude ." which parses correctly.
+//
+// Issue #974: Go's flag package treats `-parent` and `--parent` as the
+// same flag, but this reorder pass historically only matched the exact
+// double-dash spelling. The result was that `launch -parent <pid>` did
+// not pair `-parent` with `<pid>` — `<pid>` got demoted to a positional
+// and the wrong arg ended up as the parent value. We now match flag
+// names by their normalized form (dashes stripped from the left) so
+// `-parent` and `--parent` behave identically here too.
 func reorderArgsForFlagParsing(args []string) []string {
 	if len(args) == 0 {
 		return args
 	}
 
-	// Known flags that take a value (need to skip their values)
-	// Note: -b/--new-branch are boolean flags (no value), so not included here
-	valueFlags := map[string]bool{
-		"-t": true, "--title": true,
-		"-g": true, "--group": true,
-		"-c": true, "--cmd": true,
-		"-m": true, "--message": true,
-		"-p": true, "--parent": true,
-		"--mcp":       true,
-		"--channel":   true,
-		"--plugin":    true,
-		"--extra-arg": true,
-		"--wrapper":   true,
-		"-w":          true, "--worktree": true,
-		"--location":       true,
-		"--resume-session": true,
-		"--sandbox-image":  true,
-		"--ssh":            true,
-		"--remote-path":    true,
+	// Known flag *names* (no leading dashes) that take a value.
+	// Note: -b/--new-branch are boolean flags (no value), so not included here.
+	valueFlagNames := map[string]bool{
+		"t": true, "title": true,
+		"g": true, "group": true,
+		"c": true, "cmd": true,
+		"m": true, "message": true,
+		"p": true, "parent": true,
+		"mcp":            true,
+		"channel":        true,
+		"plugin":         true,
+		"extra-arg":      true,
+		"wrapper":        true,
+		"w":              true,
+		"worktree":       true,
+		"location":       true,
+		"resume-session": true,
+		"sandbox-image":  true,
+		"ssh":            true,
+		"remote-path":    true,
+		"tmux-socket":    true,
 	}
 
 	var flags []string
@@ -888,12 +899,17 @@ func reorderArgsForFlagParsing(args []string) []string {
 		arg := args[i]
 
 		// Check if it's a flag
-		if strings.HasPrefix(arg, "-") {
+		if strings.HasPrefix(arg, "-") && arg != "-" {
 			flags = append(flags, arg)
 
-			// Check if this flag takes a value (and value is separate)
-			// Handle both "-c value" and "-c=value" formats
-			if !strings.Contains(arg, "=") && valueFlags[arg] && i+1 < len(args) {
+			// `-foo=bar` carries its value in the same token.
+			if strings.Contains(arg, "=") {
+				continue
+			}
+
+			// Normalize "-foo" / "--foo" to "foo" for lookup.
+			name := strings.TrimLeft(arg, "-")
+			if valueFlagNames[name] && i+1 < len(args) {
 				i++
 				flags = append(flags, args[i])
 			}
@@ -1221,11 +1237,15 @@ func handleAdd(profile string, args []string) {
 			fmt.Printf("Error: cannot create sub-session of a sub-session (single level only)\n")
 			os.Exit(1)
 		}
-		sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+		// handleAdd resolves `path` AFTER this block (see below), so the
+		// cwd-derived group is not available here. Passing "" preserves
+		// handleAdd's existing behavior; the #972 cwd-over-parent priority
+		// is wired into `launch` where path is already known at this point.
+		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
 	} else if !*noParent {
 		parentInstance = resolveAutoParentInstance(instances)
 		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
 		} else {
 			parentInstance = nil
 		}
@@ -2654,30 +2674,76 @@ func handleUpdateToSpecificVersion(requested string, checkOnly bool) {
 	fmt.Println("  Restart agent-deck to use this version.")
 }
 
+// brewRunner abstracts `brew <args...>` so tests can inject canned output
+// without touching the real binary. The contract: return the combined
+// stdout+stderr captured from the invocation, plus the process exit error
+// (nil on exit 0). Implementations may also tee output to the terminal so
+// the user still sees brew's live progress.
+type brewRunner interface {
+	Run(args ...string) ([]byte, error)
+}
+
+// execBrewRunner is the production runner: it invokes the real `brew` binary
+// and tees its output to the user's terminal while capturing a copy for the
+// post-run inspection that #954 requires.
+type execBrewRunner struct{ bin string }
+
+func (e *execBrewRunner) Run(args ...string) ([]byte, error) {
+	cmd := exec.Command(e.bin, args...)
+	cmd.Stdin = os.Stdin
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	err := cmd.Run()
+	return buf.Bytes(), err
+}
+
 func runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd string) error {
 	cmdParts := strings.Fields(homebrewUpgradeCmd)
 	if len(cmdParts) == 0 {
 		return fmt.Errorf("empty Homebrew upgrade command")
 	}
+	return runHomebrewUpgradeWith(&execBrewRunner{bin: cmdParts[0]}, homebrewUpgradeCmd)
+}
 
-	brewBin := cmdParts[0]
-	refreshCmd := exec.Command(brewBin, "update")
-	refreshCmd.Stdout = os.Stdout
-	refreshCmd.Stderr = os.Stderr
-	refreshCmd.Stdin = os.Stdin
-	if err := refreshCmd.Run(); err != nil {
+// runHomebrewUpgradeWith executes `brew update` then `brew <upgrade args>` via
+// the supplied runner. It fails loudly when brew exits 0 but its output shows
+// the formula was refused (e.g. "Warning: agent-deck X.Y.Z already installed")
+// — see #954, reported by @alexandergharibian.
+func runHomebrewUpgradeWith(r brewRunner, homebrewUpgradeCmd string) error {
+	cmdParts := strings.Fields(homebrewUpgradeCmd)
+	if len(cmdParts) == 0 {
+		return fmt.Errorf("empty Homebrew upgrade command")
+	}
+
+	if _, err := r.Run("update"); err != nil {
 		return fmt.Errorf("failed to refresh Homebrew metadata: %w", err)
 	}
 
-	upgradeCmd := exec.Command(brewBin, cmdParts[1:]...)
-	upgradeCmd.Stdout = os.Stdout
-	upgradeCmd.Stderr = os.Stderr
-	upgradeCmd.Stdin = os.Stdin
-	if err := upgradeCmd.Run(); err != nil {
+	out, err := r.Run(cmdParts[1:]...)
+	if err != nil {
 		return fmt.Errorf("failed to run `%s`: %w", homebrewUpgradeCmd, err)
 	}
 
+	if brewRefusedUpgrade(string(out)) {
+		return fmt.Errorf(
+			"brew did not upgrade agent-deck; the tap formula may be stale (#954). "+
+				"Try `brew untap asheshgoplani/tap && brew tap asheshgoplani/tap && %s`, "+
+				"or download the latest release directly from GitHub. brew output: %s",
+			homebrewUpgradeCmd,
+			strings.TrimSpace(string(out)),
+		)
+	}
+
 	return nil
+}
+
+// brewRefusedUpgrade reports whether `brew upgrade` output indicates brew
+// declined to install a new version. Brew prints "Warning: <formula> X.Y.Z
+// already installed" and exits 0 in that case — exactly the lying-success
+// path that #954 surfaced.
+func brewRefusedUpgrade(output string) bool {
+	return strings.Contains(strings.ToLower(output), "already installed")
 }
 
 // displayChangelog fetches and displays changelog between versions
