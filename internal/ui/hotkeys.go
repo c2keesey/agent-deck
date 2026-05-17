@@ -43,6 +43,7 @@ const (
 	hotkeyReload          = "reload"
 	hotkeyDetach          = "detach"
 	hotkeyMRUCycle        = "mru_cycle"
+	hotkeyTeardown        = "teardown"
 )
 
 var hotkeyActionOrder = []string{
@@ -81,6 +82,7 @@ var hotkeyActionOrder = []string{
 	hotkeyDetach,
 	hotkeyMRUCycle,
 	hotkeyWatcherPanel,
+	hotkeyTeardown,
 }
 
 var defaultHotkeyBindings = map[string]string{
@@ -100,7 +102,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyTogglePreview:   "v",
 	hotkeyMarkUnread:      "u",
 	hotkeyQuickApprove:    "a",
-	hotkeyToggleYolo:      "y",
+	hotkeyToggleYolo:      "",
 	hotkeyQuickFork:       "f",
 	hotkeyForkWithOptions: "z",
 	hotkeyCopyOutput:      "c",
@@ -119,6 +121,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyDetach:          "ctrl+q",
 	hotkeyMRUCycle:        "ctrl+w",
 	hotkeyWatcherPanel:    "",
+	hotkeyTeardown:        "y",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{

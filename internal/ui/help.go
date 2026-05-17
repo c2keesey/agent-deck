@@ -199,6 +199,7 @@ func (h *HelpOverlay) View() string {
 	groupKey := h.key(hotkeyCreateGroup, "g")
 	undoKey := h.key(hotkeyUndoDelete, "Ctrl+Z")
 	mruKey := h.key(hotkeyMRUCycle, "Ctrl+W")
+	teardownKey := h.key(hotkeyTeardown, "y")
 
 	sections := []struct {
 		title string
@@ -239,6 +240,7 @@ func (h *HelpOverlay) View() string {
 				{restartKey, "Restart session"},
 				{hardRestartKey, "Hard restart (fresh session)"},
 				{restartFreshKey, "Restart with new session ID"},
+				{teardownKey, "Teardown (send !gr + /clear)"},
 				{deleteKey, "Delete session"},
 				{closeKey, "Close session process"},
 				{undoKey, "Undo delete"},

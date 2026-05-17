@@ -664,6 +664,12 @@ type sendOutputResultMsg struct {
 	err         error
 }
 
+// teardownResultMsg is sent when async teardown send completes
+type teardownResultMsg struct {
+	title string
+	err   error
+}
+
 // remoteSessionsFetchedMsg is sent when async remote sessions fetch completes.
 type remoteSessionsFetchedMsg struct {
 	sessions map[string][]session.RemoteSessionInfo
@@ -4650,6 +4656,14 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case teardownResultMsg:
+		if msg.err != nil {
+			h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
+		} else {
+			h.setError(fmt.Errorf("Teardown sent to '%s' (!gr + /clear)", msg.title))
+		}
+		return h, nil
+
 	case watcherEventMsg:
 		// Refresh watcher panel data on new events and re-register listener.
 		h.refreshWatcherPanel()
@@ -6460,11 +6474,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Quick create: auto-generated name, smart defaults from group context
 		return h, h.quickCreateSession()
 
-	case "z":
-		h.zoxidePicker.SetSize(h.width, h.height)
-		h.zoxidePicker.Show()
-		return h, nil
-
 	case "d":
 		// Show confirmation dialog before deletion (prevents accidental deletion)
 		if h.cursor < len(h.flatItems) {
@@ -6507,23 +6516,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		return h, nil
-
-	case "ctrl+x":
-		// Bulk remove all errored sessions from the registry.
-		count := 0
-		h.instancesMu.RLock()
-		for _, inst := range h.instances {
-			if inst.Status == session.StatusError {
-				count++
-			}
-		}
-		h.instancesMu.RUnlock()
-		if count == 0 {
-			h.setError(fmt.Errorf("no errored sessions to remove"))
-			return h, nil
-		}
-		h.confirmDialog.ShowBulkRemoveErrored(count)
 		return h, nil
 
 	case "i":
@@ -6582,56 +6574,24 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "y":
-		// Toggle YOLO mode for Gemini or Codex sessions (requires restart)
+		// Teardown: rename session to "o", move to "maia/standby", restart,
+		// then send `!gr` + `/clear`. Mirrors the MAIA `/teardown` skill end-state.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
 				inst := item.Session
-				toggled := false
-
-				switch inst.Tool {
-				case "gemini":
-					currentYolo := false
-					if inst.GeminiYoloMode != nil {
-						currentYolo = *inst.GeminiYoloMode
-					} else {
-						userConfig, _ := session.LoadUserConfig()
-						if userConfig != nil {
-							currentYolo = userConfig.Gemini.YoloMode
-						}
-					}
-					newYolo := !currentYolo
-					inst.GeminiYoloMode = &newYolo
-					toggled = true
-
-				case "codex":
-					currentYolo := false
-					opts := inst.GetCodexOptions()
-					if opts != nil && opts.YoloMode != nil {
-						currentYolo = *opts.YoloMode
-					} else {
-						userConfig, _ := session.LoadUserConfig()
-						if userConfig != nil {
-							currentYolo = userConfig.Codex.YoloMode
-						}
-					}
-					newYolo := !currentYolo
-					if opts == nil {
-						opts = &session.CodexOptions{}
-					}
-					opts.YoloMode = &newYolo
-					_ = inst.SetCodexOptions(opts)
-					toggled = true
-				}
-
-				if toggled {
-					h.saveInstances()
-					if inst.GetStatusThreadSafe() == session.StatusRunning ||
-						inst.GetStatusThreadSafe() == session.StatusWaiting {
-						h.resumingSessions[inst.ID] = time.Now()
-						return h, h.restartSession(inst)
-					}
-				}
+				inst.Title = "o"
+				inst.SyncTmuxDisplayName()
+				h.pendingTitleChanges[inst.ID] = "o"
+				h.invalidatePreviewCache(inst.ID)
+				h.groupTree.MoveSessionToGroup(inst, "maia/standby")
+				h.instancesMu.Lock()
+				h.instances = h.groupTree.GetAllInstances()
+				h.instancesMu.Unlock()
+				h.rebuildFlatItems()
+				h.saveInstances()
+				h.resumingSessions[inst.ID] = time.Now()
+				return h, h.teardownSession(inst)
 			}
 		}
 		return h, nil
@@ -13874,6 +13834,31 @@ func (h *Home) sendOutputToSession(source, target *session.Instance) tea.Cmd {
 			targetTitle: target.Title,
 			lineCount:   lineCount,
 		}
+	}
+}
+
+// teardownSession restarts the session, waits for Claude to come up, then sends
+// `!gr` and `/clear` into the fresh pane. The post-restart sleep lets Claude
+// finish booting; the gap after `!gr` lets the worktree reset complete.
+func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(3 * time.Second)
+		if err := s.Restart(); err != nil {
+			return teardownResultMsg{title: s.Title, err: fmt.Errorf("restart: %w", err)}
+		}
+		time.Sleep(3 * time.Second)
+		tmuxSession := s.GetTmuxSession()
+		if tmuxSession == nil {
+			return teardownResultMsg{title: s.Title, err: fmt.Errorf("no tmux pane after restart")}
+		}
+		if err := tmuxSession.SendKeysAndEnter("!gr"); err != nil {
+			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send !gr: %w", err)}
+		}
+		time.Sleep(3 * time.Second)
+		if err := tmuxSession.SendKeysAndEnter("/clear"); err != nil {
+			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send /clear: %w", err)}
+		}
+		return teardownResultMsg{title: s.Title}
 	}
 }
 
