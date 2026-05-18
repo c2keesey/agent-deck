@@ -164,9 +164,11 @@ func (h *HelpOverlay) View() string {
 	}
 
 	// Define help sections
-	newKeys := h.keyPair(hotkeyNewSession, hotkeyQuickCreate, "n/a")
-	forkKeys := h.keyPair(hotkeyQuickFork, hotkeyForkWithOptions, "f/z")
-	reorderKeys := "K / J"
+	newKeys := h.keyPair(hotkeyNewSession, hotkeyQuickCreate, "n/N")
+	forkKeys := h.keyPair(hotkeyQuickFork, hotkeyForkWithOptions, "f/F")
+	reorderUpKeys := "+ / K / Shift+↑"
+	reorderDownKeys := "- / J / Shift+↓"
+	indentKeys := "Shift+→/←"
 	searchKey := h.key(hotkeySearch, "/")
 	settingsKey := h.key(hotkeySettings, "p")
 	helpKey := h.key(hotkeyHelp, "?")
@@ -181,6 +183,7 @@ func (h *HelpOverlay) View() string {
 	renameKey := h.key(hotkeyRename, "r")
 	moveKey := h.key(hotkeyMoveToGroup, "o")
 	mcpKey := h.key(hotkeyMCPManager, "m")
+	pluginKey := h.key(hotkeyPluginManager, "L")
 	skillsKey := h.key(hotkeySkillsManager, "s")
 	previewKey := h.key(hotkeyTogglePreview, "v")
 	unreadKey := h.key(hotkeyMarkUnread, "u")
@@ -246,12 +249,15 @@ func (h *HelpOverlay) View() string {
 				{undoKey, "Undo delete"},
 				{moveKey, "Move to group"},
 				{mcpKey, "MCP Manager (Claude/Gemini)"},
+				{pluginKey, "Plugin Manager (Claude — RFC PLUGIN_ATTACH.md)"},
 				{skillsKey, "Skills Manager"},
 				{"$", "Cost Dashboard"},
 				{previewKey, "Toggle preview mode (output/stats/both)"},
 				{unreadKey, "Mark unread"},
 				{quickApproveKey, "Quick approve (send '1' to Claude)"},
-				{reorderKeys, "Reorder up/down"},
+				{reorderUpKeys, "Reorder up (auto-promote at edge)"},
+				{reorderDownKeys, "Reorder down (auto-promote at edge)"},
+				{indentKeys, "Indent / outdent (in group)"},
 				{forkKeys, "Fork session (Claude only)"},
 				{copyKey, "Copy output to clipboard"},
 				{"C", "Copy preview info (Repo / Path / Branch)"},

@@ -61,6 +61,16 @@ func handleLaunch(profile string, args []string) {
 		return nil
 	})
 
+	// Plugin enablement flag — repeatable, catalog-only, claude-only.
+	// Mirrors handleAdd's --plugin; resolved at spawn through
+	// [plugins.<name>] in ~/.agent-deck/config.toml (RFC docs/rfc/PLUGIN_ATTACH.md).
+	var pluginFlags []string
+	fs.Func("plugin", "Catalog plugin to enable for this session (can specify multiple times); requires -c claude", func(s string) error {
+		pluginFlags = append(pluginFlags, s)
+		return nil
+	})
+	noChannelLink := fs.Bool("no-channel-link", false, "Disable auto-link between --plugin entries with emits_channel=true and --channel")
+
 	// Extra claude CLI tokens - repeatable; mirrors handleAdd's --extra-arg.
 	// Each invocation contributes one already-tokenised arg; feeds
 	// Instance.ExtraArgs which buildClaudeExtraFlags shellescapes and appends.
@@ -73,6 +83,7 @@ func handleLaunch(profile string, args []string) {
 
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume")
+	modelID := fs.String("model", "", "Model ID/version to use for this session (claude, codex, gemini, opencode)")
 
 	// Socket isolation (v1.7.50+, issue #687). Same semantics as
 	// `agent-deck add --tmux-socket`: overrides `[tmux].socket_name` for
@@ -93,6 +104,8 @@ func handleLaunch(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  agent-deck launch . -c claude")
+		fmt.Println("  agent-deck launch . -c codex --model gpt-5.5")
+		fmt.Println("  agent-deck launch . -c gemini --model gemini-3.1-pro-preview")
 		fmt.Println("  agent-deck launch . -c claude -m \"Explain this codebase\"")
 		fmt.Println("  agent-deck launch /path/to/project -t \"My Agent\" -c claude -g work")
 		fmt.Println("  agent-deck launch . -c claude --mcp memory -m \"Research topic X\"")
@@ -248,7 +261,13 @@ func handleLaunch(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Resolve parent session if specified
+	// Resolve parent session if specified.
+	// Issue #972: when no explicit -g is passed, prefer the cwd-derived
+	// project group over the parent's group, so conductor-spawned children
+	// land in the project group (e.g. `agent-deck`) instead of the
+	// conductor's own group (`conductor`). The parent group is now a
+	// fallback for path mappings that produce no group.
+	cwdDerivedGroup := session.GroupPathForProject(path)
 	var parentInstance *session.Instance
 	if sessionParent != "" {
 		var errMsg string
@@ -261,11 +280,11 @@ func handleLaunch(profile string, args []string) {
 			out.Error("cannot create sub-session of a sub-session (single level only)", ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
-		sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+		sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided)
 	} else if !*noParent {
 		parentInstance = resolveAutoParentInstance(instances)
 		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+			sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided)
 		} else {
 			parentInstance = nil
 		}
@@ -335,6 +354,23 @@ func handleLaunch(profile string, args []string) {
 		newInstance.Channels = channelFlags
 	}
 
+	// Apply --plugin flags (catalog-only, claude-only, RFC docs/rfc/PLUGIN_ATTACH.md).
+	if len(pluginFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			out.Error("--plugin only supported for claude sessions (use -c claude); plugins enable Claude Code plugin features per-session via enabledPlugins", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		if err := validatePluginFlags(pluginFlags); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		newInstance.Plugins = pluginFlags
+		newInstance.PluginChannelLinkDisabled = *noChannelLink
+		applyPluginChannelAutolink(newInstance)
+	} else if *noChannelLink {
+		newInstance.PluginChannelLinkDisabled = true
+	}
+
 	// Apply --extra-arg flags (claude only; mirror of handleAdd).
 	if len(extraArgFlags) > 0 {
 		if newInstance.Tool != "claude" {
@@ -346,6 +382,14 @@ func handleLaunch(profile string, args []string) {
 
 	if sessionWrapperResolved != "" {
 		newInstance.Wrapper = sessionWrapperResolved
+	}
+
+	selectedModelID := strings.TrimSpace(*modelID)
+	if selectedModelID != "" {
+		if err := applyCLIModelOverride(newInstance, selectedModelID); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
 	}
 
 	if worktreePath != "" {
@@ -368,7 +412,8 @@ func handleLaunch(profile string, args []string) {
 		_ = newInstance.SetClaudeOptions(opts)
 	}
 
-	// Add to instances and save
+	// Add to instances list (in-memory only — used for downstream
+	// group cap math and the second SaveWithGroups after PostStartSync).
 	instances = append(instances, newInstance)
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
@@ -376,7 +421,13 @@ func handleLaunch(profile string, args []string) {
 		groupTree.CreateGroup(newInstance.GroupPath)
 	}
 
-	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+	// v1.9.x issue #1031: targeted single-row insert + verify, NOT the
+	// load-modify-write SaveWithGroups rewrite. SaveWithGroups under
+	// concurrent launches loses sibling rows via the DELETE-NOT-IN
+	// sweep inside SaveInstances; InsertSessionAndVerify uses
+	// SaveInstance (single-row INSERT OR REPLACE) + verify-with-backoff
+	// to guarantee persistence. Mirror of RemoveSessionAndVerify (#909).
+	if err := storage.InsertSessionAndVerify(newInstance, groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -403,27 +454,48 @@ func handleLaunch(profile string, args []string) {
 	maxC := session.GroupMaxConcurrent(tree, newInstance.GroupPath)
 	if session.ShouldQueue(instances, newInstance.GroupPath, maxC) {
 		newInstance.Status = session.StatusQueued
-		if err := saveSessionData(storage, instances, groups); err != nil {
+		// v1.9.x issue #1031: same targeted single-row pattern as the
+		// initial insert above — saveSessionData → SaveWithGroups is
+		// the load-modify-write rewrite that loses sibling launches'
+		// rows under concurrency.
+		if err := storage.InsertSessionAndVerify(newInstance, tree); err != nil {
 			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
-		out.Success(
-			fmt.Sprintf("Queued session: %s (group at cap %d)", newInstance.Title, maxC),
-			map[string]interface{}{
-				"success":        true,
-				"id":             newInstance.ID,
-				"title":          newInstance.Title,
-				"status":         "queued",
-				"group":          newInstance.GroupPath,
-				"max_concurrent": maxC,
-			},
-		)
+		queuedJSON := map[string]interface{}{
+			"success":        true,
+			"id":             newInstance.ID,
+			"title":          newInstance.Title,
+			"status":         "queued",
+			"group":          newInstance.GroupPath,
+			"max_concurrent": maxC,
+		}
+		addModelInfoJSON(queuedJSON, newInstance.LaunchModelInfo())
+		out.Success(fmt.Sprintf("Queued session: %s (group at cap %d)", newInstance.Title, maxC), queuedJSON)
 		return
 	}
+
+	// Issue #955: strip TELEGRAM_STATE_DIR from the agent-deck CLI
+	// process env before the tmux server inherits it on the first
+	// `new-session`. No-op for conductors and explicit telegram
+	// channel owners — they legitimately own the bot token. Sits
+	// above the S8 exec-layer (env -u TELEGRAM_STATE_DIR claude …)
+	// so even non-claude descendants of the pane (Bash-tool spawns,
+	// fork claudes, restart respawn) start with a clean env.
+	session.ScrubProcessEnvForChildLaunch(newInstance)
 
 	// Start the session.
 	// - default: StartWithMessage waits for readiness and delivers initial prompt
 	// - --no-wait: start immediately, then fire-and-forget send below
+	//
+	// Issue #964: gate the spawn through a process-wide semaphore so a burst
+	// of parallel `agent-deck launch` calls cannot cascade into swap thrash +
+	// fork:ENOMEM. Cap defaults to defaultMaxParallelLaunch (3) and honours
+	// AGENT_DECK_MAX_PARALLEL_LAUNCH.
+	throttle := defaultLaunchThrottle()
+	throttle.Acquire()
+	defer throttle.Release()
+
 	if initialMessage != "" && !*noWait {
 		if err := newInstance.StartWithMessage(initialMessage); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
@@ -439,8 +511,18 @@ func handleLaunch(profile string, args []string) {
 	// Capture session ID from tmux
 	newInstance.PostStartSync(3 * time.Second)
 
-	// Save again with updated state (session ID, tmux name)
-	if err := saveSessionData(storage, instances, groups); err != nil {
+	// v1.9.x issue #1031: third save point — fields populated by
+	// PostStartSync (tmux session name, ClaudeSessionID once detected)
+	// land on `newInstance`. Same targeted single-row insert/upsert
+	// pattern as the two saves above; the load-modify-write
+	// saveSessionData → SaveWithGroups path would let a sibling
+	// launch's row be silently DELETE'd by this rewrite's
+	// `DELETE FROM instances WHERE id NOT IN (...)` step.
+	postStartTree := session.NewGroupTreeWithGroups(instances, groups)
+	if newInstance.GroupPath != "" {
+		postStartTree.CreateGroup(newInstance.GroupPath)
+	}
+	if err := storage.InsertSessionAndVerify(newInstance, postStartTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -472,15 +554,21 @@ func handleLaunch(profile string, args []string) {
 		}
 	}
 
-	// Build output
+	// Build output. v1.9.x issue #1031: surface the new session ID
+	// under an explicit `session_id` key so callers (conductor fleet
+	// spawn loops, shell scripts) don't have to fall back to diffing
+	// `agent-deck list --json` before/after — that diff was unsafe
+	// under the launch-race the structural fix above also closes.
+	// The legacy `id` key is kept for backward compatibility.
 	jsonData := map[string]interface{}{
-		"success": true,
-		"id":      newInstance.ID,
-		"title":   newInstance.Title,
-		"path":    path,
-		"tool":    newInstance.Tool,
-		"group":   newInstance.GroupPath,
-		"profile": storage.Profile(),
+		"success":    true,
+		"id":         newInstance.ID,
+		"session_id": newInstance.ID,
+		"title":      newInstance.Title,
+		"path":       path,
+		"tool":       newInstance.Tool,
+		"group":      newInstance.GroupPath,
+		"profile":    storage.Profile(),
 	}
 	if sessionCommandInput != "" {
 		jsonData["command"] = sessionCommandInput
@@ -506,6 +594,7 @@ func handleLaunch(profile string, args []string) {
 		jsonData["worktree_path"] = worktreePath
 		jsonData["worktree_branch"] = wtBranch
 	}
+	addModelInfoJSON(jsonData, newInstance.LaunchModelInfo())
 
 	msg := fmt.Sprintf("Launched session: %s", newInstance.Title)
 	if initialMessage != "" {

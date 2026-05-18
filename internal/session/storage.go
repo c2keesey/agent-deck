@@ -94,6 +94,23 @@ type InstanceData struct {
 	// Plugin channels (persisted for --channels CLI flag on Claude restart)
 	Channels []string `json:"channels,omitempty"`
 
+	// Plugins is the catalog-key list of Claude Code plugins enabled for
+	// this session (RFC docs/rfc/PLUGIN_ATTACH.md). Resolved through
+	// [plugins.<name>] in ~/.agent-deck/config.toml at spawn time and
+	// emitted as enabledPlugins[<id>] = true in the per-session scratch
+	// settings.json by EnsureWorkerScratchConfigDir.
+	Plugins []string `json:"plugins,omitempty"`
+
+	// PluginChannelLinkDisabled mirrors Instance.PluginChannelLinkDisabled
+	// (RFC §4.7) for state.db round-trip.
+	PluginChannelLinkDisabled bool `json:"plugin_channel_link_disabled,omitempty"`
+
+	// AutoLinkedChannels mirrors Instance.AutoLinkedChannels (RFC §4.7,
+	// fixes G4/C2). Persisted so reconciliation can clean up channels
+	// auto-added in a previous session even after the user toggles
+	// PluginChannelLinkDisabled or removes the plugin from the catalog.
+	AutoLinkedChannels []string `json:"auto_linked_channels,omitempty"`
+
 	// User-supplied claude CLI tokens, appended to every start/resume/fork
 	// command. Persisted so restarts preserve custom flags like --agent/--model.
 	ExtraArgs []string `json:"extra_args,omitempty"`
@@ -286,83 +303,11 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 	// Convert instances to database rows
 	rows := make([]*statedb.InstanceRow, len(instances))
 	for i, inst := range instances {
-		// Issue #666: belt-and-braces guard. Empty GroupPath should never
-		// reach SQLite — the load-time fallback at convertToInstances already
-		// covers legacy rows, but a regression in a write path (fork, move,
-		// direct mutation) could still slip through. Normalize here so the
-		// next load doesn't need to defend.
-		if inst.GroupPath == "" {
-			storageLog.Warn(
-				"empty_group_path_normalized_on_save",
-				slog.String("instance_id", inst.ID),
-				slog.String("title", inst.Title),
-				slog.String("project_path", inst.ProjectPath),
-				slog.String("normalized_to", DefaultGroupPath),
-			)
-			inst.GroupPath = DefaultGroupPath
+		row, err := instanceToRow(inst)
+		if err != nil {
+			return err
 		}
-		tmuxName := ""
-		if inst.tmuxSession != nil {
-			tmuxName = inst.tmuxSession.Name
-		}
-		var sandboxJSON json.RawMessage
-		if inst.Sandbox != nil {
-			data, err := json.Marshal(inst.Sandbox)
-			if err != nil {
-				return fmt.Errorf("failed to marshal sandbox for %s: %w", inst.ID, err)
-			}
-			sandboxJSON = data
-		}
-
-		var mrWorktrees []statedb.MultiRepoWorktreeData
-		for _, wt := range inst.MultiRepoWorktrees {
-			mrWorktrees = append(mrWorktrees, statedb.MultiRepoWorktreeData{
-				OriginalPath: wt.OriginalPath,
-				WorktreePath: wt.WorktreePath,
-				RepoRoot:     wt.RepoRoot,
-				Branch:       wt.Branch,
-			})
-		}
-		toolData := statedb.MarshalToolData(
-			inst.ClaudeSessionID, inst.ClaudeDetectedAt,
-			inst.GeminiSessionID, inst.GeminiDetectedAt,
-			inst.GeminiYoloMode, inst.GeminiModel,
-			inst.OpenCodeSessionID, inst.OpenCodeDetectedAt,
-			inst.CodexSessionID, inst.CodexDetectedAt,
-			inst.LatestPrompt, inst.Notes, inst.LoadedMCPNames,
-			inst.ToolOptionsJSON,
-			sandboxJSON, inst.SandboxContainer,
-			inst.SSHHost, inst.SSHRemotePath,
-			inst.MultiRepoEnabled, inst.AdditionalPaths,
-			inst.MultiRepoTempDir, mrWorktrees,
-			inst.Channels,
-			inst.ExtraArgs,
-			inst.Color, // issue #391
-		)
-
-		rows[i] = &statedb.InstanceRow{
-			ID:                 inst.ID,
-			Title:              inst.Title,
-			ProjectPath:        inst.ProjectPath,
-			GroupPath:          inst.GroupPath,
-			Order:              inst.Order,
-			Command:            inst.Command,
-			Wrapper:            inst.Wrapper,
-			Tool:               inst.Tool,
-			Status:             string(inst.Status),
-			TmuxSession:        tmuxName,
-			TmuxSocketName:     inst.TmuxSocketName,
-			CreatedAt:          inst.CreatedAt,
-			LastAccessed:       inst.LastAccessedAt,
-			ParentSessionID:    inst.ParentSessionID,
-			IsConductor:        inst.IsConductor,
-			NoTransitionNotify: inst.NoTransitionNotify,
-			TitleLocked:        inst.TitleLocked,
-			WorktreePath:       inst.WorktreePath,
-			WorktreeRepo:       inst.WorktreeRepoRoot,
-			WorktreeBranch:     inst.WorktreeBranch,
-			ToolData:           toolData,
-		}
+		rows[i] = row
 	}
 
 	if err := s.db.SaveInstances(rows); err != nil {
@@ -507,6 +452,211 @@ func (s *Storage) RemoveSessionAndVerify(id string, remainingInstances []*Instan
 	return nil
 }
 
+// ErrInsertNotPersistent is returned by InsertSessionAndVerify when, after
+// retries, the row is still missing from the database. The most likely cause
+// is a concurrent SaveInstances rewrite from another agent-deck process
+// that loaded the instances slice before this INSERT landed and then
+// DELETE'd the row via the `DELETE FROM instances WHERE id NOT IN (...)`
+// step inside SaveInstances.
+//
+// Surfacing this as a real error (rather than silently returning success)
+// is the user-facing half of the issue #1031 fix.
+var ErrInsertNotPersistent = errors.New("insert not persistent: row dropped by concurrent writer")
+
+// insertVerifyAttempts and insertVerifyBackoff control the post-commit
+// verify loop inside InsertSessionAndVerify. The defaults absorb the
+// bounded window in which a competing rewriter can DELETE this row
+// before its own SaveInstances commits (parallel xargs -P N launches).
+// Tests override via the package-private setters so they don't sit
+// through the production backoff schedule.
+var (
+	insertVerifyAttempts = 6
+	insertVerifyBackoff  = []time.Duration{
+		20 * time.Millisecond,
+		40 * time.Millisecond,
+		80 * time.Millisecond,
+		160 * time.Millisecond,
+		320 * time.Millisecond,
+	}
+)
+
+// InsertSessionAndVerify performs a durable single-row session insert.
+//
+// Flow (v1.9.x issue #1031 fix, parallel to #909's RemoveSessionAndVerify):
+//
+//  1. SaveInstance(row) — targeted INSERT OR REPLACE on the single new
+//     row only, NOT a full-table rewrite. This sidesteps the
+//     load-modify-write race where a sibling launch's
+//     `DELETE FROM instances WHERE id NOT IN (...)` inside
+//     SaveInstances would silently delete this row.
+//  2. SaveGroupsOnly(groupTree) — persist any group structure changes
+//     WITHOUT rewriting the instances table. Rewriting (SaveWithGroups)
+//     is the load-modify-write pattern that lets a concurrent launch
+//     drop this row; skipping it eliminates the structural race for
+//     our own write.
+//  3. Verify InstanceExists(id) is true. If not (some other process
+//     issued a SaveInstances rewrite that excluded this row because it
+//     loaded the instances slice pre-INSERT), re-issue the targeted
+//     INSERT and loop with linear backoff.
+//  4. After exhausting attempts, return ErrInsertNotPersistent so the
+//     caller can fail loudly instead of returning success on a row
+//     that's not actually there.
+//
+// instances is the post-insert session list, used only to compute group
+// sort_order / membership for SaveGroupsOnly. groupTree may be nil if
+// the caller doesn't care to persist groups.
+func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *GroupTree) error {
+	if newInstance == nil {
+		return fmt.Errorf("nil instance")
+	}
+	row, err := instanceToRow(newInstance)
+	if err != nil {
+		return err
+	}
+
+	if err := s.saveSingleInstance(row); err != nil {
+		return err
+	}
+
+	if groupTree != nil {
+		if err := s.SaveGroupsOnly(groupTree); err != nil {
+			return fmt.Errorf("failed to save groups during insert: %w", err)
+		}
+	}
+
+	for attempt := 0; attempt < insertVerifyAttempts; attempt++ {
+		exists, err := s.InstanceExists(newInstance.ID)
+		if err != nil {
+			return fmt.Errorf("verify insert of %s: %w", newInstance.ID, err)
+		}
+		if exists {
+			return nil
+		}
+		if attempt < len(insertVerifyBackoff) {
+			time.Sleep(insertVerifyBackoff[attempt])
+		}
+		// Re-issue the targeted INSERT; races against the concurrent
+		// rewriter but eventually wins because every retry shrinks the
+		// window.
+		if err := s.saveSingleInstance(row); err != nil {
+			return err
+		}
+	}
+
+	exists, err := s.InstanceExists(newInstance.ID)
+	if err != nil {
+		return fmt.Errorf("verify insert of %s: %w", newInstance.ID, err)
+	}
+	if exists {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrInsertNotPersistent, newInstance.ID)
+}
+
+// saveSingleInstance writes one row via the targeted SaveInstance path
+// (single-row INSERT OR REPLACE — no DELETE-NOT-IN sweep). Wraps the
+// statedb call in the storage mutex and the nil-db guard so callers
+// stay symmetric with DeleteInstance.
+func (s *Storage) saveSingleInstance(row *statedb.InstanceRow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
+	}
+	if err := s.db.SaveInstance(row); err != nil {
+		return fmt.Errorf("failed to save instance %s: %w", row.ID, err)
+	}
+	_ = s.db.Touch()
+	return nil
+}
+
+// instanceToRow converts a session.Instance into the statedb row shape.
+// Shared by SaveWithGroups (bulk path) and InsertSessionAndVerify
+// (targeted single-row path) so the marshal/normalize logic stays in
+// one place.
+func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
+	// Issue #666: belt-and-braces guard. Empty GroupPath should never
+	// reach SQLite — the load-time fallback at convertToInstances already
+	// covers legacy rows, but a regression in a write path (fork, move,
+	// direct mutation) could still slip through. Normalize here so the
+	// next load doesn't need to defend.
+	if inst.GroupPath == "" {
+		storageLog.Warn(
+			"empty_group_path_normalized_on_save",
+			slog.String("instance_id", inst.ID),
+			slog.String("title", inst.Title),
+			slog.String("project_path", inst.ProjectPath),
+			slog.String("normalized_to", DefaultGroupPath),
+		)
+		inst.GroupPath = DefaultGroupPath
+	}
+	tmuxName := ""
+	if inst.tmuxSession != nil {
+		tmuxName = inst.tmuxSession.Name
+	}
+	var sandboxJSON json.RawMessage
+	if inst.Sandbox != nil {
+		data, err := json.Marshal(inst.Sandbox)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal sandbox for %s: %w", inst.ID, err)
+		}
+		sandboxJSON = data
+	}
+
+	var mrWorktrees []statedb.MultiRepoWorktreeData
+	for _, wt := range inst.MultiRepoWorktrees {
+		mrWorktrees = append(mrWorktrees, statedb.MultiRepoWorktreeData{
+			OriginalPath: wt.OriginalPath,
+			WorktreePath: wt.WorktreePath,
+			RepoRoot:     wt.RepoRoot,
+			Branch:       wt.Branch,
+		})
+	}
+	toolData := statedb.MarshalToolData(
+		inst.ClaudeSessionID, inst.ClaudeDetectedAt,
+		inst.GeminiSessionID, inst.GeminiDetectedAt,
+		inst.GeminiYoloMode, inst.GeminiModel,
+		inst.OpenCodeSessionID, inst.OpenCodeDetectedAt,
+		inst.CodexSessionID, inst.CodexDetectedAt,
+		inst.LatestPrompt, inst.Notes, inst.LoadedMCPNames,
+		inst.ToolOptionsJSON,
+		sandboxJSON, inst.SandboxContainer,
+		inst.SSHHost, inst.SSHRemotePath,
+		inst.MultiRepoEnabled, inst.AdditionalPaths,
+		inst.MultiRepoTempDir, mrWorktrees,
+		inst.Channels,
+		inst.ExtraArgs,
+		inst.Plugins,                   // RFC docs/rfc/PLUGIN_ATTACH.md
+		inst.PluginChannelLinkDisabled, // RFC §4.7
+		inst.AutoLinkedChannels,        // RFC §4.7 (G4/C2 fix)
+		inst.Color,                     // issue #391
+	)
+
+	return &statedb.InstanceRow{
+		ID:                 inst.ID,
+		Title:              inst.Title,
+		ProjectPath:        inst.ProjectPath,
+		GroupPath:          inst.GroupPath,
+		Order:              inst.Order,
+		Command:            inst.Command,
+		Wrapper:            inst.Wrapper,
+		Tool:               inst.Tool,
+		Status:             string(inst.Status),
+		TmuxSession:        tmuxName,
+		TmuxSocketName:     inst.TmuxSocketName,
+		CreatedAt:          inst.CreatedAt,
+		LastAccessed:       inst.LastAccessedAt,
+		ParentSessionID:    inst.ParentSessionID,
+		IsConductor:        inst.IsConductor,
+		NoTransitionNotify: inst.NoTransitionNotify,
+		TitleLocked:        inst.TitleLocked,
+		WorktreePath:       inst.WorktreePath,
+		WorktreeRepo:       inst.WorktreeRepoRoot,
+		WorktreeBranch:     inst.WorktreeBranch,
+		ToolData:           toolData,
+	}, nil
+}
+
 // SaveGroupsOnly persists only the groups table to SQLite.
 // This is a lightweight save for visual state like group expanded/collapsed.
 // It does NOT call Touch() to avoid triggering StorageWatcher reloads on other instances.
@@ -586,55 +736,61 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			mrTempDir2, mrWorktrees2,
 			channels2,
 			extraArgs2,
+			plugins2,
+			pluginChannelLinkDisabled2,
+			autoLinkedChannels2,
 			color2 := statedb.UnmarshalToolData(r.ToolData)
 		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		instances[i] = &InstanceData{
-			ID:                 r.ID,
-			Title:              r.Title,
-			ProjectPath:        r.ProjectPath,
-			GroupPath:          r.GroupPath,
-			Order:              r.Order,
-			ParentSessionID:    r.ParentSessionID,
-			IsConductor:        r.IsConductor,
-			NoTransitionNotify: r.NoTransitionNotify,
-			TitleLocked:        r.TitleLocked,
-			Command:            r.Command,
-			Wrapper:            r.Wrapper,
-			Tool:               r.Tool,
-			Status:             Status(r.Status),
-			CreatedAt:          r.CreatedAt,
-			LastAccessedAt:     r.LastAccessed,
-			TmuxSession:        r.TmuxSession,
-			TmuxSocketName:     r.TmuxSocketName,
-			WorktreePath:       r.WorktreePath,
-			WorktreeRepoRoot:   r.WorktreeRepo,
-			WorktreeBranch:     r.WorktreeBranch,
-			ClaudeSessionID:    claudeSID,
-			ClaudeDetectedAt:   claudeAt,
-			GeminiSessionID:    geminiSID,
-			GeminiDetectedAt:   geminiAt,
-			GeminiYoloMode:     geminiYolo,
-			GeminiModel:        geminiModel,
-			OpenCodeSessionID:  opencodeSID,
-			OpenCodeDetectedAt: opencodeAt,
-			CodexSessionID:     codexSID,
-			CodexDetectedAt:    codexAt,
-			LatestPrompt:       latestPrompt,
-			Notes:              notes,
-			ToolOptionsJSON:    toolOpts,
-			LoadedMCPNames:     loadedMCPs,
-			Sandbox:            sandboxCfg,
-			SandboxContainer:   sandboxContainer,
-			SSHHost:            sshHost2,
-			SSHRemotePath:      sshRemotePath2,
-			MultiRepoEnabled:   mrEnabled2,
-			AdditionalPaths:    addPaths2,
-			MultiRepoTempDir:   mrTempDir2,
-			MultiRepoWorktrees: mrWorktrees2,
-			Channels:           channels2,
-			ExtraArgs:          extraArgs2,
-			Color:              color2,
+			ID:                        r.ID,
+			Title:                     r.Title,
+			ProjectPath:               r.ProjectPath,
+			GroupPath:                 r.GroupPath,
+			Order:                     r.Order,
+			ParentSessionID:           r.ParentSessionID,
+			IsConductor:               r.IsConductor,
+			NoTransitionNotify:        r.NoTransitionNotify,
+			TitleLocked:               r.TitleLocked,
+			Command:                   r.Command,
+			Wrapper:                   r.Wrapper,
+			Tool:                      r.Tool,
+			Status:                    Status(r.Status),
+			CreatedAt:                 r.CreatedAt,
+			LastAccessedAt:            r.LastAccessed,
+			TmuxSession:               r.TmuxSession,
+			TmuxSocketName:            r.TmuxSocketName,
+			WorktreePath:              r.WorktreePath,
+			WorktreeRepoRoot:          r.WorktreeRepo,
+			WorktreeBranch:            r.WorktreeBranch,
+			ClaudeSessionID:           claudeSID,
+			ClaudeDetectedAt:          claudeAt,
+			GeminiSessionID:           geminiSID,
+			GeminiDetectedAt:          geminiAt,
+			GeminiYoloMode:            geminiYolo,
+			GeminiModel:               geminiModel,
+			OpenCodeSessionID:         opencodeSID,
+			OpenCodeDetectedAt:        opencodeAt,
+			CodexSessionID:            codexSID,
+			CodexDetectedAt:           codexAt,
+			LatestPrompt:              latestPrompt,
+			Notes:                     notes,
+			ToolOptionsJSON:           toolOpts,
+			LoadedMCPNames:            loadedMCPs,
+			Sandbox:                   sandboxCfg,
+			SandboxContainer:          sandboxContainer,
+			SSHHost:                   sshHost2,
+			SSHRemotePath:             sshRemotePath2,
+			MultiRepoEnabled:          mrEnabled2,
+			AdditionalPaths:           addPaths2,
+			MultiRepoTempDir:          mrTempDir2,
+			MultiRepoWorktrees:        mrWorktrees2,
+			Channels:                  channels2,
+			ExtraArgs:                 extraArgs2,
+			Plugins:                   plugins2,
+			PluginChannelLinkDisabled: pluginChannelLinkDisabled2,
+			AutoLinkedChannels:        autoLinkedChannels2,
+			Color:                     color2,
 		}
 	}
 
@@ -693,55 +849,61 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			mrTempDir, mrWorktrees,
 			channels,
 			extraArgs,
+			plugins,
+			pluginChannelLinkDisabled,
+			autoLinkedChannels,
 			color := statedb.UnmarshalToolData(r.ToolData)
 		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		data.Instances[i] = &InstanceData{
-			ID:                 r.ID,
-			Title:              r.Title,
-			ProjectPath:        r.ProjectPath,
-			GroupPath:          r.GroupPath,
-			Order:              r.Order,
-			ParentSessionID:    r.ParentSessionID,
-			IsConductor:        r.IsConductor,
-			NoTransitionNotify: r.NoTransitionNotify,
-			TitleLocked:        r.TitleLocked,
-			Command:            r.Command,
-			Wrapper:            r.Wrapper,
-			Tool:               r.Tool,
-			Status:             Status(r.Status),
-			CreatedAt:          r.CreatedAt,
-			LastAccessedAt:     r.LastAccessed,
-			TmuxSession:        r.TmuxSession,
-			TmuxSocketName:     r.TmuxSocketName,
-			WorktreePath:       r.WorktreePath,
-			WorktreeRepoRoot:   r.WorktreeRepo,
-			WorktreeBranch:     r.WorktreeBranch,
-			ClaudeSessionID:    claudeSID,
-			ClaudeDetectedAt:   claudeAt,
-			GeminiSessionID:    geminiSID,
-			GeminiDetectedAt:   geminiAt,
-			GeminiYoloMode:     geminiYolo,
-			GeminiModel:        geminiModel,
-			OpenCodeSessionID:  opencodeSID,
-			OpenCodeDetectedAt: opencodeAt,
-			CodexSessionID:     codexSID,
-			CodexDetectedAt:    codexAt,
-			LatestPrompt:       latestPrompt,
-			Notes:              notes,
-			ToolOptionsJSON:    toolOpts,
-			LoadedMCPNames:     loadedMCPs,
-			Sandbox:            sandboxCfg,
-			SandboxContainer:   sandboxContainer,
-			SSHHost:            sshHost,
-			SSHRemotePath:      sshRemotePath,
-			MultiRepoEnabled:   mrEnabled,
-			AdditionalPaths:    addPaths,
-			MultiRepoTempDir:   mrTempDir,
-			MultiRepoWorktrees: mrWorktrees,
-			Channels:           channels,
-			ExtraArgs:          extraArgs,
-			Color:              color,
+			ID:                        r.ID,
+			Title:                     r.Title,
+			ProjectPath:               r.ProjectPath,
+			GroupPath:                 r.GroupPath,
+			Order:                     r.Order,
+			ParentSessionID:           r.ParentSessionID,
+			IsConductor:               r.IsConductor,
+			NoTransitionNotify:        r.NoTransitionNotify,
+			TitleLocked:               r.TitleLocked,
+			Command:                   r.Command,
+			Wrapper:                   r.Wrapper,
+			Tool:                      r.Tool,
+			Status:                    Status(r.Status),
+			CreatedAt:                 r.CreatedAt,
+			LastAccessedAt:            r.LastAccessed,
+			TmuxSession:               r.TmuxSession,
+			TmuxSocketName:            r.TmuxSocketName,
+			WorktreePath:              r.WorktreePath,
+			WorktreeRepoRoot:          r.WorktreeRepo,
+			WorktreeBranch:            r.WorktreeBranch,
+			ClaudeSessionID:           claudeSID,
+			ClaudeDetectedAt:          claudeAt,
+			GeminiSessionID:           geminiSID,
+			GeminiDetectedAt:          geminiAt,
+			GeminiYoloMode:            geminiYolo,
+			GeminiModel:               geminiModel,
+			OpenCodeSessionID:         opencodeSID,
+			OpenCodeDetectedAt:        opencodeAt,
+			CodexSessionID:            codexSID,
+			CodexDetectedAt:           codexAt,
+			LatestPrompt:              latestPrompt,
+			Notes:                     notes,
+			ToolOptionsJSON:           toolOpts,
+			LoadedMCPNames:            loadedMCPs,
+			Sandbox:                   sandboxCfg,
+			SandboxContainer:          sandboxContainer,
+			SSHHost:                   sshHost,
+			SSHRemotePath:             sshRemotePath,
+			MultiRepoEnabled:          mrEnabled,
+			AdditionalPaths:           addPaths,
+			MultiRepoTempDir:          mrTempDir,
+			MultiRepoWorktrees:        mrWorktrees,
+			Channels:                  channels,
+			ExtraArgs:                 extraArgs,
+			Plugins:                   plugins,
+			PluginChannelLinkDisabled: pluginChannelLinkDisabled,
+			AutoLinkedChannels:        autoLinkedChannels,
+			Color:                     color,
 		}
 	}
 
@@ -943,50 +1105,53 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		projectPath := ExpandPath(fixMalformedTildePath(instData.ProjectPath))
 
 		inst := &Instance{
-			ID:                 instData.ID,
-			Title:              instData.Title,
-			ProjectPath:        projectPath,
-			GroupPath:          groupPath,
-			Order:              instData.Order,
-			ParentSessionID:    instData.ParentSessionID,
-			IsConductor:        instData.IsConductor,
-			NoTransitionNotify: instData.NoTransitionNotify,
-			TitleLocked:        instData.TitleLocked,
-			Command:            instData.Command,
-			Wrapper:            instData.Wrapper,
-			Tool:               instData.Tool,
-			Status:             instData.Status,
-			CreatedAt:          instData.CreatedAt,
-			LastAccessedAt:     instData.LastAccessedAt,
-			WorktreePath:       instData.WorktreePath,
-			WorktreeRepoRoot:   instData.WorktreeRepoRoot,
-			WorktreeBranch:     instData.WorktreeBranch,
-			TmuxSocketName:     instData.TmuxSocketName,
-			ClaudeSessionID:    instData.ClaudeSessionID,
-			ClaudeDetectedAt:   instData.ClaudeDetectedAt,
-			GeminiSessionID:    instData.GeminiSessionID,
-			GeminiDetectedAt:   instData.GeminiDetectedAt,
-			GeminiYoloMode:     instData.GeminiYoloMode,
-			GeminiModel:        instData.GeminiModel,
-			OpenCodeSessionID:  instData.OpenCodeSessionID,
-			OpenCodeDetectedAt: instData.OpenCodeDetectedAt,
-			CodexSessionID:     instData.CodexSessionID,
-			CodexDetectedAt:    instData.CodexDetectedAt,
-			ToolOptionsJSON:    instData.ToolOptionsJSON,
-			LatestPrompt:       instData.LatestPrompt,
-			Notes:              instData.Notes,
-			LoadedMCPNames:     instData.LoadedMCPNames,
-			Channels:           instData.Channels,
-			ExtraArgs:          instData.ExtraArgs,
-			Color:              instData.Color,
-			Sandbox:            instData.Sandbox,
-			SandboxContainer:   instData.SandboxContainer,
-			SSHHost:            instData.SSHHost,
-			SSHRemotePath:      instData.SSHRemotePath,
-			MultiRepoEnabled:   instData.MultiRepoEnabled,
-			AdditionalPaths:    instData.AdditionalPaths,
-			MultiRepoTempDir:   instData.MultiRepoTempDir,
-			tmuxSession:        tmuxSess,
+			ID:                        instData.ID,
+			Title:                     instData.Title,
+			ProjectPath:               projectPath,
+			GroupPath:                 groupPath,
+			Order:                     instData.Order,
+			ParentSessionID:           instData.ParentSessionID,
+			IsConductor:               instData.IsConductor,
+			NoTransitionNotify:        instData.NoTransitionNotify,
+			TitleLocked:               instData.TitleLocked,
+			Command:                   instData.Command,
+			Wrapper:                   instData.Wrapper,
+			Tool:                      instData.Tool,
+			Status:                    instData.Status,
+			CreatedAt:                 instData.CreatedAt,
+			LastAccessedAt:            instData.LastAccessedAt,
+			WorktreePath:              instData.WorktreePath,
+			WorktreeRepoRoot:          instData.WorktreeRepoRoot,
+			WorktreeBranch:            instData.WorktreeBranch,
+			TmuxSocketName:            instData.TmuxSocketName,
+			ClaudeSessionID:           instData.ClaudeSessionID,
+			ClaudeDetectedAt:          instData.ClaudeDetectedAt,
+			GeminiSessionID:           instData.GeminiSessionID,
+			GeminiDetectedAt:          instData.GeminiDetectedAt,
+			GeminiYoloMode:            instData.GeminiYoloMode,
+			GeminiModel:               instData.GeminiModel,
+			OpenCodeSessionID:         instData.OpenCodeSessionID,
+			OpenCodeDetectedAt:        instData.OpenCodeDetectedAt,
+			CodexSessionID:            instData.CodexSessionID,
+			CodexDetectedAt:           instData.CodexDetectedAt,
+			ToolOptionsJSON:           instData.ToolOptionsJSON,
+			LatestPrompt:              instData.LatestPrompt,
+			Notes:                     instData.Notes,
+			LoadedMCPNames:            instData.LoadedMCPNames,
+			Channels:                  instData.Channels,
+			ExtraArgs:                 instData.ExtraArgs,
+			Plugins:                   instData.Plugins,
+			PluginChannelLinkDisabled: instData.PluginChannelLinkDisabled,
+			AutoLinkedChannels:        instData.AutoLinkedChannels,
+			Color:                     instData.Color,
+			Sandbox:                   instData.Sandbox,
+			SandboxContainer:          instData.SandboxContainer,
+			SSHHost:                   instData.SSHHost,
+			SSHRemotePath:             instData.SSHRemotePath,
+			MultiRepoEnabled:          instData.MultiRepoEnabled,
+			AdditionalPaths:           instData.AdditionalPaths,
+			MultiRepoTempDir:          instData.MultiRepoTempDir,
+			tmuxSession:               tmuxSess,
 		}
 		// Convert multi-repo worktree data
 		for _, wt := range instData.MultiRepoWorktrees {

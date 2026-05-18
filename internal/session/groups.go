@@ -75,6 +75,63 @@ type GroupTree struct {
 	Expanded  map[string]bool   // Collapsed state persistence
 }
 
+// actionablePriority maps a session.Status to an "attention-needed" rank
+// used by SortInstancesByActionable. Lower = more actionable = surfaces
+// higher in the in-group list (issue #857).
+//
+// Buckets:
+//
+//	0  error                       (something broke, look at me)
+//	1  waiting                     (model done, awaiting user input)
+//	2  running, starting           (model actively working)
+//	3  idle, queued, "" (unset)    (nothing to do; "" matches legacy
+//	                                instances persisted before this field
+//	                                was widely populated — TestSessionOrder*
+//	                                rely on this neutral default)
+//	4  stopped                     (user-parked, bottom of pile)
+//
+// Any future Status value not enumerated above defaults to 5 so it sorts
+// after every known bucket rather than silently slotting into "idle".
+func actionablePriority(s Status) int {
+	switch s {
+	case StatusError:
+		return 0
+	case StatusWaiting:
+		return 1
+	case StatusRunning, StatusStarting:
+		return 2
+	case StatusIdle, StatusQueued, "":
+		return 3
+	case StatusStopped:
+		return 4
+	}
+	return 5
+}
+
+// SortInstancesByActionable sorts the given slice in place so the most
+// recently actionable sessions surface first within a group (issue #857).
+// Key precedence:
+//
+//  1. actionablePriority(Status)   asc  — error/waiting/running first
+//  2. LastAccessedAt              desc  — recent attention first
+//  3. Order                        asc  — preserves user-customized
+//     position as a stable tie-breaker
+//     (TestSessionOrderPersistence,
+//     TestSessionOrderMigration)
+func SortInstancesByActionable(insts []*Instance) {
+	sort.SliceStable(insts, func(i, j int) bool {
+		pi, pj := actionablePriority(insts[i].Status), actionablePriority(insts[j].Status)
+		if pi != pj {
+			return pi < pj
+		}
+		ai, aj := insts[i].LastAccessedAt, insts[j].LastAccessedAt
+		if !ai.Equal(aj) {
+			return ai.After(aj)
+		}
+		return insts[i].Order < insts[j].Order
+	})
+}
+
 // NewGroupTree creates a new group tree from instances
 func NewGroupTree(instances []*Instance) *GroupTree {
 	tree := &GroupTree{
@@ -110,11 +167,12 @@ func NewGroupTree(instances []*Instance) *GroupTree {
 		group.Sessions = append(group.Sessions, inst)
 	}
 
-	// Sort sessions within each group by persisted Order
+	// Sort sessions within each group by actionability (issue #857).
+	// Persisted Order is preserved as the stable tie-breaker, so
+	// instances without a Status set behave identically to the prior
+	// Order-only sort.
 	for _, group := range tree.Groups {
-		sort.SliceStable(group.Sessions, func(i, j int) bool {
-			return group.Sessions[i].Order < group.Sessions[j].Order
-		})
+		SortInstancesByActionable(group.Sessions)
 	}
 
 	// Sort groups alphabetically and assign order
@@ -179,11 +237,12 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 		group.Sessions = append(group.Sessions, inst)
 	}
 
-	// Sort sessions within each group by persisted Order
+	// Sort sessions within each group by actionability (issue #857).
+	// Persisted Order is preserved as the stable tie-breaker, so
+	// instances without a Status set behave identically to the prior
+	// Order-only sort.
 	for _, group := range tree.Groups {
-		sort.SliceStable(group.Sessions, func(i, j int) bool {
-			return group.Sessions[i].Order < group.Sessions[j].Order
-		})
+		SortInstancesByActionable(group.Sessions)
 	}
 
 	// Rebuild group list maintaining stored order
@@ -566,30 +625,54 @@ func (t *GroupTree) MoveGroupDown(path string) {
 // MoveSessionUp moves a session up among its visual siblings: top-level
 // sessions (empty ParentSessionID) reorder among other top-level sessions
 // in the same group; sub-sessions reorder among other sub-sessions of the
-// same parent. Non-siblings interleaved in the flat slice are skipped, so
-// a single call always produces a visible change when one is possible.
+// same parent. Non-siblings interleaved in the flat slice are skipped.
+//
+// When a sub-session has no previous same-parent sibling (it is at the
+// top of its parent's children block), it is promoted to top-level and
+// inserted in the slice immediately before the parent. At the group's
+// top boundary (no previous top-level peer) the call is a no-op;
+// cross-group moves remain on the M shortcut.
 func (t *GroupTree) MoveSessionUp(inst *Instance) {
 	group, exists := t.Groups[inst.GroupPath]
 	if !exists {
 		return
 	}
 
-	currentIdx, prevSiblingIdx := -1, -1
+	currentIdx, prevSiblingIdx, parentIdx := -1, -1, -1
 	for i, s := range group.Sessions {
 		if s.ID == inst.ID {
 			currentIdx = i
-			break
+			continue
 		}
-		if s.ParentSessionID == inst.ParentSessionID {
+		if currentIdx < 0 && s.ParentSessionID == inst.ParentSessionID {
 			prevSiblingIdx = i
 		}
+		if inst.ParentSessionID != "" && s.ID == inst.ParentSessionID {
+			parentIdx = i
+		}
 	}
-	if currentIdx < 0 || prevSiblingIdx < 0 {
+	if currentIdx < 0 {
 		return
 	}
-	group.Sessions[currentIdx], group.Sessions[prevSiblingIdx] = group.Sessions[prevSiblingIdx], group.Sessions[currentIdx]
 
-	// Normalize Order for all sessions in group
+	switch {
+	case prevSiblingIdx >= 0:
+		group.Sessions[currentIdx], group.Sessions[prevSiblingIdx] = group.Sessions[prevSiblingIdx], group.Sessions[currentIdx]
+	case inst.ParentSessionID != "" && parentIdx >= 0:
+		// Promote sub-session to top-level: clear parent and reposition
+		// the slice entry immediately before the parent so the renderer
+		// shows it as a top-level peer just above the parent's block.
+		inst.ClearParent()
+		s := group.Sessions[currentIdx]
+		group.Sessions = append(group.Sessions[:currentIdx], group.Sessions[currentIdx+1:]...)
+		if parentIdx > currentIdx {
+			parentIdx--
+		}
+		group.Sessions = append(group.Sessions[:parentIdx], append([]*Instance{s}, group.Sessions[parentIdx:]...)...)
+	default:
+		return
+	}
+
 	for i, s := range group.Sessions {
 		s.Order = i
 	}
@@ -598,6 +681,12 @@ func (t *GroupTree) MoveSessionUp(inst *Instance) {
 // MoveSessionDown moves a session down among its visual siblings.
 // See MoveSessionUp for the sibling-aware semantics; this is the symmetric
 // case that swaps with the next same-parent session in the slice.
+//
+// When a sub-session has no following same-parent sibling (it is at the
+// bottom of its parent's children block), it is promoted to top-level
+// at its current slice position so the renderer shows it as a top-level
+// peer immediately after the parent's block. At the group's bottom
+// boundary (no following top-level peer) the call is a no-op.
 func (t *GroupTree) MoveSessionDown(inst *Instance) {
 	group, exists := t.Groups[inst.GroupPath]
 	if !exists {
@@ -610,17 +699,105 @@ func (t *GroupTree) MoveSessionDown(inst *Instance) {
 			currentIdx = i
 			continue
 		}
-		if currentIdx >= 0 && s.ParentSessionID == inst.ParentSessionID {
+		if currentIdx >= 0 && s.ParentSessionID == inst.ParentSessionID && nextSiblingIdx < 0 {
 			nextSiblingIdx = i
-			break
 		}
 	}
-	if currentIdx < 0 || nextSiblingIdx < 0 {
+	if currentIdx < 0 {
 		return
 	}
-	group.Sessions[currentIdx], group.Sessions[nextSiblingIdx] = group.Sessions[nextSiblingIdx], group.Sessions[currentIdx]
 
-	// Normalize Order for all sessions in group
+	switch {
+	case nextSiblingIdx >= 0:
+		group.Sessions[currentIdx], group.Sessions[nextSiblingIdx] = group.Sessions[nextSiblingIdx], group.Sessions[currentIdx]
+	case inst.ParentSessionID != "":
+		// Promote sub-session to top-level. The slice entry already sits
+		// after the parent's other children, so just clearing the parent
+		// pointer is enough — the renderer will place it as a top-level
+		// peer immediately after the parent's block.
+		inst.ClearParent()
+	default:
+		return
+	}
+
+	for i, s := range group.Sessions {
+		s.Order = i
+	}
+}
+
+// PromoteSession converts a sub-session into a top-level peer in the same
+// group. Slice position is preserved so the renderer places the session as
+// a top-level peer immediately after its former parent's children block.
+// Top-level sessions are unchanged.
+func (t *GroupTree) PromoteSession(inst *Instance) {
+	if inst.ParentSessionID == "" {
+		return
+	}
+	group, exists := t.Groups[inst.GroupPath]
+	if !exists {
+		return
+	}
+	inst.ClearParent()
+	for i, s := range group.Sessions {
+		s.Order = i
+	}
+}
+
+// DemoteSession converts a top-level session into a sub-session of the
+// previous top-level peer in the same group, inserting it as that peer's
+// last child. No-op if there is no previous peer (group's first
+// top-level), if the session is already a sub-session, or if it has its
+// own children — single-level nesting only, mirroring the validation in
+// `session set-parent`.
+func (t *GroupTree) DemoteSession(inst *Instance) {
+	if inst.ParentSessionID != "" {
+		return
+	}
+	group, exists := t.Groups[inst.GroupPath]
+	if !exists {
+		return
+	}
+
+	for _, s := range group.Sessions {
+		if s.ParentSessionID == inst.ID {
+			return
+		}
+	}
+
+	currentIdx, prevTopIdx := -1, -1
+	for i, s := range group.Sessions {
+		if s.ID == inst.ID {
+			currentIdx = i
+			break
+		}
+		if s.ParentSessionID == "" {
+			prevTopIdx = i
+		}
+	}
+	if currentIdx < 0 || prevTopIdx < 0 {
+		return
+	}
+
+	parent := group.Sessions[prevTopIdx]
+	inst.SetParentWithPath(parent.ID, parent.ProjectPath)
+
+	insertIdx := prevTopIdx + 1
+	for i := prevTopIdx + 1; i < len(group.Sessions); i++ {
+		if i == currentIdx {
+			continue
+		}
+		if group.Sessions[i].ParentSessionID == parent.ID {
+			insertIdx = i + 1
+		}
+	}
+
+	s := group.Sessions[currentIdx]
+	group.Sessions = append(group.Sessions[:currentIdx], group.Sessions[currentIdx+1:]...)
+	if insertIdx > currentIdx {
+		insertIdx--
+	}
+	group.Sessions = append(group.Sessions[:insertIdx], append([]*Instance{s}, group.Sessions[insertIdx:]...)...)
+
 	for i, s := range group.Sessions {
 		s.Order = i
 	}

@@ -20,6 +20,7 @@ const (
 	hotkeyUndoDelete      = "undo_delete"
 	hotkeyMoveToGroup     = "move_to_group"
 	hotkeyMCPManager      = "mcp_manager"
+	hotkeyPluginManager   = "plugin_manager"
 	hotkeySkillsManager   = "skills_manager"
 	hotkeyTogglePreview   = "toggle_preview"
 	hotkeyMarkUnread      = "mark_unread"
@@ -59,6 +60,7 @@ var hotkeyActionOrder = []string{
 	hotkeyUndoDelete,
 	hotkeyMoveToGroup,
 	hotkeyMCPManager,
+	hotkeyPluginManager,
 	hotkeySkillsManager,
 	hotkeyTogglePreview,
 	hotkeyMarkUnread,
@@ -98,6 +100,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyUndoDelete:      "ctrl+z",
 	hotkeyMoveToGroup:     "o",
 	hotkeyMCPManager:      "m",
+	hotkeyPluginManager:   "L",
 	hotkeySkillsManager:   "s",
 	hotkeyTogglePreview:   "v",
 	hotkeyMarkUnread:      "u",

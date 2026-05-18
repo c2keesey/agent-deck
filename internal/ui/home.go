@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -21,11 +20,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/BurntSushi/toml"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/mattn/go-runewidth"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
@@ -205,6 +204,7 @@ type Home struct {
 	confirmDialog        *ConfirmDialog        // For confirming destructive actions
 	helpOverlay          *HelpOverlay          // For showing keyboard shortcuts
 	mcpDialog            *MCPDialog            // For managing MCPs
+	pluginDialog         *PluginDialog         // For managing per-session Claude Code plugins (RFC PLUGIN_ATTACH.md)
 	editPathsDialog      *EditPathsDialog      // For editing multi-repo paths
 	editSessionDialog    *EditSessionDialog    // For editing session settings (title/color/notes/command/...)
 	skillDialog          *SkillDialog          // For managing project skills
@@ -769,6 +769,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		confirmDialog:        NewConfirmDialog(),
 		helpOverlay:          NewHelpOverlay(),
 		mcpDialog:            NewMCPDialog(),
+		pluginDialog:         NewPluginDialog(),
 		editPathsDialog:      NewEditPathsDialog(),
 		editSessionDialog:    NewEditSessionDialog(),
 		skillDialog:          NewSkillDialog(),
@@ -2025,7 +2026,7 @@ func (h *Home) startWatcherEngine() tea.Cmd {
 		adapterCfg := watcher.AdapterConfig{
 			Type:     row.Type,
 			Name:     row.Name,
-			Settings: map[string]string{},
+			Settings: loadWatcherSourceSettings(row.Name),
 		}
 		eng.RegisterAdapter(row.ID, adapter, adapterCfg, maxSilenceMinutes)
 	}
@@ -2041,6 +2042,29 @@ func (h *Home) startWatcherEngine() tea.Cmd {
 		listenForWatcherEvent(eng.EventCh()),
 		listenForWatcherHealth(eng.HealthCh()),
 	)
+}
+
+// loadWatcherSourceSettings reads the [source] table from
+// ~/.agent-deck/watcher/<name>/watcher.toml into a map[string]string suitable for
+// AdapterConfig.Settings. Returns an empty (non-nil) map on any error so the engine
+// falls back to per-adapter defaults instead of failing to register.
+func loadWatcherSourceSettings(name string) map[string]string {
+	out := map[string]string{}
+	dir, err := session.WatcherNameDir(name)
+	if err != nil {
+		return out
+	}
+	path := filepath.Join(dir, "watcher.toml")
+	var cfg struct {
+		Source map[string]string `toml:"source"`
+	}
+	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+		return out
+	}
+	for k, v := range cfg.Source {
+		out[k] = v
+	}
+	return out
 }
 
 // propagateThemeToSessions updates COLORFGBG in all running tmux sessions
@@ -3288,6 +3312,54 @@ func (h *Home) triggerStatusUpdate() {
 	}
 }
 
+func (h *Home) refreshAttachedSessionStatus(sessionID string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+
+	h.instancesMu.RLock()
+	inst := h.instanceByID[sessionID]
+	h.instancesMu.RUnlock()
+	if inst == nil {
+		return
+	}
+
+	// Attach return is the one moment where stale hook files are most visible:
+	// Claude/Codex may have exited via /q without writing a fresh "dead" hook.
+	// Force the attached session through the live tmux path before the list is
+	// redrawn so the status icon reflects a dead pane immediately.
+	inst.ClearHookStatus()
+	if h.hookWatcher != nil {
+		h.hookWatcher.ClearHookStatus(inst.ID)
+	}
+	inst.ForceNextStatusCheck()
+
+	if inst.GetTmuxSession() != nil {
+		tmux.RefreshSessionCache()
+		tmux.RefreshPaneInfoCache()
+	}
+
+	oldStatus := inst.GetStatusThreadSafe()
+	_ = inst.UpdateStatus()
+	newStatus := inst.GetStatusThreadSafe()
+	if newStatus != oldStatus {
+		h.cachedStatusCounts.valid.Store(false)
+		h.publishCurrentSessionStates()
+		if db := statedb.GetGlobal(); db != nil {
+			_ = db.WriteStatus(inst.ID, string(newStatus), inst.GetToolThreadSafe())
+		}
+	}
+	h.refreshSessionRenderSnapshot(nil)
+}
+
+func (h *Home) publishCurrentSessionStates() {
+	h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(h.instances))
+	copy(instances, h.instances)
+	h.instancesMu.RUnlock()
+	h.publishWebSessionStates(instances)
+}
+
 // processStatusUpdate implements round-robin status updates (Priority 1A + 1B)
 // Called by the background worker goroutine
 // Instead of updating ALL sessions every tick (which causes lag with 100+ sessions),
@@ -4274,6 +4346,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.isAttaching.Store(false) // Atomic store for thread safety
 		now := time.Now()
 		h.beginAttachReturnGrace(now)
+		// Reconcile the attached session synchronously before the normal delayed
+		// refresh so an exited pane does not render as still running for a tick.
+		h.refreshAttachedSessionStatus(msg.attachedSessionID)
 
 		selectedBefore := h.captureSelectedItemIdentity()
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
@@ -4363,23 +4438,29 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Combine with periodic save instead of saving on every attach/detach.
 		// We'll let the next tickMsg handle background save if needed.
 
-		// Re-enable mouse mode after returning from tea.Exec.
-		// tmux detach-client sends terminal reset sequences that disable mouse reporting.
-		// First disable ALL mouse modes to reset terminal state cleanly — without this,
-		// Ghostty (and other terminals) can get stuck interpreting Shift as text selection.
-		// Also restore legacy keyboard reporting (tmux's extended-keys setting leaves
-		// Kitty/modifyOtherKeys on the outer terminal; see RestoreLegacyKeyboardCmd).
-		// Schedule a delayed refresh so the main menu reflects attach-return state changes.
+		// Re-enable mouse mode after returning from tea.Exec (tmux detach-client
+		// resets mouse reporting), restore legacy keyboard reporting (tmux's
+		// extended-keys setting leaves Kitty/modifyOtherKeys on the outer terminal;
+		// see RestoreLegacyKeyboardCmd for the full rationale), force-poll
+		// terminal dimensions (#936: SIGWINCH propagation through nested SSH is
+		// late or lost — a host-terminal Cmd++ zoom during attach would otherwise
+		// land us back in the menu with stale pre-zoom column counts, making the
+		// input line render above the real viewport bottom and run off the
+		// right edge), and schedule a delayed repaint for any pane-title/content
+		// cache changes that settle just after tmux restores the outer client.
 		return h, tea.Batch(
 			tea.Sequence(tea.DisableMouse, tea.EnableMouseCellMotion),
 			RestoreLegacyKeyboardCmd(os.Stdout),
+			tea.WindowSize(),
 			tea.Tick(attachReturnRefreshDelay, func(time.Time) tea.Msg { return attachReturnRefreshMsg{} }),
 		)
 
 	case attachReturnRefreshMsg:
 		selectedBefore := h.captureSelectedItemIdentity()
 		tmux.RefreshSessionCache()
+		tmux.RefreshPaneInfoCache()
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
+		h.refreshSessionRenderSnapshot(nil)
 		return h, nil
 
 	case previewDebounceMsg:
@@ -4966,6 +5047,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.mcpDialog.IsVisible() {
 			return h.handleMCPDialogKey(msg)
 		}
+		if h.pluginDialog.IsVisible() {
+			return h.handlePluginDialogKey(msg)
+		}
 		if h.editPathsDialog.IsVisible() {
 			return h.handleEditPathsDialogKey(msg)
 		}
@@ -5236,32 +5320,21 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, cmd
 	}
 
-	// When the path suggestions dropdown is in active arrow-key mode, the
-	// dialog must consume navigation keys before the outer handlers run.
-	// Enter is special: apply the highlighted entry, dismiss the dropdown,
-	// then fall through to the form-submit handler below — unless "Type
-	// custom" is highlighted, in which case we just close the dropdown
-	// (the user wants to type a path, not submit).
 	if h.newDialog.IsSuggestionsActive() {
-		if msg.String() == "enter" {
-			if h.newDialog.IsTypeCustomHighlighted() {
-				h.newDialog.ApplyHighlightedSuggestion()
-				return h, nil
-			}
-			h.newDialog.ApplyHighlightedSuggestion()
-			h.newDialog.DismissSuggestions() // hide dropdown until user types
-			// fall through to the "enter" case below to validate + create.
-		} else {
-			var cmd tea.Cmd
-			h.newDialog, cmd = h.newDialog.Update(msg)
-			return h, cmd
-		}
+		var cmd tea.Cmd
+		h.newDialog, cmd = h.newDialog.Update(msg)
+		return h, cmd
+	}
+
+	if h.newDialog.IsModelSuggestionsActive() {
+		var cmd tea.Cmd
+		h.newDialog, cmd = h.newDialog.Update(msg)
+		return h, cmd
 	}
 
 	switch msg.String() {
 	case "enter":
-		// When multi-repo path list is focused, let the dialog handle enter (edit/save path).
-		if h.newDialog.IsMultiRepoEditing() {
+		if h.newDialog.shouldHandleEnterLocally() {
 			var cmd tea.Cmd
 			h.newDialog, cmd = h.newDialog.Update(msg)
 			return h, cmd
@@ -5277,6 +5350,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		name, path, command, branchName, worktreeEnabled := h.newDialog.GetValuesWithWorktree()
 		groupPath := h.newDialog.GetSelectedGroup()
 		claudeOpts := h.newDialog.GetClaudeOptions() // Get Claude options if applicable.
+		launchModelID := h.newDialog.GetLaunchModelID()
 
 		// Resolve worktree target if enabled; actual worktree creation runs in async command.
 		var worktreePath, worktreeRepoRoot string
@@ -5333,7 +5407,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !worktreeEnabled {
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				h.newDialog.Hide()
-				h.confirmDialog.ShowCreateDirectory(path, name, command, groupPath, toolOptionsJSON, claudeExtraArgs, claudeStartQuery, parentSessionID, parentProjectPath)
+				h.confirmDialog.ShowCreateDirectory(path, name, command, groupPath, toolOptionsJSON, claudeExtraArgs, claudeStartQuery, launchModelID, parentSessionID, parentProjectPath)
 				return h, nil
 			}
 		}
@@ -5386,6 +5460,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			toolOptionsJSON,
 			claudeExtraArgs,
 			claudeStartQuery,
+			launchModelID,
 			multiRepoEnabled,
 			additionalPaths,
 			parentSessionID,
@@ -5572,7 +5647,7 @@ func (h *Home) hasModalVisible() bool {
 		h.watcherPanel.IsVisible() || // hotkeyWatcherPanel overlay
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
-		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.skillDialog.IsVisible() ||
+		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
 		h.geminiModelDialog.IsVisible() || h.sessionPickerDialog.IsVisible() ||
 		h.worktreeFinishDialog.IsVisible() || h.editPathsDialog.IsVisible() ||
 		h.editSessionDialog.IsVisible() ||
@@ -5781,10 +5856,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.lastEscTime = time.Now()
 		return h, nil
 
-	case "up", "k":
+	case "up", "k", "ctrl+p":
+		h.previewScrollOffset = 0
 		if h.cursor > 0 {
 			h.cursor--
-			h.previewScrollOffset = 0
 			h.syncViewport()
 			h.markNavigationActivity()
 			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
@@ -5793,10 +5868,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "down", "j":
+	case "down", "j", "ctrl+n":
+		h.previewScrollOffset = 0
 		if h.cursor < len(h.flatItems)-1 {
 			h.cursor++
-			h.previewScrollOffset = 0
 			h.syncViewport()
 			h.markNavigationActivity()
 			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
@@ -6082,7 +6157,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "shift+up", "K":
+	case "shift+up", "ctrl+up", "+", "K":
 		// Move item up
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -6109,7 +6184,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "shift+down", "J":
+	case "shift+down", "ctrl+down", "-", "J":
 		// Move item down
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -6136,6 +6211,56 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "shift+left":
+		// Promote: outdent a sub-session to top-level peer in the same group.
+		// Top-level sessions and groups are unaffected. Cross-group moves
+		// stay on M.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				sessionID := item.Session.ID
+				h.groupTree.PromoteSession(item.Session)
+				h.rebuildFlatItems()
+				h.moveCursorToSession(sessionID)
+				if h.cursor >= len(h.flatItems) {
+					h.cursor = max(0, len(h.flatItems)-1)
+				}
+				h.saveInstances()
+			}
+		}
+		return h, nil
+
+	case "shift+right":
+		// Demote: nest the cursor's top-level session under the previous
+		// top-level peer as that peer's last child. No-op when already a
+		// sub-session, when the session has its own children (single-level
+		// nesting only), or when there is no previous peer in the group.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				sessionID := item.Session.ID
+				h.groupTree.DemoteSession(item.Session)
+				h.rebuildFlatItems()
+				h.moveCursorToSession(sessionID)
+				if h.cursor >= len(h.flatItems) {
+					h.cursor = max(0, len(h.flatItems)-1)
+				}
+				h.saveInstances()
+			}
+		}
+		return h, nil
+
+	case "p":
+		// Edit multi-repo paths
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.IsMultiRepo() {
+				h.editPathsDialog.SetSize(h.width, h.height)
+				h.editPathsDialog.Show(item.Session, h.newDialog.allPathSuggestions)
+			}
+		}
+		return h, nil
+
 	case "P", "shift+p":
 		// Edit session settings — local sessions only (remote mutators live
 		// on the remote host, not in our Storage).
@@ -6157,6 +6282,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				(session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
 				h.mcpDialog.SetSize(h.width, h.height)
 				if err := h.mcpDialog.Show(item.Session.ProjectPath, item.Session.ID, item.Session.Tool); err != nil {
+					h.setError(err)
+				}
+			}
+		}
+		return h, nil
+
+	case "L":
+		// Plugin Manager — claude-only (RFC docs/rfc/PLUGIN_ATTACH.md).
+		// Mirrors the MCP-manager UX (`m`): toggleable list of catalog
+		// plugins from ~/.agent-deck/config.toml. Apply persists via
+		// session.SetField(FieldPlugins,...) and triggers restart.
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil &&
+				session.IsClaudeCompatible(item.Session.Tool) {
+				h.pluginDialog.SetSize(h.width, h.height)
+				if err := h.pluginDialog.Show(item.Session); err != nil {
 					h.setError(err)
 				}
 			}
@@ -6996,7 +7138,7 @@ func (h *Home) confirmAction() tea.Cmd {
 
 // confirmCreateDirectory handles the "yes" action for ConfirmCreateDirectory.
 func (h *Home) confirmCreateDirectory() tea.Cmd {
-	name, path, command, groupPath, pendingToolOpts, pendingExtraArgs, pendingStartQuery, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
+	name, path, command, groupPath, pendingToolOpts, pendingExtraArgs, pendingStartQuery, pendingLaunchModelID, parentSessionID, parentProjectPath := h.confirmDialog.GetPendingSession()
 	h.confirmDialog.Hide()
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		h.setError(fmt.Errorf("failed to create directory: %w", err))
@@ -7015,6 +7157,7 @@ func (h *Home) confirmCreateDirectory() tea.Cmd {
 		pendingToolOpts,
 		pendingExtraArgs,
 		pendingStartQuery,
+		pendingLaunchModelID,
 		false,
 		nil,
 		parentSessionID,
@@ -7330,6 +7473,59 @@ func (h *Home) handleMCPDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// handlePluginDialogKey routes key events to the plugin manager dialog.
+// Apply path: persist via session.SetField(FieldPlugins,...) and restart
+// the session to reload claude's enabledPlugins from the per-session
+// scratch settings.json. RFC: docs/rfc/PLUGIN_ATTACH.md.
+func (h *Home) handlePluginDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		// Persist if anything changed; otherwise just close.
+		if !h.pluginDialog.HasChanged() {
+			h.pluginDialog.Hide()
+			return h, nil
+		}
+		sessionID := h.pluginDialog.GetSessionID()
+		newNames := h.pluginDialog.SelectedPluginNames()
+
+		var targetInst *session.Instance
+		h.instancesMu.RLock()
+		for _, inst := range h.instances {
+			if inst.ID == sessionID {
+				targetInst = inst
+				break
+			}
+		}
+		h.instancesMu.RUnlock()
+		if targetInst == nil {
+			h.pluginDialog.Hide()
+			return h, nil
+		}
+
+		oldValue, _, mutErr := session.SetField(targetInst, session.FieldPlugins, strings.Join(newNames, ","), nil)
+		if mutErr != nil {
+			h.setError(mutErr)
+			return h, nil
+		}
+		_ = oldValue
+		h.forceSaveInstances()
+		h.pluginDialog.Hide()
+
+		if targetInst.CanRestart() && !h.hasActiveAnimation(targetInst.ID) {
+			return h, h.restartSession(targetInst)
+		}
+		return h, nil
+
+	case "esc":
+		h.pluginDialog.Hide()
+		return h, nil
+
+	default:
+		h.pluginDialog.Update(msg)
+		return h, nil
+	}
+}
+
 // handleEditPathsDialogKey handles key events for the edit paths dialog.
 func (h *Home) handleEditPathsDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -7584,13 +7780,20 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case GroupDialogCreate:
 			name := h.groupDialog.GetValue()
 			if name != "" {
+				var created *session.Group
 				if h.groupDialog.HasParent() {
 					// Create subgroup under parent
 					parentPath := h.groupDialog.GetParentPath()
-					h.groupTree.CreateSubgroup(parentPath, name)
+					created = h.groupTree.CreateSubgroup(parentPath, name)
 				} else {
 					// Create root-level group
-					h.groupTree.CreateGroup(name)
+					created = h.groupTree.CreateGroup(name)
+				}
+				// Issue #918: persist the optional default path captured in the dialog.
+				if created != nil {
+					if defaultPath := h.groupDialog.GetDefaultPath(); defaultPath != "" {
+						h.groupTree.SetDefaultPathForGroup(created.Path, defaultPath)
+					}
 				}
 				h.rebuildFlatItems()
 				h.saveInstances() // Persist the new group
@@ -7998,6 +8201,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	toolOptionsJSON json.RawMessage,
 	claudeExtraArgs []string,
 	claudeStartQuery string,
+	launchModelID string,
 	multiRepoEnabled bool,
 	additionalPaths []string,
 	parentSessionID, parentProjectPath string,
@@ -8054,6 +8258,12 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		// Apply generic tool options (claude, codex, etc.)
 		if len(toolOptionsJSON) > 0 {
 			inst.ToolOptionsJSON = toolOptionsJSON
+		}
+
+		if launchModelID != "" {
+			if err := inst.ApplyLaunchModel(launchModelID); err != nil {
+				return sessionCreatedMsg{err: fmt.Errorf("failed to apply model override: %w", err), tempID: tempID}
+			}
 		}
 
 		// Apply claude extra CLI tokens (claude-only, ignored for other tools).
@@ -8226,6 +8436,8 @@ func createSessionTool(command string) (string, string) {
 		tool = "pi"
 	case "copilot":
 		tool = "copilot"
+	case "crush":
+		tool = "crush"
 	default:
 		if toolDef := session.GetToolDef(command); toolDef != nil {
 			tool = command
@@ -8359,6 +8571,7 @@ func (h *Home) quickCreateSession() tea.Cmd {
 		geminiYoloMode, false, toolOptionsJSON,
 		nil,        // no extra claude args (recent-session path)
 		"",         // no claude startup query (recent-session path)
+		"",         // no explicit model override
 		false, nil, // no multi-repo
 		"", "", // no parent
 		"", // no placeholder
@@ -8437,6 +8650,7 @@ func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
 		false, false, nil,
 		nil, // no extra claude args
 		"",  // no claude startup query
+		"",  // no explicit model override
 		false, nil,
 		"", "",
 		"",
@@ -9487,6 +9701,9 @@ func (h *Home) View() string {
 	if h.mcpDialog.IsVisible() {
 		return h.mcpDialog.View()
 	}
+	if h.pluginDialog.IsVisible() {
+		return h.pluginDialog.View()
+	}
 	if h.editSessionDialog.IsVisible() {
 		return h.editSessionDialog.View()
 	}
@@ -10110,8 +10327,13 @@ func clampViewToViewport(content string, width, height int) string {
 	}
 
 	for i, line := range lines {
-		if ansi.StringWidth(line) > width {
-			lines[i] = ansi.Truncate(line, width, "")
+		// #937 v2: cellWidth/cellTruncate (not ansi.*) so this final
+		// viewport-clamp safety net sees keycap clusters at their true
+		// terminal cell count. Any line that slips past upstream gates
+		// with a #️⃣ 0️⃣–9️⃣ *️⃣ glyph would otherwise overflow into the
+		// next row here — exactly @jennings's pane-content drift report.
+		if cellWidth(line) > width {
+			lines[i] = cellTruncate(line, width, "")
 		}
 	}
 
@@ -10355,6 +10577,44 @@ func renderDetectedAtLine(b *strings.Builder, detectedAt time.Time) {
 	b.WriteString("\n")
 }
 
+// renderLaunchModelInfoLines renders the per-session model/version override,
+// or an explicit tool-default marker when the tool supports model selection.
+func renderLaunchModelInfoLines(b *strings.Builder, inst *session.Instance) {
+	if inst == nil || !session.SupportsLaunchModel(inst.Tool) {
+		return
+	}
+
+	labelStyle := lipgloss.NewStyle().Foreground(ColorText)
+	valueStyle := lipgloss.NewStyle().Foreground(ColorAccent)
+	dimStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
+
+	info := inst.LaunchModelInfo()
+	if info.ModelID == "" {
+		b.WriteString(labelStyle.Render("Model:   "))
+		b.WriteString(dimStyle.Render("tool default"))
+		b.WriteString("\n")
+		return
+	}
+
+	model := info.Model
+	if model == "" {
+		model = info.ModelID
+	}
+	b.WriteString(labelStyle.Render("Model:   "))
+	b.WriteString(valueStyle.Render(model))
+	b.WriteString("\n")
+
+	if info.Version != "" {
+		b.WriteString(labelStyle.Render("Version: "))
+		b.WriteString(valueStyle.Render(info.Version))
+		b.WriteString("\n")
+	}
+
+	b.WriteString(labelStyle.Render("Model ID:"))
+	b.WriteString(valueStyle.Render(" " + info.ModelID))
+	b.WriteString("\n")
+}
+
 // renderForkHintLine renders the fork keyboard hint line.
 func (h *Home) renderForkHintLine(b *strings.Builder) {
 	quickForkKey := h.actionKey(hotkeyQuickFork)
@@ -10418,7 +10678,11 @@ func renderSimpleMCPLine(b *strings.Builder, mcpInfo *session.MCPInfo, width int
 
 	for i, part := range mcpParts {
 		plainPart := tmux.StripANSI(part)
-		partWidth := runewidth.StringWidth(plainPart)
+		// #937 v2: cellWidth promotes keycap clusters (#️⃣ 0️⃣–9️⃣ *️⃣) to 2
+		// cells; ansi.StringWidth reports them at 1 and let MCP rows drift
+		// past the right edge — see internal/ui/cellwidth.go for the
+		// uniseg/terminal disagreement that motivates this shim.
+		partWidth := cellWidth(plainPart)
 
 		addedWidth := partWidth
 		if mcpCount > 0 {
@@ -10433,7 +10697,7 @@ func renderSimpleMCPLine(b *strings.Builder, mcpInfo *session.MCPInfo, width int
 			wouldExceed = currentWidth+addedWidth > mcpMaxWidth
 		} else {
 			moreIndicator := fmt.Sprintf(" (+%d more)", remaining)
-			moreWidth := runewidth.StringWidth(moreIndicator)
+			moreWidth := cellWidth(moreIndicator)
 			wouldExceed = currentWidth+addedWidth+moreWidth > mcpMaxWidth
 		}
 
@@ -10945,6 +11209,7 @@ func (h *Home) renderHelpBarFull() string {
 	// Global shortcuts (right side) - more compact with separators
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalParts := []string{globalStyle.Render("↑↓ Nav")}
+	globalParts = append(globalParts, globalStyle.Render("+/- Move"))
 	if key := h.actionKey(hotkeySearch); key != "" {
 		globalParts = append(globalParts, globalStyle.Render(key+" Search"))
 	}
@@ -11616,14 +11881,19 @@ func (h *Home) renderSessionItem(
 	)
 
 	// Append pane title filling remaining row space (only for the selected item).
-	// lipgloss.Width(row) accounts for indentation, tree connectors, and all badges,
-	// so deeply-nested sessions with many badges naturally get less pane title space.
+	// #937 v2: cellWidth/cellTruncate (not lipgloss.Width / ansi.Truncate)
+	// for both the row budget and the pane-title fit check. pane titles
+	// often surface tmux pane content which can contain keycap glyphs
+	// (#️⃣ 0️⃣–9️⃣ *️⃣) — uniseg reports those at 1 cell, terminals render 2,
+	// so the prior measurement let the trailing pane-title text overflow
+	// the panel and shove subsequent rows down by one cell. See
+	// internal/ui/cellwidth.go for the upstream disagreement.
 	if selected && instState.paneTitle != "" {
-		remaining := h.width - lipgloss.Width(row) - 2 // -2 for trailing margin
+		remaining := h.width - cellWidth(row) - 2 // -2 for trailing margin
 		if remaining > 10 {
 			pt := instState.paneTitle
-			if lipgloss.Width(pt) > remaining {
-				pt = ansi.Truncate(pt, remaining, "…")
+			if cellWidth(pt) > remaining {
+				pt = cellTruncate(pt, remaining, "…")
 			}
 			row += DimStyle.Render(" " + pt)
 		}
@@ -12442,6 +12712,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(statusStyle.Render("○ Not connected"))
 			b.WriteString("\n")
 		}
+		renderLaunchModelInfoLines(&b, selected)
 
 		// MCP servers - compact format with source indicators and sync status
 		mcpInfo := selected.GetMCPInfo()
@@ -12535,7 +12806,10 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			for i, part := range mcpParts {
 				// Strip ANSI codes to measure actual display width
 				plainPart := tmux.StripANSI(part)
-				partWidth := runewidth.StringWidth(plainPart)
+				// #937 v2: cellWidth (not ansi.StringWidth) so keycap
+				// clusters in MCP names — see cellwidth.go — are sized
+				// at the cell count terminals actually render.
+				partWidth := cellWidth(plainPart)
 
 				// Calculate width including separator if not first
 				addedWidth := partWidth
@@ -12555,7 +12829,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 				} else {
 					// Not last - check with indicator space reserved
 					moreIndicator := fmt.Sprintf(" (+%d more)", remaining)
-					moreWidth := runewidth.StringWidth(moreIndicator)
+					moreWidth := cellWidth(moreIndicator)
 					wouldExceed = currentWidth+addedWidth+moreWidth > mcpMaxWidth
 				}
 
@@ -12626,16 +12900,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Session: "))
 			b.WriteString(valueStyle.Render(selected.GeminiSessionID))
 			b.WriteString("\n")
-
-			// Display active model
-			modelDisplay := "auto"
-			if selected.GeminiModel != "" {
-				modelDisplay = selected.GeminiModel
-			}
-			accentStyle := lipgloss.NewStyle().Foreground(ColorAccent)
-			b.WriteString(labelStyle.Render("Model:   "))
-			b.WriteString(accentStyle.Render(modelDisplay))
-			b.WriteString("\n")
+			renderLaunchModelInfoLines(&b, selected)
 
 			// MCPs for Gemini (global only)
 			mcpInfo := selected.GetMCPInfo()
@@ -12645,6 +12910,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Status:  "))
 			b.WriteString(statusStyle.Render("○ Not connected"))
 			b.WriteString("\n")
+			renderLaunchModelInfoLines(&b, selected)
 		}
 	}
 
@@ -12673,6 +12939,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Session: "))
 			b.WriteString(valueStyle.Render(selected.OpenCodeSessionID))
 			b.WriteString("\n")
+			renderLaunchModelInfoLines(&b, selected)
 
 			// Show when session was detected
 			if !selected.OpenCodeDetectedAt.IsZero() {
@@ -12695,12 +12962,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 				b.WriteString(labelStyle.Render("Status:  "))
 				b.WriteString(statusStyle.Render("◐ Detecting session..."))
 				b.WriteString("\n")
+				renderLaunchModelInfoLines(&b, selected)
 			} else {
 				// Detection completed but no session found
 				statusStyle := lipgloss.NewStyle().Foreground(ColorText)
 				b.WriteString(labelStyle.Render("Status:  "))
 				b.WriteString(statusStyle.Render("○ No session found"))
 				b.WriteString("\n")
+				renderLaunchModelInfoLines(&b, selected)
 			}
 		}
 	}
@@ -12712,6 +12981,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n")
 
 		renderToolStatusLine(&b, selected.CodexSessionID, selected.CodexDetectedAt, true)
+		renderLaunchModelInfoLines(&b, selected)
 		if selected.CodexSessionID != "" {
 			renderDetectedAtLine(&b, selected.CodexDetectedAt)
 		}
@@ -13247,12 +13517,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			}
 			consecutiveEmpty = 0 // Reset counter on non-empty line
 
-			// Truncate based on display width using ANSI-aware measurement
-			// ansi.StringWidth ignores escape sequences for accurate width
-			displayWidth := ansi.StringWidth(safeLine)
+			// Truncate based on display width using ANSI-aware measurement.
+			// #937 v2: cellWidth/cellTruncate so pane-content lines from
+			// the tmux capture-pane buffer — which is where @jennings's
+			// keycap glyphs live — are sized at the cell count terminals
+			// actually render.
+			displayWidth := cellWidth(safeLine)
 			if displayWidth > maxWidth {
-				// ansi.Truncate preserves ANSI codes while truncating visible content
-				safeLine = ansi.Truncate(safeLine, maxWidth-3, "...")
+				safeLine = cellTruncate(safeLine, maxWidth-3, "...")
 			}
 
 			b.WriteString(safeLine)
@@ -13272,11 +13544,13 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	lines := strings.Split(result, "\n")
 	var truncatedLines []string
 	for _, line := range lines {
-		// Use ANSI-aware width measurement to handle lines with escape codes
-		displayWidth := ansi.StringWidth(line)
+		// #937 v2: cellWidth/cellTruncate so the right-panel width
+		// enforcement before lipgloss.JoinHorizontal handles keycap
+		// clusters; ansi.* alone under-counted them and let oversized
+		// lines bleed into the left panel.
+		displayWidth := cellWidth(line)
 		if displayWidth > maxWidth {
-			// ANSI-aware truncation preserves escape codes while trimming visible content
-			line = ansi.Truncate(line, maxWidth-3, "...")
+			line = cellTruncate(line, maxWidth-3, "...")
 		}
 		// Issue #699: captured Claude output (e.g., highlighted input line) can
 		// contain an unclosed SGR whose reset was off-screen or clipped by
@@ -13367,7 +13641,11 @@ func (h *Home) renderNotesSection(inst *session.Instance, width, maxLines int) s
 		}
 
 		for _, line := range viewLines {
-			lines = append(lines, ansi.Truncate(line, contentWidth, "..."))
+			// #937 v2: cellTruncate for notes-editor lines so a keycap
+			// glyph the user typed into the notes editor doesn't overflow
+			// the panel — same drift class as the renderNotesSection path
+			// just below.
+			lines = append(lines, cellTruncate(line, contentWidth, "..."))
 		}
 
 		lines = append(lines, hintStyle.Render("Ctrl+S save • Esc cancel"))
@@ -13393,7 +13671,13 @@ func (h *Home) renderNotesSection(inst *session.Instance, width, maxLines int) s
 			}
 			for _, line := range displayLines {
 				safe := stripControlCharsPreserveANSI(line)
-				safe = runewidth.Truncate(safe, contentWidth, "...")
+				// #937 v2: cellTruncate (not ansi.Truncate) is the truncation
+				// gate for pane content. ansi/uniseg miss keycap clusters
+				// (#️⃣ 0️⃣–9️⃣ *️⃣) — exactly the emoji @jennings reported
+				// against v1.9.3 — so PR #948's swap to ansi.Truncate alone
+				// still let oversized lines past the gate and reproduced
+				// #937's per-frame row-offset drift. See cellwidth.go.
+				safe = cellTruncate(safe, contentWidth, "...")
 				lines = append(lines, notesStyle.Render(safe))
 			}
 			if overflow && len(lines) > 0 {
@@ -13490,9 +13774,17 @@ func remapANSIBackground(s, replacement string) string {
 	return ansiBackgroundRE.ReplaceAllString(s, replacement)
 }
 
-// truncatePath shortens a path to fit within maxLen display width
+// truncatePath shortens a path to fit within maxLen display width.
+//
+// #937 v2: width and truncate route through cellWidth/cellTruncate (which
+// promote keycap clusters such as #️⃣ to 2 cells on top of ansi/uniseg's
+// VS16 handling). ansi.* alone — what PR #948 shipped — still let
+// keycap-prefixed titles past the truncation gate and reproduced #937's
+// row-offset drift on titles like "#️⃣ /Users/foo/keycap-channel".
+// See internal/ui/cellwidth.go for the upstream disagreement that
+// motivates this shim.
 func truncatePath(path string, maxLen int) string {
-	pathWidth := runewidth.StringWidth(path)
+	pathWidth := cellWidth(path)
 	if pathWidth <= maxLen {
 		return path
 	}
@@ -13505,8 +13797,8 @@ func truncatePath(path string, maxLen int) string {
 	startLen := maxLen / 3
 	endLen := maxLen*2/3 - 3
 	if startLen+endLen+3 > len(runes) {
-		// Path is short in runes but wide in display - use simple truncation
-		return runewidth.Truncate(path, maxLen-3, "...")
+		// Path is short in runes but wide in display - use width-aware truncation
+		return cellTruncate(path, maxLen-3, "...")
 	}
 	return string(runes[:startLen]) + "..." + string(runes[len(runes)-endLen:])
 }
@@ -13702,9 +13994,13 @@ func (h *Home) renderGroupPreview(group *session.Group, width, height int) strin
 	var truncatedLines []string
 	for _, line := range lines {
 		cleanLine := tmux.StripANSI(line)
-		displayWidth := runewidth.StringWidth(cleanLine)
+		// #937 v2: cellWidth + cellTruncate add keycap-cluster handling on
+		// top of ansi/uniseg's VS16 awareness, so group-preview lines
+		// containing #️⃣ 0️⃣–9️⃣ *️⃣ (jennings's pane-content reopen) stay
+		// inside the panel budget. See cellwidth.go.
+		displayWidth := cellWidth(cleanLine)
 		if displayWidth > maxWidth {
-			truncated := runewidth.Truncate(cleanLine, maxWidth-3, "...")
+			truncated := cellTruncate(cleanLine, maxWidth-3, "...")
 			truncatedLines = append(truncatedLines, truncated)
 		} else {
 			truncatedLines = append(truncatedLines, line)
@@ -13932,26 +14228,14 @@ func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, b
 	return func() tea.Msg {
 		merged := false
 
-		// Step 1: Merge (if requested)
+		// Step 1: Merge (if requested). git.MergeBack handles both regular
+		// and bare-repo layouts; in bare layouts the project root has no
+		// working tree, so checkout/merge cannot run there (#891).
 		if mergeEnabled {
-			// Checkout target branch in main repo
-			cmd := exec.Command("git", "-C", repoRoot, "checkout", targetBranch)
-			checkoutOutput, err := cmd.CombinedOutput()
-			if err != nil {
+			if err := git.MergeBack(repoRoot, branchName, targetBranch); err != nil {
 				return worktreeFinishResultMsg{
 					sessionID: sessionID, sessionTitle: sessionTitle,
-					err: fmt.Errorf("failed to checkout %s: %s", targetBranch, strings.TrimSpace(string(checkoutOutput))),
-				}
-			}
-
-			// Merge the worktree branch
-			if err := git.MergeBranch(repoRoot, branchName); err != nil {
-				// Abort the merge to leave things clean
-				abortCmd := exec.Command("git", "-C", repoRoot, "merge", "--abort")
-				_ = abortCmd.Run()
-				return worktreeFinishResultMsg{
-					sessionID: sessionID, sessionTitle: sessionTitle,
-					err: fmt.Errorf("merge failed (aborted): %v", err),
+					err: fmt.Errorf("merge failed: %v", err),
 				}
 			}
 			merged = true

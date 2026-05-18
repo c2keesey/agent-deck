@@ -1504,6 +1504,7 @@ func TestBuildCodexCommand_CustomWrapperPreservesToolIdentity(t *testing.T) {
 	}
 
 	cfg := &UserConfig{
+		Codex: CodexSettings{Command: "codex-v2"},
 		Tools: map[string]ToolDef{
 			"my-codex": {
 				Command:        "codex-wrapper",
@@ -1534,6 +1535,306 @@ func TestBuildCodexCommand_CustomWrapperPreservesToolIdentity(t *testing.T) {
 	cmd = inst.buildCodexCommand(inst.Command)
 	if !strings.Contains(cmd, "codex-wrapper resume 019d1af6-c425-7791-8fd1-38c0fc43062c") {
 		t.Fatalf("buildCodexCommand should resume through the custom wrapper, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_UsesConfiguredCommandForBuiltinCodex(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	cfg := &UserConfig{Codex: CodexSettings{Command: "codex-v2", YoloMode: true}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("configured", "/tmp/configured", "codex")
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, "codex-v2 --yolo") {
+		t.Fatalf("configured Codex command should be used with yolo flag, got %q", cmd)
+	}
+	if strings.Contains(cmd, " codex --yolo") {
+		t.Fatalf("default codex command should not be used when [codex].command is set, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_ModelOption(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("codex-model", "/tmp/codex-model", "codex")
+	if err := inst.SetCodexOptions(&CodexOptions{Model: "gpt-5"}); err != nil {
+		t.Fatalf("SetCodexOptions: %v", err)
+	}
+
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, "--model gpt-5") {
+		t.Fatalf("buildCodexCommand should include selected model, got %q", cmd)
+	}
+}
+
+func TestApplyLaunchModel_SetsToolSpecificFields(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	tests := []struct {
+		name string
+		tool string
+		want func(t *testing.T, inst *Instance)
+	}{
+		{
+			name: "claude",
+			tool: "claude",
+			want: func(t *testing.T, inst *Instance) {
+				t.Helper()
+				opts := inst.GetClaudeOptions()
+				if opts == nil || opts.Model != "claude-sonnet-4-6" {
+					t.Fatalf("Claude model = %#v, want claude-sonnet-4-6", opts)
+				}
+			},
+		},
+		{
+			name: "gemini",
+			tool: "gemini",
+			want: func(t *testing.T, inst *Instance) {
+				t.Helper()
+				if inst.GeminiModel != "claude-sonnet-4-6" {
+					t.Fatalf("GeminiModel = %q, want claude-sonnet-4-6", inst.GeminiModel)
+				}
+			},
+		},
+		{
+			name: "codex",
+			tool: "codex",
+			want: func(t *testing.T, inst *Instance) {
+				t.Helper()
+				opts := inst.GetCodexOptions()
+				if opts == nil || opts.Model != "claude-sonnet-4-6" {
+					t.Fatalf("Codex model = %#v, want claude-sonnet-4-6", opts)
+				}
+			},
+		},
+		{
+			name: "opencode",
+			tool: "opencode",
+			want: func(t *testing.T, inst *Instance) {
+				t.Helper()
+				opts := inst.GetOpenCodeOptions()
+				if opts == nil || opts.Model != "claude-sonnet-4-6" {
+					t.Fatalf("OpenCode model = %#v, want claude-sonnet-4-6", opts)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := NewInstanceWithTool("model-"+tc.tool, "/tmp/model", tc.tool)
+			if err := inst.ApplyLaunchModel("claude-sonnet-4-6"); err != nil {
+				t.Fatalf("ApplyLaunchModel: %v", err)
+			}
+			tc.want(t, inst)
+		})
+	}
+}
+
+func TestBuildCodexCommand_ConfiguredCommandResume(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		}
+	}()
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	cfg := &UserConfig{Codex: CodexSettings{Command: "codex-v2"}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("configured-resume", "/tmp/configured-resume", "codex")
+	id := "bbbbbbbb-1111-2222-3333-444444444444"
+	inst.CodexSessionID = id
+	writeFakeCodexRollout(t, filepath.Join(tmpDir, ".codex"), id)
+
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, "codex-v2 resume "+id) {
+		t.Fatalf("configured Codex command should be used for resume, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_ExplicitCommandBeatsConfiguredCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	cfg := &UserConfig{Codex: CodexSettings{Command: "codex-v2"}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("explicit", "/tmp/explicit", "codex")
+	cmd := inst.buildCodexCommand("codex-nightly")
+	if !strings.Contains(cmd, "codex-nightly") {
+		t.Fatalf("explicit Codex command should be preserved, got %q", cmd)
+	}
+	if strings.Contains(cmd, "codex-v2") {
+		t.Fatalf("configured command should not override explicit session command, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_InlineCodexHomeForRolloutCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		}
+	}()
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	codexHome := filepath.Join(tmpDir, ".codex-work")
+	cfg := &UserConfig{Codex: CodexSettings{Command: "CODEX_HOME=" + codexHome + " codex"}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("inline-home", "/tmp/inline-home", "codex")
+	id := "cccccccc-1111-2222-3333-444444444444"
+	inst.CodexSessionID = id
+	writeFakeCodexRollout(t, codexHome, id)
+
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, "CODEX_HOME="+codexHome+" codex resume "+id) {
+		t.Fatalf("inline CODEX_HOME command should resume from configured home, got %q", cmd)
+	}
+}
+
+func TestBuildCodexCommand_QuotedInlineCodexHomeWithSpaces(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		}
+	}()
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	codexHome := filepath.Join(tmpDir, "codex work")
+	cfg := &UserConfig{Codex: CodexSettings{Command: `CODEX_HOME="` + codexHome + `" codex`}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("quoted-inline-home", "/tmp/quoted-inline-home", "codex")
+	id := "eeeeeeee-1111-2222-3333-444444444444"
+	inst.CodexSessionID = id
+	writeFakeCodexRollout(t, codexHome, id)
+
+	cmd := inst.buildCodexCommand("codex")
+	if !strings.Contains(cmd, `CODEX_HOME="`+codexHome+`" codex resume `+id) {
+		t.Fatalf("quoted inline CODEX_HOME command should resume from configured home, got %q", cmd)
+	}
+	if inst.CodexSessionID != id {
+		t.Fatalf("CodexSessionID should be preserved when quoted CODEX_HOME rollout exists, got %q", inst.CodexSessionID)
+	}
+}
+
+func TestCodexHomeFromCommand_PreservesQuotedAssignmentSpaces(t *testing.T) {
+	tmpDir := t.TempDir()
+	codexHome := filepath.Join(tmpDir, "codex work")
+
+	got := codexHomeFromCommand(`FOO=bar CODEX_HOME="` + codexHome + `" codex`)
+	if got != codexHome {
+		t.Fatalf("codexHomeFromCommand() = %q, want %q", got, codexHome)
+	}
+
+	got = codexHomeFromCommand(`CODEX_HOME='` + codexHome + `' codex`)
+	if got != codexHome {
+		t.Fatalf("codexHomeFromCommand() single quoted = %q, want %q", got, codexHome)
+	}
+}
+
+func TestBuildCodexCommand_InlineCodexHomeDropsStaleID(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	originalCodexHome := os.Getenv("CODEX_HOME")
+	os.Unsetenv("CODEX_HOME")
+	defer func() {
+		if originalCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", originalCodexHome)
+		}
+	}()
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".agent-deck", "hooks"), 0o700); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+
+	codexHome := filepath.Join(tmpDir, ".codex-work")
+	cfg := &UserConfig{Codex: CodexSettings{Command: "CODEX_HOME=" + codexHome + " codex"}}
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	inst := NewInstanceWithTool("inline-stale", "/tmp/inline-stale", "codex")
+	id := "dddddddd-1111-2222-3333-444444444444"
+	inst.CodexSessionID = id
+	inst.CodexDetectedAt = time.Now()
+	WriteHookSessionAnchor(inst.ID, id)
+	writeFakeCodexRollout(t, filepath.Join(tmpDir, ".codex"), id)
+	if err := os.MkdirAll(filepath.Join(codexHome, "sessions", "2026", "04", "24"), 0o755); err != nil {
+		t.Fatalf("mkdir custom codex sessions: %v", err)
+	}
+
+	cmd := inst.buildCodexCommand("codex")
+	if strings.Contains(cmd, "resume "+id) {
+		t.Fatalf("resume should be dropped when rollout is absent from inline CODEX_HOME, got %q", cmd)
+	}
+	if inst.CodexSessionID != "" {
+		t.Fatalf("CodexSessionID should be cleared after stale-id drop, got %q", inst.CodexSessionID)
+	}
+	if got := ReadHookSessionAnchor(inst.ID); got != "" {
+		t.Fatalf(".sid anchor should be cleared after stale-id drop, got %q", got)
 	}
 }
 
@@ -2786,6 +3087,15 @@ func TestBuildClaudeExtraFlags_NilOpts(t *testing.T) {
 	}
 }
 
+func TestBuildClaudeExtraFlags_Model(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	flags := inst.buildClaudeExtraFlags(&ClaudeOptions{Model: "claude-sonnet-4-6"})
+
+	if !strings.Contains(flags, "--model claude-sonnet-4-6") {
+		t.Fatalf("expected --model flag, got %q", flags)
+	}
+}
+
 // TestBuildClaudeCommand_ExportsInstanceID verifies that AGENTDECK_INSTANCE_ID
 // is included in the command string for Claude sessions.
 func TestBuildClaudeCommand_ExportsInstanceID(t *testing.T) {
@@ -3286,6 +3596,15 @@ func TestExtractCodexSessionIDFromPath_DeletedSuffix(t *testing.T) {
 	}
 }
 
+func TestExtractCodexSessionIDFromPath_CustomCodexHome(t *testing.T) {
+	path := "/tmp/codex-work/sessions/2026/02/28/rollout-2026-02-28T00-42-18-019c9ffa-c9d6-7be1-9e1c-527080e68951.jsonl"
+	got := extractCodexSessionIDFromPath(path)
+	want := "019c9ffa-c9d6-7be1-9e1c-527080e68951"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromPath() custom home = %q, want %q", got, want)
+	}
+}
+
 func TestParsePSParentChildMap(t *testing.T) {
 	procTable := []byte("100 1\n101 100\n102 100\n103 101\nbad-line\n104 invalid\n105 0\n")
 	got := parsePSParentChildMap(procTable)
@@ -3390,6 +3709,38 @@ func TestInstance_UpdateHookStatus_Nil(t *testing.T) {
 
 	if inst.hookStatus != "" {
 		t.Errorf("hookStatus should be empty, got %q", inst.hookStatus)
+	}
+}
+
+func TestInstance_ClearHookStatus_RemovesPersistedHookFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	inst := NewInstanceWithTool("test", "/tmp", "codex")
+	inst.ID = "clear-hook-file"
+
+	hooksDir := GetHooksDir()
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+	hookPath := filepath.Join(hooksDir, inst.ID+".json")
+	if err := os.WriteFile(hookPath, []byte(`{"status":"running","event":"UserPromptSubmit","ts":1}`), 0o644); err != nil {
+		t.Fatalf("write hook file: %v", err)
+	}
+
+	inst.UpdateHookStatus(&HookStatus{
+		Status:    "running",
+		Event:     "UserPromptSubmit",
+		UpdatedAt: time.Now(),
+	})
+
+	inst.ClearHookStatus()
+
+	if status, fresh := inst.GetHookStatus(); status != "" || fresh {
+		t.Fatalf("hook status = %q fresh=%v, want cleared", status, fresh)
+	}
+	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
+		t.Fatalf("hook file still exists or stat failed with unexpected error: %v", err)
 	}
 }
 

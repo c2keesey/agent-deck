@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -36,7 +37,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.8.3" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.17" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -224,6 +225,9 @@ func main() {
 
 	var webEnabled bool
 	var webArgs []string
+	// webHeadless: true when --no-tui is passed to the `web` subcommand.
+	// Skips bubbletea boot (the bulk of ~60 MB RSS) and runs HTTP-server only.
+	var webHeadless bool
 
 	// Handle subcommands
 	if len(args) > 0 {
@@ -260,6 +264,9 @@ func main() {
 			return
 		case "mcp":
 			handleMCP(profile, args[1:])
+			return
+		case "plugin":
+			handlePlugin(profile, args[1:])
 			return
 		case "skill":
 			handleSkill(profile, args[1:])
@@ -300,8 +307,12 @@ func main() {
 			return
 		case "web":
 			webEnabled = true
-			webArgs = append(webArgs, args[1:]...)
-			// fall through to TUI launch below
+			// Extract --no-tui out of webArgs before buildWebServer's flag set
+			// sees it. The TUI-vs-headless decision is made at bootstrap (it
+			// controls whether bubbletea ever boots), so it lives outside the
+			// per-server flag set.
+			webHeadless, webArgs = extractNoTuiFlag(args[1:])
+			// fall through to TUI launch below (or headless server boot if --no-tui)
 		case "uninstall":
 			handleUninstall(args[1:])
 			return
@@ -343,7 +354,8 @@ func main() {
 
 	// Block TUI launch inside a managed session to prevent infinite nesting.
 	// CLI commands (add, session start/stop, mcp attach, etc.) still work fine.
-	if isNestedSession() {
+	// In headless web mode (--no-tui), no TUI launches, so this guard is skipped.
+	if !webHeadless && isNestedSession() {
 		fmt.Fprintln(os.Stderr, "Error: Cannot launch the agent-deck TUI inside an agent-deck session.")
 		fmt.Fprintln(os.Stderr, "This would create a recursive nested session.")
 		fmt.Fprintln(os.Stderr, "")
@@ -360,8 +372,9 @@ func main() {
 	// Block TUI launch inside a *generic* (non-agentdeck) tmux session (#560).
 	// Detach semantics get confusing when nested: Ctrl+Q returns to the outer
 	// tmux instead of a clean shell. CLI subcommands still work inside tmux —
-	// this guard only fires on the interactive TUI path.
-	if isOuterTmuxWithoutOptIn() {
+	// this guard only fires on the interactive TUI path. Headless web mode
+	// (--no-tui) skips it for the same reason: no TUI, no detach surprise.
+	if !webHeadless && isOuterTmuxWithoutOptIn() {
 		fmt.Fprintln(os.Stderr, "Error: The agent-deck TUI is designed to run OUTSIDE of tmux.")
 		fmt.Fprintln(os.Stderr, "You are inside a tmux session, so Ctrl+Q detach and nested")
 		fmt.Fprintln(os.Stderr, "tmux behavior will be surprising. agent-deck manages its own")
@@ -385,10 +398,14 @@ func main() {
 	theme := session.ResolveTheme()
 	ui.InitTheme(theme)
 
-	// Check for updates and prompt user before launching TUI
-	if promptForUpdate() {
-		// Update was performed, exit so user can restart with new version
-		return
+	// Check for updates and prompt user before launching TUI. Headless web
+	// mode (--no-tui) skips this — it's an interactive prompt that would
+	// hang a non-TTY process.
+	if !webHeadless {
+		if promptForUpdate() {
+			// Update was performed, exit so user can restart with new version
+			return
+		}
 	}
 
 	// Check if tmux is available (with fallback path search)
@@ -540,6 +557,9 @@ func main() {
 	// inflate the counter.
 	if fbSt, _ := feedback.LoadState(); fbSt != nil {
 		feedback.RecordLaunch(fbSt, time.Now())
+		// #967: migrate pre-existing forever-opt-outs to per-release-series.
+		// Idempotent — no-op once OptOutVersion is set or feedback is enabled.
+		feedback.MigrateLegacyOptOut(fbSt, Version)
 		_ = feedback.SaveState(fbSt)
 	}
 
@@ -687,7 +707,9 @@ func main() {
 		}
 	}
 
-	// Start web server alongside TUI if "web" subcommand was used
+	// Start web server alongside TUI if "web" subcommand was used.
+	// When --no-tui is also set, run the HTTP server in the foreground and
+	// skip bubbletea entirely — the perf win that motivated this flag.
 	if webEnabled {
 		effectiveProfile := session.GetEffectiveProfile(profile)
 		fallbackMenuData := web.NewSessionDataService(effectiveProfile)
@@ -702,6 +724,28 @@ func main() {
 		if costStore != nil {
 			server.SetCostStore(costStore)
 		}
+
+		if webHeadless {
+			// Headless: block on server.Start() and skip bubbletea. The
+			// HTTP server uses SessionDataService (storage-backed) as a
+			// fallback when MemoryMenuData has no snapshot, so the web UI
+			// reads live data from storage on each request.
+			fmt.Println("Headless mode: TUI disabled")
+			fmt.Printf("Web server: http://%s\n", server.Addr())
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = server.Shutdown(ctx)
+			}()
+			if err := server.Start(); err != nil {
+				logging.ForComponent(logging.CompWeb).Error("web_server_error",
+					slog.String("error", err.Error()))
+				fmt.Fprintf(os.Stderr, "Error: web server: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+
 		go func() {
 			if err := server.Start(); err != nil {
 				logging.ForComponent(logging.CompWeb).Error("web_server_error",
@@ -852,29 +896,41 @@ func extractSelectFlag(args []string) (string, []string) {
 // Go's flag package stops parsing at the first non-flag argument,
 // so "add . -c claude" would fail to parse -c without this fix.
 // This reorders to "add -c claude ." which parses correctly.
+//
+// Issue #974: Go's flag package treats `-parent` and `--parent` as the
+// same flag, but this reorder pass historically only matched the exact
+// double-dash spelling. The result was that `launch -parent <pid>` did
+// not pair `-parent` with `<pid>` — `<pid>` got demoted to a positional
+// and the wrong arg ended up as the parent value. We now match flag
+// names by their normalized form (dashes stripped from the left) so
+// `-parent` and `--parent` behave identically here too.
 func reorderArgsForFlagParsing(args []string) []string {
 	if len(args) == 0 {
 		return args
 	}
 
-	// Known flags that take a value (need to skip their values)
-	// Note: -b/--new-branch are boolean flags (no value), so not included here
-	valueFlags := map[string]bool{
-		"-t": true, "--title": true,
-		"-g": true, "--group": true,
-		"-c": true, "--cmd": true,
-		"-m": true, "--message": true,
-		"-p": true, "--parent": true,
-		"--mcp":       true,
-		"--channel":   true,
-		"--extra-arg": true,
-		"--wrapper":   true,
-		"-w":          true, "--worktree": true,
-		"--location":       true,
-		"--resume-session": true,
-		"--sandbox-image":  true,
-		"--ssh":            true,
-		"--remote-path":    true,
+	// Known flag *names* (no leading dashes) that take a value.
+	// Note: -b/--new-branch are boolean flags (no value), so not included here.
+	valueFlagNames := map[string]bool{
+		"t": true, "title": true,
+		"g": true, "group": true,
+		"c": true, "cmd": true,
+		"m": true, "message": true,
+		"p": true, "parent": true,
+		"mcp":            true,
+		"channel":        true,
+		"plugin":         true,
+		"extra-arg":      true,
+		"wrapper":        true,
+		"model":          true,
+		"w":              true,
+		"worktree":       true,
+		"location":       true,
+		"resume-session": true,
+		"sandbox-image":  true,
+		"ssh":            true,
+		"remote-path":    true,
+		"tmux-socket":    true,
 	}
 
 	var flags []string
@@ -884,12 +940,17 @@ func reorderArgsForFlagParsing(args []string) []string {
 		arg := args[i]
 
 		// Check if it's a flag
-		if strings.HasPrefix(arg, "-") {
+		if strings.HasPrefix(arg, "-") && arg != "-" {
 			flags = append(flags, arg)
 
-			// Check if this flag takes a value (and value is separate)
-			// Handle both "-c value" and "-c=value" formats
-			if !strings.Contains(arg, "=") && valueFlags[arg] && i+1 < len(args) {
+			// `-foo=bar` carries its value in the same token.
+			if strings.Contains(arg, "=") {
+				continue
+			}
+
+			// Normalize "-foo" / "--foo" to "foo" for lookup.
+			name := strings.TrimLeft(arg, "-")
+			if valueFlagNames[name] && i+1 < len(args) {
 				i++
 				flags = append(flags, args[i])
 			}
@@ -1066,6 +1127,17 @@ func handleAdd(profile string, args []string) {
 		return nil
 	})
 
+	// Plugin enablement flag — repeatable, catalog-only, claude-only.
+	// Persisted on Instance.Plugins; resolved at spawn through
+	// [plugins.<name>] in ~/.agent-deck/config.toml and applied via the
+	// per-session scratch settings.json (RFC docs/rfc/PLUGIN_ATTACH.md).
+	var pluginFlags []string
+	fs.Func("plugin", "Catalog plugin to enable for this session (can specify multiple times); requires -c claude; configure in [plugins.<name>] in ~/.agent-deck/config.toml", func(s string) error {
+		pluginFlags = append(pluginFlags, s)
+		return nil
+	})
+	noChannelLink := fs.Bool("no-channel-link", false, "Disable auto-link between --plugin entries with emits_channel=true and --channel (RFC §4.7)")
+
 	// Extra claude CLI tokens - repeatable; each invocation is one already-
 	// tokenised arg (e.g. --extra-arg --agent --extra-arg reviewer).
 	// Persisted on Instance.ExtraArgs (plaintext — do NOT pass secrets) and
@@ -1087,6 +1159,7 @@ func handleAdd(profile string, args []string) {
 
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume (skips new session creation)")
+	modelID := fs.String("model", "", "Model ID/version to use for this session (claude, codex, gemini, opencode)")
 	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode for Gemini or Codex sessions")
 	geminiYoloMode := fs.Bool("gemini-yolo", false, "Enable YOLO mode (alias for --yolo)")
 
@@ -1112,6 +1185,8 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add /path/to/project")
 		fmt.Println("  agent-deck add -t \"My Project\" -g \"work\"")
 		fmt.Println("  agent-deck add -c claude .")
+		fmt.Println("  agent-deck add -c codex --model gpt-5.5 .")
+		fmt.Println("  agent-deck add -c gemini --model gemini-3.1-pro-preview .")
 		fmt.Println("  agent-deck -p work add               # Add to 'work' profile")
 		fmt.Println("  agent-deck add -t \"Sub-task\" --parent \"Main Project\"  # Create sub-session")
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
@@ -1206,11 +1281,15 @@ func handleAdd(profile string, args []string) {
 			fmt.Printf("Error: cannot create sub-session of a sub-session (single level only)\n")
 			os.Exit(1)
 		}
-		sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+		// handleAdd resolves `path` AFTER this block (see below), so the
+		// cwd-derived group is not available here. Passing "" preserves
+		// handleAdd's existing behavior; the #972 cwd-over-parent priority
+		// is wired into `launch` where path is already known at this point.
+		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
 	} else if !*noParent {
 		parentInstance = resolveAutoParentInstance(instances)
 		if parentInstance != nil && !parentInstance.IsSubSession() {
-			sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided)
 		} else {
 			parentInstance = nil
 		}
@@ -1422,6 +1501,25 @@ func handleAdd(profile string, args []string) {
 		newInstance.Channels = channelFlags
 	}
 
+	// Apply --plugin flags (catalog-only, claude-only, RFC docs/rfc/PLUGIN_ATTACH.md).
+	if len(pluginFlags) > 0 {
+		if newInstance.Tool != "claude" {
+			fmt.Println("Error: --plugin only supported for claude sessions (use -c claude); plugins enable Claude Code plugin features per-session via enabledPlugins")
+			os.Exit(1)
+		}
+		if err := validatePluginFlags(pluginFlags); err != nil {
+			fmt.Println("Error:", err)
+			os.Exit(1)
+		}
+		newInstance.Plugins = pluginFlags
+		newInstance.PluginChannelLinkDisabled = *noChannelLink
+		applyPluginChannelAutolink(newInstance)
+	} else if *noChannelLink {
+		// No-op flag without --plugin — quietly persist the preference
+		// for future session set / dialog edits.
+		newInstance.PluginChannelLinkDisabled = true
+	}
+
 	// Apply --extra-arg flags (claude only for now — these are passed to the
 	// claude binary via buildClaudeExtraFlags; other tools have their own builders).
 	if len(extraArgFlags) > 0 {
@@ -1435,6 +1533,16 @@ func handleAdd(profile string, args []string) {
 	// Set wrapper if provided
 	if sessionWrapperResolved != "" {
 		newInstance.Wrapper = sessionWrapperResolved
+	}
+
+	// Apply per-session model override after command/tool resolution so the
+	// tool-specific option field is populated correctly.
+	selectedModelID := strings.TrimSpace(*modelID)
+	if selectedModelID != "" {
+		if err := applyCLIModelOverride(newInstance, selectedModelID); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Set worktree fields if created
@@ -1556,6 +1664,11 @@ func handleAdd(profile string, args []string) {
 	if *resumeSession != "" {
 		humanLines = append(humanLines, fmt.Sprintf("  Resume:  %s", *resumeSession))
 	}
+	modelInfo := newInstance.LaunchModelInfo()
+	if modelInfo.ModelID != "" {
+		humanLines = append(humanLines, fmt.Sprintf("  Model:   %s", modelInfo.Display()))
+		humanLines = append(humanLines, fmt.Sprintf("  ModelID: %s", modelInfo.ModelID))
+	}
 	humanLines = append(humanLines, "")
 	humanLines = append(humanLines, "Next steps:")
 	humanLines = append(humanLines, fmt.Sprintf("  agent-deck session start %s   # Start the session", sessionTitle))
@@ -1596,6 +1709,7 @@ func handleAdd(profile string, args []string) {
 	if *resumeSession != "" {
 		jsonData["resume_session"] = *resumeSession
 	}
+	addModelInfoJSON(jsonData, modelInfo)
 	if *sandbox {
 		jsonData["sandbox"] = true
 		humanLines = append(humanLines[:len(humanLines)-3],
@@ -1670,6 +1784,9 @@ func handleList(profile string, args []string) {
 			Group         string    `json:"group"`
 			Tool          string    `json:"tool"`
 			Command       string    `json:"command,omitempty"`
+			ModelID       string    `json:"model_id,omitempty"`
+			Model         string    `json:"model,omitempty"`
+			ModelVersion  string    `json:"model_version,omitempty"`
 			Status        string    `json:"status"`
 			TmuxSession   string    `json:"tmux_session,omitempty"`
 			Profile       string    `json:"profile"`
@@ -1704,6 +1821,11 @@ func handleList(profile string, args []string) {
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
+			}
+			if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
+				sj.ModelID = modelInfo.ModelID
+				sj.Model = modelInfo.Model
+				sj.ModelVersion = modelInfo.Version
 			}
 			sessions[i] = sj
 		}
@@ -2144,22 +2266,54 @@ func handleStatus(profile string, args []string) {
 
 	// Output based on flags
 	if *jsonOutput {
-		type statusJSON struct {
-			Waiting int `json:"waiting"`
-			Running int `json:"running"`
-			Idle    int `json:"idle"`
-			Error   int `json:"error"`
-			Stopped int `json:"stopped"`
-			Total   int `json:"total"`
+		type statusSessionJSON struct {
+			ID           string `json:"id"`
+			Title        string `json:"title"`
+			Tool         string `json:"tool"`
+			ModelID      string `json:"model_id,omitempty"`
+			Model        string `json:"model,omitempty"`
+			ModelVersion string `json:"model_version,omitempty"`
+			Status       string `json:"status"`
+			Path         string `json:"path"`
 		}
-		output, _ := json.Marshal(statusJSON{
+		type statusJSON struct {
+			Waiting  int                 `json:"waiting"`
+			Running  int                 `json:"running"`
+			Idle     int                 `json:"idle"`
+			Error    int                 `json:"error"`
+			Stopped  int                 `json:"stopped"`
+			Total    int                 `json:"total"`
+			Sessions []statusSessionJSON `json:"sessions,omitempty"`
+		}
+		resp := statusJSON{
 			Waiting: counts.waiting,
 			Running: counts.running,
 			Idle:    counts.idle,
 			Error:   counts.err,
 			Stopped: counts.stopped,
 			Total:   counts.total,
-		})
+		}
+		if *verbose || *verboseShort {
+			session.RefreshInstancesForCLIStatus(instances)
+			resp.Sessions = make([]statusSessionJSON, 0, len(instances))
+			for _, inst := range instances {
+				_ = inst.UpdateStatus()
+				sj := statusSessionJSON{
+					ID:     inst.ID,
+					Title:  inst.Title,
+					Tool:   inst.Tool,
+					Status: StatusString(inst.Status),
+					Path:   inst.ProjectPath,
+				}
+				if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
+					sj.ModelID = modelInfo.ModelID
+					sj.Model = modelInfo.Model
+					sj.ModelVersion = modelInfo.Version
+				}
+				resp.Sessions = append(resp.Sessions, sj)
+			}
+		}
+		output, _ := json.Marshal(resp)
 		fmt.Println(string(output))
 	} else if *quiet || *quietShort {
 		fmt.Println(counts.waiting)
@@ -2182,7 +2336,7 @@ func handleStatus(profile string, args []string) {
 				if strings.HasPrefix(path, home) {
 					path = "~" + path[len(home):]
 				}
-				fmt.Printf("  %s %-16s %-10s %s\n", symbol, inst.Title, inst.Tool, path)
+				fmt.Printf("  %s %-16s %-10s %-22s %s\n", symbol, inst.Title, inst.Tool, truncate(modelStatusDisplay(inst), 22), path)
 			}
 			fmt.Println()
 		}
@@ -2620,30 +2774,76 @@ func handleUpdateToSpecificVersion(requested string, checkOnly bool) {
 	fmt.Println("  Restart agent-deck to use this version.")
 }
 
+// brewRunner abstracts `brew <args...>` so tests can inject canned output
+// without touching the real binary. The contract: return the combined
+// stdout+stderr captured from the invocation, plus the process exit error
+// (nil on exit 0). Implementations may also tee output to the terminal so
+// the user still sees brew's live progress.
+type brewRunner interface {
+	Run(args ...string) ([]byte, error)
+}
+
+// execBrewRunner is the production runner: it invokes the real `brew` binary
+// and tees its output to the user's terminal while capturing a copy for the
+// post-run inspection that #954 requires.
+type execBrewRunner struct{ bin string }
+
+func (e *execBrewRunner) Run(args ...string) ([]byte, error) {
+	cmd := exec.Command(e.bin, args...)
+	cmd.Stdin = os.Stdin
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	err := cmd.Run()
+	return buf.Bytes(), err
+}
+
 func runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd string) error {
 	cmdParts := strings.Fields(homebrewUpgradeCmd)
 	if len(cmdParts) == 0 {
 		return fmt.Errorf("empty Homebrew upgrade command")
 	}
+	return runHomebrewUpgradeWith(&execBrewRunner{bin: cmdParts[0]}, homebrewUpgradeCmd)
+}
 
-	brewBin := cmdParts[0]
-	refreshCmd := exec.Command(brewBin, "update")
-	refreshCmd.Stdout = os.Stdout
-	refreshCmd.Stderr = os.Stderr
-	refreshCmd.Stdin = os.Stdin
-	if err := refreshCmd.Run(); err != nil {
+// runHomebrewUpgradeWith executes `brew update` then `brew <upgrade args>` via
+// the supplied runner. It fails loudly when brew exits 0 but its output shows
+// the formula was refused (e.g. "Warning: agent-deck X.Y.Z already installed")
+// — see #954, reported by @alexandergharibian.
+func runHomebrewUpgradeWith(r brewRunner, homebrewUpgradeCmd string) error {
+	cmdParts := strings.Fields(homebrewUpgradeCmd)
+	if len(cmdParts) == 0 {
+		return fmt.Errorf("empty Homebrew upgrade command")
+	}
+
+	if _, err := r.Run("update"); err != nil {
 		return fmt.Errorf("failed to refresh Homebrew metadata: %w", err)
 	}
 
-	upgradeCmd := exec.Command(brewBin, cmdParts[1:]...)
-	upgradeCmd.Stdout = os.Stdout
-	upgradeCmd.Stderr = os.Stderr
-	upgradeCmd.Stdin = os.Stdin
-	if err := upgradeCmd.Run(); err != nil {
+	out, err := r.Run(cmdParts[1:]...)
+	if err != nil {
 		return fmt.Errorf("failed to run `%s`: %w", homebrewUpgradeCmd, err)
 	}
 
+	if brewRefusedUpgrade(string(out)) {
+		return fmt.Errorf(
+			"brew did not upgrade agent-deck; the tap formula may be stale (#954). "+
+				"Try `brew untap asheshgoplani/tap && brew tap asheshgoplani/tap && %s`, "+
+				"or download the latest release directly from GitHub. brew output: %s",
+			homebrewUpgradeCmd,
+			strings.TrimSpace(string(out)),
+		)
+	}
+
 	return nil
+}
+
+// brewRefusedUpgrade reports whether `brew upgrade` output indicates brew
+// declined to install a new version. Brew prints "Warning: <formula> X.Y.Z
+// already installed" and exits 0 in that case — exactly the lying-success
+// path that #954 surfaced.
+func brewRefusedUpgrade(output string) bool {
+	return strings.Contains(strings.ToLower(output), "already installed")
 }
 
 // displayChangelog fetches and displays changelog between versions
@@ -2867,6 +3067,8 @@ func detectTool(cmd string) string {
 		return "pi"
 	case strings.Contains(cmd, "copilot"):
 		return "copilot"
+	case strings.Contains(cmd, "crush"):
+		return "crush"
 	case strings.Contains(cmd, "cursor"):
 		return "cursor"
 	default:

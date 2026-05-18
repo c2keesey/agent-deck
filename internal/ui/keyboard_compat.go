@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/termreply"
 	tea "github.com/charmbracelet/bubbletea"
@@ -135,6 +136,10 @@ func ParseCSIu(data []byte) *tea.KeyMsg {
 		msg := tea.KeyMsg{Type: tea.KeyEnter}
 		return &msg
 	case 9: // HT = Tab
+		if shiftHeld {
+			msg := tea.KeyMsg{Type: tea.KeyShiftTab}
+			return &msg
+		}
 		msg := tea.KeyMsg{Type: tea.KeyTab}
 		return &msg
 	case 27: // ESC
@@ -217,6 +222,10 @@ func ParseModifyOtherKeys(data []byte) *tea.KeyMsg {
 		msg := tea.KeyMsg{Type: tea.KeyEnter}
 		return &msg
 	case 9:
+		if shiftHeld {
+			msg := tea.KeyMsg{Type: tea.KeyShiftTab}
+			return &msg
+		}
 		msg := tea.KeyMsg{Type: tea.KeyTab}
 		return &msg
 	case 27:
@@ -270,6 +279,8 @@ type csiuReader struct {
 	inBuf       []byte // buffered input bytes not yet processed
 	err         error  // pending source error to return after draining buffers
 	replyFilter termreply.Filter
+	// pollFn checks whether more bytes follow a lone ESC within a timeout.
+	pollFn func(time.Duration) bool
 }
 
 // csiuFileReader wraps a *os.File and overrides Read with CSI u translation.
@@ -303,6 +314,10 @@ func NewCSIuReader(r io.Reader) io.Reader {
 		inBuf: make([]byte, 0, 256),
 	}
 	if f, ok := r.(*os.File); ok {
+		fd := int(f.Fd())
+		inner.pollFn = func(timeout time.Duration) bool {
+			return pollFdReady(fd, timeout)
+		}
 		return &csiuFileReader{File: f, inner: inner}
 	}
 	return inner
@@ -355,6 +370,16 @@ func (c *csiuReader) Read(p []byte) (int, error) {
 		if err != nil {
 			c.err = err
 			return 0, err
+		}
+
+		// Flush lone ESC after 50ms poll timeout (ncurses ESCDELAY convention).
+		if len(c.inBuf) == 1 && c.inBuf[0] == 0x1b && c.pollFn != nil {
+			if !c.pollFn(50 * time.Millisecond) {
+				p[0] = c.inBuf[0]
+				c.inBuf = c.inBuf[:0]
+				return 1, nil
+			}
+			// More bytes incoming — loop to bundle them with the ESC.
 		}
 	}
 }
@@ -453,6 +478,8 @@ func (c *csiuReader) translate(final bool) []byte {
 						out = append(out, '\r')
 					case tea.KeyTab:
 						out = append(out, '\t')
+					case tea.KeyShiftTab:
+						out = append(out, []byte("\x1b[Z")...)
 					case tea.KeyEsc:
 						out = append(out, 0x1b)
 					case tea.KeyBackspace:
@@ -491,6 +518,8 @@ func (c *csiuReader) translate(final bool) []byte {
 			out = append(out, '\r')
 		case tea.KeyTab:
 			out = append(out, '\t')
+		case tea.KeyShiftTab:
+			out = append(out, []byte("\x1b[Z")...)
 		case tea.KeyEsc:
 			out = append(out, 0x1b)
 		case tea.KeyBackspace:
