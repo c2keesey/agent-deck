@@ -55,6 +55,7 @@ Thumbs.db
 excalidraw.log
 
 .worktrees
+.worktree/
 agent-deck-test
 
 # Tailwind brute-force diff gate scratch file (make css temp artifact)

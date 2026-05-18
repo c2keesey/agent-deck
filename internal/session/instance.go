@@ -838,7 +838,28 @@ func (i *Instance) buildBashExportPrefix() string {
 		configDir := i.applyWorkerScratchOverride(GetClaudeConfigDirForInstance(i))
 		prefix += fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", configDir)
 	}
+	prefix += i.buildResolvedAccountHintExports()
 	return prefix
+}
+
+// buildResolvedAccountHintExports emits the three "intended account"
+// hint env vars introduced by issue #925 (reporter @bautrey): the
+// resolved config dir, group path, and source label from the priority
+// chain. These mirror the user's *intent* and intentionally bypass
+// the worker-scratch override applied to CLAUDE_CONFIG_DIR — consumer
+// scripts (statusline, custom prompts, telemetry, hooks) need a stable
+// label of which account this session belongs to, not agent-deck's
+// per-session scratch path. Always emitted for claude-compatible
+// instances (including when source resolves to "default") so consumers
+// can rely on the vars being present.
+func (i *Instance) buildResolvedAccountHintExports() string {
+	resolved, source := GetClaudeConfigDirSourceForInstance(i)
+	return fmt.Sprintf(
+		"export AGENTDECK_RESOLVED_CONFIG_DIR=%s; export AGENTDECK_RESOLVED_GROUP=%s; export AGENTDECK_RESOLVED_SOURCE=%s; ",
+		shellescape.Quote(resolved),
+		shellescape.Quote(i.GroupPath),
+		shellescape.Quote(source),
+	)
 }
 
 // logClaudeConfigResolution emits the CFG-07 observability line documenting
@@ -892,6 +913,9 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 
 	// Options-level flags
 	if opts != nil {
+		if opts.Model != "" {
+			flags = append(flags, "--model "+shellescape.Quote(opts.Model))
+		}
 		if opts.SkipPermissions {
 			flags = append(flags, "--dangerously-skip-permissions")
 		} else if opts.AutoMode {
@@ -1082,6 +1106,14 @@ func (i *Instance) resolveCodexYoloFlag() string {
 	return ""
 }
 
+func (i *Instance) resolveCodexModelFlag() string {
+	opts := i.GetCodexOptions()
+	if opts != nil && strings.TrimSpace(opts.Model) != "" {
+		return " --model " + shellescape.Quote(strings.TrimSpace(opts.Model))
+	}
+	return ""
+}
+
 func (i *Instance) resolveCodexCommand(baseCommand string) string {
 	command := strings.TrimSpace(baseCommand)
 	if i.Tool == "codex" && (command == "" || command == "codex") {
@@ -1190,6 +1222,7 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	envPrefix += agentdeckEnvPrefix
 
 	yoloFlag := i.resolveCodexYoloFlag()
+	modelFlag := i.resolveCodexModelFlag()
 	command := i.resolveCodexCommand(baseCommand)
 	codexHome := getCodexHomeDirForCommand(command)
 
@@ -1213,11 +1246,11 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	}
 
 	if i.CodexSessionID != "" {
-		return envPrefix + fmt.Sprintf("%s%s resume %s",
-			command, yoloFlag, i.CodexSessionID)
+		return envPrefix + fmt.Sprintf("%s%s%s resume %s",
+			command, yoloFlag, modelFlag, i.CodexSessionID)
 	}
 
-	return envPrefix + command + yoloFlag
+	return envPrefix + command + yoloFlag + modelFlag
 }
 
 // codexRolloutExists reports whether Codex has flushed a rollout JSONL for
@@ -2716,6 +2749,8 @@ func (i *Instance) StartWithMessage(message string) error {
 	case IsCodexCompatible(i.Tool):
 		command = i.buildCodexCommand(i.Command)
 		i.CodexStartedAt = time.Now().UnixMilli()
+	case i.Tool == "crush":
+		command = i.buildCrushCommand(i.Command)
 	default:
 		// Check if this is a custom tool with session resume config
 		if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -4972,6 +5007,8 @@ func (i *Instance) Restart() error {
 			command = i.buildCodexCommand(i.Command)
 			// Record start time for async session ID detection
 			i.CodexStartedAt = time.Now().UnixMilli()
+		case i.Tool == "crush":
+			command = i.buildCrushCommand(i.Command)
 		default:
 			// Check if this is a custom tool with session resume config
 			if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -5202,6 +5239,53 @@ func (i *Instance) SetGeminiModel(model string) error {
 	return nil
 }
 
+// SupportsLaunchModel reports whether a newly-created session can receive an
+// explicit model override through Agent Deck's generic session creation path.
+func SupportsLaunchModel(tool string) bool {
+	return IsClaudeCompatible(tool) || tool == "gemini" || tool == "opencode" || IsCodexCompatible(tool)
+}
+
+// ApplyLaunchModel stores a per-session model override in the tool-specific
+// field that the relevant command builder already reads on start/restart.
+func (i *Instance) ApplyLaunchModel(model string) error {
+	model = strings.TrimSpace(model)
+	if i == nil || model == "" {
+		return nil
+	}
+
+	switch {
+	case IsClaudeCompatible(i.Tool):
+		opts := i.GetClaudeOptions()
+		if opts == nil {
+			userConfig, _ := LoadUserConfig()
+			opts = NewClaudeOptions(userConfig)
+		}
+		opts.Model = model
+		return i.SetClaudeOptions(opts)
+	case i.Tool == "gemini":
+		i.GeminiModel = model
+		return nil
+	case i.Tool == "opencode":
+		opts := i.GetOpenCodeOptions()
+		if opts == nil {
+			userConfig, _ := LoadUserConfig()
+			opts = NewOpenCodeOptions(userConfig)
+		}
+		opts.Model = model
+		return i.SetOpenCodeOptions(opts)
+	case IsCodexCompatible(i.Tool):
+		opts := i.GetCodexOptions()
+		if opts == nil {
+			userConfig, _ := LoadUserConfig()
+			opts = NewCodexOptions(userConfig)
+		}
+		opts.Model = model
+		return i.SetCodexOptions(opts)
+	default:
+		return fmt.Errorf("model selection is not supported for tool %q", i.Tool)
+	}
+}
+
 // CanRestart returns true if the session can be restarted
 // For Claude sessions with known ID: can always restart (interrupt and resume)
 // For Gemini sessions with known ID: can always restart (interrupt and resume)
@@ -5217,6 +5301,18 @@ func (i *Instance) CanRestart() bool {
 
 	// Claude sessions with known session ID can always be restarted
 	if IsClaudeCompatible(i.Tool) && i.ClaudeSessionID != "" {
+		return true
+	}
+
+	// Claude sessions without ID can still restart (will start fresh or
+	// resume the latest JSONL via ensureClaudeSessionIDFromDisk). REQ-7
+	// reopen #911: custom-command Claude sessions (Tool=claude with a
+	// wrapper Command) bypass happy-path session-id capture and have an
+	// intentionally empty ClaudeSessionID. Without this branch they fall
+	// to the dead-or-error fallback below and the registry refuses
+	// restart even when the underlying tmux pane is alive — the false-
+	// error class this issue tracks. Mirrors the opencode/codex policy.
+	if IsClaudeCompatible(i.Tool) {
 		return true
 	}
 
