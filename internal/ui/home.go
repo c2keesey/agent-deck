@@ -13843,6 +13843,15 @@ func (h *Home) sendOutputToSession(source, target *session.Instance) tea.Cmd {
 func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
 	return func() tea.Msg {
 		time.Sleep(3 * time.Second)
+		// Stop the worker's docker stack via `make down` in the worktree.
+		// Non-fatal: log and continue if no Makefile or down target fails.
+		if wd := s.EffectiveWorkingDir(); wd != "" {
+			cmd := exec.Command("make", "down")
+			cmd.Dir = wd
+			if out, err := cmd.CombinedOutput(); err != nil {
+				uiLog.Info("teardown_make_down_failed", "session", s.Title, "dir", wd, "err", err, "output", string(out))
+			}
+		}
 		if err := s.Restart(); err != nil {
 			return teardownResultMsg{title: s.Title, err: fmt.Errorf("restart: %w", err)}
 		}
