@@ -19,6 +19,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
+	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
 
 // handleSession dispatches session subcommands
@@ -66,6 +67,8 @@ func handleSession(profile string, args []string) {
 		handleSessionMove(profile, args[1:])
 	case "send":
 		handleSessionSend(profile, args[1:])
+	case "send-keys":
+		handleSessionSendKeys(profile, args[1:])
 	case "output":
 		handleSessionOutput(profile, args[1:])
 	case "search":
@@ -707,16 +710,15 @@ func handleSessionFork(profile string, args []string) {
 
 	// Handle worktree creation
 	var opts *session.ClaudeOptions
+	var worktreeType string
 	if wtBranch != "" {
-		if !git.IsGitRepoOrBareProjectRoot(inst.ProjectPath) {
-			out.Error("session path is not a git repository", ErrCodeInvalidOperation)
-			os.Exit(1)
-		}
-		repoRoot, err := git.GetWorktreeBaseRoot(inst.ProjectPath)
+		backend, err := detectAndCreateBackend(inst.ProjectPath)
 		if err != nil {
-			out.Error(fmt.Sprintf("failed to get repo root: %v", err), ErrCodeInvalidOperation)
+			out.Error(fmt.Sprintf("%v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
+		worktreeType = string(backend.Type())
+		repoRoot := backend.RepoDir()
 
 		// Apply configured branch prefix before validation/existence checks
 		wtSettings := session.GetWorktreeSettings()
@@ -727,21 +729,20 @@ func handleSessionFork(profile string, args []string) {
 			os.Exit(1)
 		}
 
-		if !createNewBranch && !git.BranchExists(repoRoot, wtBranch) {
+		if !createNewBranch && !backend.BranchExists(wtBranch) {
 			out.Error(fmt.Sprintf("branch '%s' does not exist (use -b to create)", wtBranch), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 
-		worktreePath := git.WorktreePath(git.WorktreePathOptions{
+		worktreePath := backend.WorktreePath(vcs.WorktreePathOptions{
 			Branch:    wtBranch,
 			Location:  wtSettings.DefaultLocation,
-			RepoDir:   repoRoot,
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
 
 		// Check for an existing worktree for this branch before creating a new one
-		if existingPath, err := git.GetWorktreeForBranch(repoRoot, wtBranch); err == nil && existingPath != "" {
+		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
 			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
 			worktreePath = existingPath
 		} else {
@@ -755,16 +756,28 @@ func handleSessionFork(profile string, args []string) {
 				os.Exit(1)
 			}
 
-			setupErr, err := git.CreateWorktreeWithStateAndSetup(
-				repoRoot, worktreePath, wtBranch,
-				git.WorktreeStateOptions{WithState: wantState, WithIgnored: *withStateGitignored},
-				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
-			if err != nil {
-				out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
-				os.Exit(1)
-			}
-			if setupErr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
+			// --with-state* is git-specific (uses index/stash). Reject for jujutsu.
+			if backend.Type() == vcs.TypeGit {
+				setupErr, err := git.CreateWorktreeWithStateAndSetup(
+					repoRoot, worktreePath, wtBranch,
+					git.WorktreeStateOptions{WithState: wantState, WithIgnored: *withStateGitignored},
+					os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+				if err != nil {
+					out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				if setupErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
+				}
+			} else {
+				if wantState {
+					out.Error("--with-state is only supported for git repositories", ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				if err := backend.CreateWorktree(worktreePath, wtBranch); err != nil {
+					out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
 			}
 		}
 
@@ -781,6 +794,10 @@ func handleSessionFork(profile string, args []string) {
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to create fork: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	if worktreeType != "" {
+		forkedInst.WorktreeType = worktreeType
 	}
 
 	// Apply sandbox config if requested.
@@ -1146,6 +1163,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  color              Optional TUI row tint: '#RRGGBB' or ANSI '0'..'255' or '' (issue #391)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
+		fmt.Println("  account            Named account slot (#924) — resolves via [profiles.<account>.claude].config_dir; restart required")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -1928,6 +1946,17 @@ func handleSessionSend(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	if shouldSkipConductorHeartbeatSend(inst, message) {
+		out.Success(fmt.Sprintf("Skipped heartbeat for '%s'", inst.Title), map[string]interface{}{
+			"success":       true,
+			"skipped":       true,
+			"session_id":    inst.ID,
+			"session_title": inst.Title,
+			"message":       message,
+		})
+		return
+	}
+
 	// Get tmux session
 	tmuxSess := inst.GetTmuxSession()
 	if tmuxSess == nil {
@@ -2076,6 +2105,32 @@ func defaultSendOptions() sendRetryOptions {
 		checkDelay:     300 * time.Millisecond,
 		verifyDelivery: true,
 	}
+}
+
+func shouldSkipConductorHeartbeatSend(inst *session.Instance, message string) bool {
+	if inst == nil || !session.IsConductorHeartbeatMessage(message) {
+		return false
+	}
+	name := strings.TrimPrefix(inst.Title, session.ConductorSessionTitlePrefix)
+	if name == inst.Title || name == "" {
+		return false
+	}
+	meta, err := session.LoadConductorMeta(name)
+	if err != nil {
+		return false
+	}
+	idleMinutes := meta.GetHeartbeatIdleMinutes()
+	if idleMinutes <= 0 {
+		return false
+	}
+	lastActivity, err := session.GetConductorLastActivity(name, meta.Profile)
+	if err != nil {
+		return false
+	}
+	if lastActivity.IsZero() {
+		return false
+	}
+	return time.Since(lastActivity) >= time.Duration(idleMinutes)*time.Minute
 }
 
 // sendWithRetry sends a message atomically and retries Enter if the agent
@@ -2318,14 +2373,13 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 					waitingNoActivityChecks = 0
 					_ = target.SendCtrlC()
 					time.Sleep(200 * time.Millisecond)
-					if resendErr := target.SendKeysAndEnter(message); resendErr == nil {
-						// A successful resend is not yet evidence of receipt
-						// — the next iteration must still observe a positive
-						// signal — but we record the attempt so verifyDelivery
-						// can distinguish "send pipe ever fired" from "never
-						// even acked". Intentionally NOT setting
-						// sawDeliveryEvidence here.
-					}
+					// A successful resend is not yet evidence of receipt — the
+					// next iteration must still observe a positive signal — so
+					// we intentionally do NOT set sawDeliveryEvidence here, even
+					// when SendKeysAndEnter returns nil. The send attempt is
+					// recorded only so verifyDelivery can distinguish "pipe ever
+					// fired" from "never even acked".
+					_ = target.SendKeysAndEnter(message)
 					continue
 				}
 
@@ -2736,6 +2790,11 @@ func handleSessionOutput(profile string, args []string) {
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	copyFlag := fs.Bool("copy", false, "Copy output to system clipboard")
+	// #1101: --pane returns the raw tmux capture-pane content (with ANSI escapes
+	// and the tool's full UI chrome) instead of the parsed transcript "last
+	// response". The local TUI preview uses capture-pane; remote sessions
+	// fetched via SSH need this same content to render claude-formatted output.
+	paneFlag := fs.Bool("pane", false, "Return tmux capture-pane content (full UI with ANSI)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session output [id|title] [options]")
@@ -2780,6 +2839,32 @@ func handleSessionOutput(profile string, args []string) {
 			inst.ClaudeSessionID = freshID
 			inst.ClaudeDetectedAt = time.Now()
 		}
+	}
+
+	// #1101: --pane short-circuits the transcript path and returns the live
+	// tmux pane capture so remote previews can render the same claude-formatted
+	// content the local preview shows. We still emit a ResponseOutput-shaped
+	// JSON so the wire format is unchanged.
+	if *paneFlag {
+		paneContent, paneErr := inst.PreviewFull()
+		if paneErr != nil {
+			out.Error(fmt.Sprintf("failed to capture pane: %v", paneErr), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		jsonData := map[string]interface{}{
+			"success":       true,
+			"session_id":    inst.ID,
+			"session_title": inst.Title,
+			"tool":          inst.Tool,
+			"role":          "pane",
+			"content":       paneContent,
+		}
+		if quietMode {
+			fmt.Println(paneContent)
+			return
+		}
+		out.Print(paneContent, jsonData)
+		return
 	}
 
 	// Get the last response (best-effort fallback for smoother CLI reads)

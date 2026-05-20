@@ -224,6 +224,7 @@ func (h *HelpOverlay) View() string {
 				{"Space", "Jump mode"},
 				{mruKey, "Cycle recent sessions"},
 				{"Enter", "Attach / toggle"},
+				{"Shift+Enter", "Open session in new iTerm window (macOS)"},
 			},
 		},
 		{
@@ -253,6 +254,7 @@ func (h *HelpOverlay) View() string {
 				{skillsKey, "Skills Manager"},
 				{"$", "Cost Dashboard"},
 				{previewKey, "Toggle preview mode (output/stats/both)"},
+				{"< / >", "Shrink / grow preview pane by 5% (issue #1092)"},
 				{unreadKey, "Mark unread"},
 				{quickApproveKey, "Quick approve (send '1' to Claude)"},
 				{reorderUpKeys, "Reorder up (auto-promote at edge)"},

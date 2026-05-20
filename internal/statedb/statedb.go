@@ -14,11 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/logging"
 	_ "modernc.org/sqlite"
 )
-
-var statedbLog = logging.ForComponent(logging.CompStorage)
 
 // withBusyRetry runs op with linear backoff (10ms, 20ms, 30ms, 40ms, 50ms;
 // ~150ms total) when op fails with SQLITE_BUSY. Non-BUSY errors are returned
@@ -57,7 +54,7 @@ func withBusyRetry(op func() error) error {
 
 // SchemaVersion tracks the current database schema version.
 // Bump this when adding migrations.
-const SchemaVersion = 7
+const SchemaVersion = 9
 
 // StateDB wraps a SQLite database for session/group persistence.
 // Thread-safe for concurrent use from multiple goroutines within one process.
@@ -93,7 +90,12 @@ type InstanceRow struct {
 	WorktreePath   string
 	WorktreeRepo   string
 	WorktreeBranch string
-	ToolData       json.RawMessage // JSON blob for tool-specific data
+	// Account is the per-session named account (v1.9.22+, issue #924). Maps to
+	// `[profiles.<account>.claude].config_dir` at spawn time and becomes the
+	// most-specific level in the CLAUDE_CONFIG_DIR resolution chain. Empty
+	// means "fall through to conductor/group/env/profile/global/default".
+	Account  string
+	ToolData json.RawMessage // JSON blob for tool-specific data
 }
 
 // WatcherRow represents a watcher row in the database.
@@ -276,6 +278,7 @@ func (s *StateDB) Migrate() error {
 			worktree_path     TEXT NOT NULL DEFAULT '',
 			worktree_repo     TEXT NOT NULL DEFAULT '',
 			worktree_branch   TEXT NOT NULL DEFAULT '',
+			account           TEXT NOT NULL DEFAULT '',
 			tool_data       TEXT NOT NULL DEFAULT '{}',
 			acknowledged    INTEGER NOT NULL DEFAULT 0
 		)
@@ -418,6 +421,10 @@ func (s *StateDB) Migrate() error {
 		// v8 (issue #697, v1.7.52): title lock blocks Claude session-name sync.
 		// Default 0 keeps the pre-v1.7.52 behavior (#572 sync default-on) for existing rows.
 		"ALTER TABLE instances ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0",
+		// v9 (issue #924): per-session named account. Default '' preserves
+		// the pre-v1.9.22 behavior for legacy rows (fall through to
+		// conductor/group/env/profile/global/default).
+		"ALTER TABLE instances ADD COLUMN account TEXT NOT NULL DEFAULT ''",
 	}
 	for _, stmt := range alterMigrations {
 		if _, err := tx.Exec(stmt); err != nil {
@@ -468,6 +475,13 @@ func (s *StateDB) Migrate() error {
 			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0`); err != nil {
 				if !strings.Contains(err.Error(), "duplicate column") {
 					return fmt.Errorf("statedb: migrate v8 title_locked: %w", err)
+				}
+			}
+		}
+		if oldVer < 9 {
+			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN account TEXT NOT NULL DEFAULT ''`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					return fmt.Errorf("statedb: migrate v9 account: %w", err)
 				}
 			}
 		}
@@ -526,15 +540,15 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
-			worktree_path, worktree_repo, worktree_branch,
+			worktree_path, worktree_repo, worktree_branch, account,
 			tool_data, title_locked
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
 		inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
 		inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
 		inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
-		inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch,
+		inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
 		string(toolData), titleLockedInt,
 	)
 	return err
@@ -578,6 +592,8 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 			placeholders[i] = "?"
 			args[i] = inst.ID
 		}
+		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+		// from len(insts); all values flow through args[], never the SQL string.
 		query := "SELECT id, tool_data FROM instances WHERE id IN (" + strings.Join(placeholders, ",") + ")"
 		rows, queryErr := s.db.Query(query, args...)
 		if queryErr == nil {
@@ -610,6 +626,8 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 			placeholders[i] = "?"
 			args[i] = inst.ID
 		}
+		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+		// from len(insts); all values flow through args[], never the SQL string.
 		query := "DELETE FROM instances WHERE id NOT IN (" + strings.Join(placeholders, ",") + ")"
 		if _, err := tx.Exec(query, args...); err != nil {
 			return err
@@ -622,9 +640,9 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
-			worktree_path, worktree_repo, worktree_branch,
+			worktree_path, worktree_repo, worktree_branch, account,
 			tool_data, title_locked
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -656,7 +674,7 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow) error {
 			inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
 			inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
 			inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
-			inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch,
+			inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
 			string(toolData), titleLockedInt,
 		); err != nil {
 			return err
@@ -673,7 +691,7 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
-			worktree_path, worktree_repo, worktree_branch,
+			worktree_path, worktree_repo, worktree_branch, account,
 			tool_data, title_locked
 		FROM instances ORDER BY sort_order
 	`)
@@ -693,7 +711,7 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 			&r.Command, &r.Wrapper, &r.Tool, &r.Status, &r.TmuxSession, &r.TmuxSocketName,
 			&createdUnix, &accessedUnix,
 			&r.ParentSessionID, &isConductorInt, &noTransitionNotifyInt,
-			&r.WorktreePath, &r.WorktreeRepo, &r.WorktreeBranch,
+			&r.WorktreePath, &r.WorktreeRepo, &r.WorktreeBranch, &r.Account,
 			&toolDataStr, &titleLockedInt,
 		); err != nil {
 			return nil, err
@@ -738,14 +756,6 @@ func (s *StateDB) InstanceExists(id string) (bool, error) {
 		return false, err
 	}
 	return true, nil
-}
-
-// UpdateInstanceField updates a single column for a given instance.
-// field must be a valid column name (caller is responsible for safety).
-func (s *StateDB) UpdateInstanceField(id, field string, value any) error {
-	query := fmt.Sprintf("UPDATE instances SET %s = ? WHERE id = ?", field)
-	_, err := s.db.Exec(query, value, id)
-	return err
 }
 
 // --- Group CRUD ---

@@ -34,10 +34,11 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
 	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/asheshgoplani/agent-deck/internal/vcs"
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.17" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.24" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -776,6 +777,15 @@ func main() {
 	ui.DisableKittyKeyboard(os.Stdout)
 	defer ui.RestoreKittyKeyboard(os.Stdout)
 
+	// Issue #1093: also request xterm modifyOtherKeys mode 1 so iTerm2 (and
+	// other xterm-compatible terminals) send Shift+Enter as a distinct
+	// CSI 27;2;13~ sequence instead of plain '\r'. Without this, Bubble Tea
+	// v1.3.10 cannot distinguish Shift+Enter from Enter on a fresh launch,
+	// and the "open in new iTerm window" binding shipped in #1077 falls
+	// through to the in-pane attach handler. Plain Enter is unaffected.
+	ui.EnableModifyOtherKeys(os.Stdout)
+	defer ui.DisableModifyOtherKeys(os.Stdout)
+
 	p := tea.NewProgram(
 		homeModel,
 		tea.WithAltScreen(),
@@ -1169,6 +1179,12 @@ func handleAdd(profile string, args []string) {
 	// subsequent start/restart/revive always target the same socket.
 	tmuxSocket := fs.String("tmux-socket", "", "tmux -L socket name for this session (overrides [tmux].socket_name)")
 
+	// Per-session named account slot (#924). Maps to
+	// [profiles.<account>.claude].config_dir in ~/.agent-deck/config.toml
+	// and becomes the most-specific level of CLAUDE_CONFIG_DIR resolution.
+	// Empty = fall through to conductor/group/env/profile/global/default.
+	account := fs.String("account", "", "Named account slot (resolves via [profiles.<account>.claude].config_dir; #924)")
+
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck add [path] [options]")
 		fmt.Println()
@@ -1343,20 +1359,15 @@ func handleAdd(profile string, args []string) {
 	}
 
 	// Handle worktree creation
-	var worktreePath, worktreeRepoRoot string
+	var worktreePath, worktreeRepoRoot, worktreeType string
 	if wtBranch != "" {
-		// Validate path is a git repo (or a bare-repo project root with nested .bare/)
-		if !git.IsGitRepoOrBareProjectRoot(path) {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a git repository\n", path)
-			os.Exit(1)
-		}
-
-		// Get repo root (resolve through worktrees to prevent nesting)
-		repoRoot, err := git.GetWorktreeBaseRoot(path)
+		backend, err := detectAndCreateBackend(path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to get repo root: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+		worktreeType = string(backend.Type())
+		repoRoot := backend.RepoDir()
 
 		// Determine worktree settings and apply configured branch prefix
 		// (e.g., "$USER/" -> "dani.fernandez/") before validation/existence checks
@@ -1370,7 +1381,7 @@ func handleAdd(profile string, args []string) {
 		}
 
 		// Check -b flag logic: if -b is passed, branch must NOT exist (user wants new branch)
-		branchExists := git.BranchExists(repoRoot, wtBranch)
+		branchExists := backend.BranchExists(wtBranch)
 		if createNewBranch && branchExists {
 			fmt.Fprintf(
 				os.Stderr,
@@ -1386,16 +1397,15 @@ func handleAdd(profile string, args []string) {
 		}
 
 		// Generate worktree path
-		worktreePath = git.WorktreePath(git.WorktreePathOptions{
+		worktreePath = backend.WorktreePath(vcs.WorktreePathOptions{
 			Branch:    wtBranch,
 			Location:  location,
-			RepoDir:   repoRoot,
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
 
 		// Check for an existing worktree for this branch before creating a new one
-		if existingPath, err := git.GetWorktreeForBranch(repoRoot, wtBranch); err == nil && existingPath != "" {
+		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
 			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
 			worktreePath = existingPath
 		} else {
@@ -1407,7 +1417,7 @@ func handleAdd(profile string, args []string) {
 
 			// Create worktree atomically (git handles existence checks).
 			// This avoids a TOCTOU race from separate check-then-create steps.
-			setupErr, err := git.CreateWorktreeWithSetup(repoRoot, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				if isWorktreeAlreadyExistsError(err) {
 					fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)
@@ -1535,6 +1545,13 @@ func handleAdd(profile string, args []string) {
 		newInstance.Wrapper = sessionWrapperResolved
 	}
 
+	// #924 per-session named account slot — captured verbatim. The
+	// resolver silently falls through when no matching [profiles.<account>]
+	// block exists, so unknown names are never an error here.
+	if trimmed := strings.TrimSpace(*account); trimmed != "" {
+		newInstance.Account = trimmed
+	}
+
 	// Apply per-session model override after command/tool resolution so the
 	// tool-specific option field is populated correctly.
 	selectedModelID := strings.TrimSpace(*modelID)
@@ -1550,6 +1567,7 @@ func handleAdd(profile string, args []string) {
 		newInstance.WorktreePath = worktreePath
 		newInstance.WorktreeRepoRoot = worktreeRepoRoot
 		newInstance.WorktreeBranch = wtBranch
+		newInstance.WorktreeType = worktreeType
 	}
 
 	// Apply sandbox config if requested.
@@ -2036,12 +2054,16 @@ func handleRemove(profile string, args []string) {
 
 	// Clean up worktree directory if this is a worktree session
 	if inst.IsWorktree() {
-		if err := git.RemoveWorktree(inst.WorktreeRepoRoot, inst.WorktreePath, false); err != nil {
-			if !*jsonOutput {
-				fmt.Printf("Warning: failed to remove worktree: %v\n", err)
+		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
+			if err := backend.RemoveWorktree(inst.WorktreePath, false); err != nil {
+				if !*jsonOutput {
+					fmt.Printf("Warning: failed to remove worktree: %v\n", err)
+				}
 			}
+			_ = backend.PruneWorktrees()
+		} else if !*jsonOutput {
+			fmt.Printf("Warning: failed to initialize VCS for worktree cleanup: %v\n", err)
 		}
-		_ = git.PruneWorktrees(inst.WorktreeRepoRoot)
 	}
 
 	// Rebuild instance list without the deleted session and persist groups.
@@ -2789,6 +2811,9 @@ type brewRunner interface {
 type execBrewRunner struct{ bin string }
 
 func (e *execBrewRunner) Run(args ...string) ([]byte, error) {
+	// #nosec G204 -- e.bin is an internal path (typically "brew") chosen by
+	// the install path resolver; args are constructed by the brew_cmd.go
+	// runner, not from external input.
 	cmd := exec.Command(e.bin, args...)
 	cmd.Stdin = os.Stdin
 	var buf bytes.Buffer
@@ -3071,6 +3096,8 @@ func detectTool(cmd string) string {
 		return "crush"
 	case strings.Contains(cmd, "cursor"):
 		return "cursor"
+	case strings.Contains(cmd, "hermes"):
+		return "hermes"
 	default:
 		return "shell"
 	}
@@ -3359,6 +3386,9 @@ func handleUninstall(args []string) {
 		if f, err := os.Create(testFile); err != nil {
 			// Need elevated permissions
 			fmt.Printf("Requires sudo to remove %s\n", item.path)
+			// #nosec G204 -- item.path comes from the local uninstall scan
+			// (binary install paths), not external input. Fixed "sudo rm -f"
+			// args are hardcoded.
 			cmd := exec.Command("sudo", "rm", "-f", item.path)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr

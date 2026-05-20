@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/termreply"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/creack/pty"
@@ -298,6 +299,48 @@ func (r *SSHRunner) FetchSessionOutput(ctx context.Context, sessionID string) (s
 	return parseRemoteSessionOutput(output)
 }
 
+// FetchSessionPane retrieves the tmux capture-pane content for a remote session.
+// #1101: Local TUI previews render capture-pane content (ANSI + tool UI chrome).
+// Remote previews used to fetch only the parsed transcript text via
+// FetchSessionOutput, which is why claude-formatted output never showed for
+// SSH sessions. FetchSessionPane closes that gap by asking the remote for the
+// raw pane content via `session output --pane --json`.
+func (r *SSHRunner) FetchSessionPane(ctx context.Context, sessionID string) (string, error) {
+	output, err := r.Run(ctx, "session", "output", sessionID, "--pane", "--json")
+	if err != nil {
+		return "", err
+	}
+
+	return parseRemoteSessionOutput(output)
+}
+
+// FetchCostSummary retrieves the remote agent-deck's cost summary as JSON.
+// #1101: the local TUI's status-line cost segment used to show only events
+// written to the local cost_events table — remote sessions' Stop hooks write
+// to the remote DB, so their spend never surfaced locally. The TUI calls this
+// per configured remote and folds the totals into the displayed figures.
+//
+// Returns nil with no error when the remote returns empty output (older
+// agent-deck builds that predate `costs summary --json`). Callers should
+// treat a nil summary as "remote not available; render local-only totals".
+func (r *SSHRunner) FetchCostSummary(ctx context.Context) (*costs.RemoteCostSummary, error) {
+	output, err := r.Run(ctx, "costs", "summary", "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, nil
+	}
+
+	var summary costs.RemoteCostSummary
+	if err := json.Unmarshal(trimmed, &summary); err != nil {
+		return nil, fmt.Errorf("failed to parse remote cost summary: %w", err)
+	}
+	return &summary, nil
+}
+
 // DetectPlatform returns the remote host's OS and architecture (e.g., "linux", "amd64").
 func (r *SSHRunner) DetectPlatform(ctx context.Context) (goos, goarch string, err error) {
 	_ = os.MkdirAll(sshControlDir, 0700)
@@ -509,4 +552,37 @@ type RemoteSessionInfo struct {
 
 	// Set locally, not from JSON
 	RemoteName string `json:"-"`
+}
+
+// RemoteLatency is a live round-trip-time sample for a configured remote.
+// Tracked per remote host (not per session) — multiple sessions on the same
+// host share the same connection, so latency is a host-level metric. See
+// issue #1103.
+type RemoteLatency struct {
+	// MS is the round-trip time in milliseconds. Meaningful only when
+	// Offline is false.
+	MS int
+	// Offline is true when the most recent measurement attempt failed
+	// (network error, SSH dead, remote agent-deck binary missing, etc).
+	Offline bool
+	// MeasuredAt is when the sample was taken; zero value means never measured.
+	MeasuredAt time.Time
+}
+
+// MeasureLatency measures the round-trip time of a lightweight noop call
+// to the remote agent-deck binary. Returns the elapsed duration on success.
+//
+// Implementation note: we run `agent-deck --version` because it is the
+// cheapest possible call (no DB read, no tmux probe, no network back to
+// services). The ControlMaster socket is persisted across calls so we
+// measure mostly network RTT after the first hit, which is exactly what
+// the user wants to see in the header per #1103.
+func (r *SSHRunner) MeasureLatency(ctx context.Context) (time.Duration, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := r.run(timeoutCtx, "--version"); err != nil {
+		return 0, err
+	}
+	return time.Since(start), nil
 }

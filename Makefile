@@ -1,4 +1,4 @@
-.PHONY: build run install clean dev release-local test fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
+.PHONY: build run install clean dev release-local test test-perf bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
 
 BINARY_NAME=agent-deck
 BUILD_DIR=./build
@@ -10,7 +10,7 @@ TAILWIND_VERSION=v4.2.2
 TAILWIND_BIN=$(HOME)/.local/bin/tailwindcss
 
 # Pin Go toolchain to 1.24.0 to prevent Go 1.25+ runtime regression on macOS
-export GOTOOLCHAIN=go1.24.0
+export GOTOOLCHAIN=go1.25.10
 
 # Build the binary (requires compiled CSS via `make css`)
 build: css
@@ -129,6 +129,19 @@ dev:
 # Run tests (with race detector)
 test:
 	go test -race -v ./...
+
+# Run hard-gated walltime regression tests (Track B). Honors PERF_BUDGET_MULTIPLIER
+# (default 1.0 locally; CI sets 2.0). See docs/perf-budget-suite.md.
+test-perf:
+	PERF_BUDGET_MULTIPLIER=$${PERF_BUDGET_MULTIPLIER:-1.0} \
+		go test -run '^TestPerf_' -race -v -count=1 -timeout 120s \
+		./cmd/agent-deck/...
+
+# Run advisory benchmarks (Track A). No -race — race overhead distorts ns/op.
+# Output is for trending; not a CI gate.
+bench:
+	go test -run '^$$' -bench '^Benchmark' -benchmem -benchtime=1x -count=3 -timeout 5m \
+		./cmd/agent-deck/... ./internal/tmux/...
 
 # Format code
 fmt:

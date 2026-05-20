@@ -96,6 +96,18 @@ type Instance struct {
 	WorktreePath     string `json:"worktree_path,omitempty"`      // Path to worktree (if session is in worktree)
 	WorktreeRepoRoot string `json:"worktree_repo_root,omitempty"` // Original repo root
 	WorktreeBranch   string `json:"worktree_branch,omitempty"`    // Branch name in worktree
+	WorktreeType     string `json:"worktree_type,omitempty"`      // "git", "jujutsu", or "" (legacy = git)
+
+	// Account is the per-session named account slot (issue #924). Maps to
+	// `[profiles.<account>.claude].config_dir` in ~/.agent-deck/config.toml
+	// at spawn time and becomes the most-specific level in the
+	// CLAUDE_CONFIG_DIR resolution chain — beating conductor / group / env.
+	// Switching the value requires a session restart (the Option 1 MVP
+	// tradeoff): the in-flight Claude conversation is lost since the new
+	// account's settings.json and history live elsewhere. Empty means
+	// "fall through to conductor/group/env/profile/global/default" so
+	// pre-#924 sessions keep their existing behavior unchanged.
+	Account string `json:"account,omitempty"`
 
 	// Multi-repo support
 	MultiRepoEnabled   bool                `json:"multi_repo_enabled,omitempty"`
@@ -144,6 +156,13 @@ type Instance struct {
 	// pendingCodexRestartWarning is consumed by UI/CLI after Restart() succeeds.
 	// It is intentionally transient and never persisted.
 	pendingCodexRestartWarning string `json:"-"`
+
+	// GitHub Copilot CLI integration
+	CopilotSessionID  string    `json:"copilot_session_id,omitempty"`
+	CopilotDetectedAt time.Time `json:"copilot_detected_at,omitempty"`
+	CopilotStartedAt  int64     `json:"-"`                           // Unix millis when we started Copilot (for session matching, not persisted)
+	CopilotModel      string    `json:"copilot_model,omitempty"`     // Active model for this session
+	CopilotAllowAll   bool      `json:"copilot_allow_all,omitempty"` // Per-session --allow-all override
 
 	// Latest user input for context (extracted from session files)
 	LatestPrompt      string    `json:"latest_prompt,omitempty"`
@@ -1001,12 +1020,14 @@ func (i *Instance) buildGeminiCommand(baseCommand string) string {
 
 	// If baseCommand is just "gemini", handle specially
 	if baseCommand == "gemini" {
+		cmd := GetToolCommand("gemini")
 		// If we already have a session ID, use simple resume
 		if i.GeminiSessionID != "" {
 			// GEMINI_YOLO_MODE and GEMINI_SESSION_ID are propagated via host-side
 			// SetEnvironment after tmux start. No inline tmux set-environment.
 			return envPrefix + fmt.Sprintf(
-				"gemini --resume %s%s%s",
+				"%s --resume %s%s%s",
+				cmd,
 				i.GeminiSessionID,
 				yoloFlag,
 				modelFlag,
@@ -1018,7 +1039,8 @@ func (i *Instance) buildGeminiCommand(baseCommand string) string {
 		// because Gemini processes the "." prompt which takes too long
 		// GEMINI_YOLO_MODE is propagated via host-side SetEnvironment after tmux start.
 		return envPrefix + fmt.Sprintf(
-			`gemini%s%s`,
+			`%s%s%s`,
+			cmd,
 			yoloFlag,
 			modelFlag,
 		)
@@ -1045,17 +1067,18 @@ func (i *Instance) buildOpenCodeCommand(baseCommand string) string {
 
 	// If baseCommand is just "opencode", handle specially
 	if baseCommand == "opencode" {
+		cmd := GetToolCommand("opencode")
 		extraFlags := i.buildOpenCodeExtraFlags()
 
 		// If we already have a session ID, use resume with -s flag.
 		// OPENCODE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
 		if i.OpenCodeSessionID != "" {
-			return envPrefix + fmt.Sprintf("opencode -s %s%s",
-				i.OpenCodeSessionID, extraFlags)
+			return envPrefix + fmt.Sprintf("%s -s %s%s",
+				cmd, i.OpenCodeSessionID, extraFlags)
 		}
 
 		// Start OpenCode fresh - session ID will be captured async after startup
-		return envPrefix + "opencode" + extraFlags
+		return envPrefix + cmd + extraFlags
 	}
 
 	// For custom commands (e.g., fork commands), return as-is
@@ -1222,9 +1245,35 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	}
 
 	envPrefix := i.buildEnvSourceCommand()
+
+	// AGENTDECK_* env injection is required for the hook subprocesses spawned
+	// by tools in the codex family to find this session's state, so it is
+	// injected BEFORE the custom-command passthrough early-return below.
+	// Dropping it on custom-command sessions was the design regression flagged
+	// on #951 review — keep AGENTDECK_* on every codex-flavoured launch.
 	agentdeckEnvPrefix := fmt.Sprintf("AGENTDECK_INSTANCE_ID=%s AGENTDECK_TITLE=%q AGENTDECK_TOOL=%s ",
 		i.ID, i.Title, i.Tool)
 	envPrefix += agentdeckEnvPrefix
+
+	// Passthrough: if the tool is literally "codex" and user gave a custom command
+	// (not the bare "codex" name), return as-is without flag injection.
+	// Codex-compatible tools (e.g., "my-codex" with CompatibleWith="codex") always
+	// get the full treatment regardless of their command name.
+	trimmed := strings.TrimSpace(baseCommand)
+	if i.Tool == "codex" && trimmed != "codex" && trimmed != "" {
+		return envPrefix + trimmed
+	}
+	if isCodexHomeExplicit() {
+		codexHome := strings.TrimSpace(getCodexHomeDir())
+		if codexHome != "" {
+			if err := os.MkdirAll(codexHome, 0o755); err != nil {
+				sessionLog.Warn("codex_home_mkdir_failed",
+					slog.String("path", codexHome),
+					slog.String("error", err.Error()))
+			}
+		}
+		envPrefix += "CODEX_HOME=" + codexHome + " "
+	}
 
 	yoloFlag := i.resolveCodexYoloFlag()
 	modelFlag := i.resolveCodexModelFlag()
@@ -1258,15 +1307,49 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	return envPrefix + command + yoloFlag + modelFlag
 }
 
-// codexRolloutExists reports whether Codex has flushed a rollout JSONL for
-// the given session ID under $CODEX_HOME/sessions. Used by buildCodexCommand
-// to gate `codex resume <sid>` on a real on-disk rollout file (Issue #756).
-//
-// Codex layout: $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
-func codexRolloutExists(sessionID string) bool {
-	return codexRolloutExistsInHome(sessionID, getCodexHomeDir())
+// buildCursorCommand builds the command for the Cursor CLI (`cursor agent`).
+// continuePrev adds --continue so Restart resumes the previous chat in the workspace.
+// Env files from [shell].env_files are applied via buildEnvSourceCommand.
+func (i *Instance) buildCursorCommand(baseCommand string, continuePrev bool) string {
+	if i.Tool != "cursor" {
+		return baseCommand
+	}
+
+	envPrefix := i.buildEnvSourceCommand()
+	cmd := strings.TrimSpace(baseCommand)
+	if cmd == "" || strings.EqualFold(cmd, "cursor") {
+		cmd = "cursor agent"
+	}
+
+	out := envPrefix + cmd
+	if continuePrev && !strings.Contains(strings.ToLower(cmd), "--continue") {
+		out += " --continue"
+	}
+	return out
 }
 
+// buildCopilotCommand builds the command for GitHub Copilot CLI.
+// If baseCommand is the bare "copilot" name, applies config command override + env prefix.
+// Otherwise returns the custom command as-is with env prefix (passthrough).
+func (i *Instance) buildCopilotCommand(baseCommand string) string {
+	if i.Tool != "copilot" {
+		return baseCommand
+	}
+
+	envPrefix := i.buildEnvSourceCommand()
+
+	if baseCommand != "copilot" {
+		return envPrefix + baseCommand
+	}
+
+	return envPrefix + GetToolCommand("copilot")
+}
+
+// codexRolloutExistsInHome reports whether Codex has flushed a rollout JSONL
+// for the given session ID under codexHome/sessions. Used by buildCodexCommand
+// to gate `codex resume <sid>` on a real on-disk rollout file (Issue #756).
+//
+// Codex layout: codexHome/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
 func codexRolloutExistsInHome(sessionID, codexHome string) bool {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -1591,11 +1674,36 @@ func getCodexHomeDir() string {
 		return ExpandPath(codexHome)
 	}
 
+	if cfg, err := LoadUserConfig(); err == nil && cfg != nil {
+		profile := GetEffectiveProfile("")
+		if profileDir := cfg.GetProfileCodexConfigDir(profile); profileDir != "" {
+			return profileDir
+		}
+		if cfg.Codex.ConfigDir != "" {
+			return ExpandPath(cfg.Codex.ConfigDir)
+		}
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return filepath.Join(os.TempDir(), ".codex")
 	}
 	return filepath.Join(home, ".codex")
+}
+
+func isCodexHomeExplicit() bool {
+	if strings.TrimSpace(os.Getenv("CODEX_HOME")) != "" {
+		return true
+	}
+	cfg, err := LoadUserConfig()
+	if err != nil || cfg == nil {
+		return false
+	}
+	profile := GetEffectiveProfile("")
+	if cfg.GetProfileCodexConfigDir(profile) != "" {
+		return true
+	}
+	return strings.TrimSpace(cfg.Codex.ConfigDir) != ""
 }
 
 // runWithTimeout runs op in a goroutine and waits up to timeout for it to
@@ -1968,6 +2076,8 @@ func collectProcessTreePIDsViaPgrep(rootPID int) []int {
 		queue = queue[1:]
 		allPIDs = append(allPIDs, parent)
 
+		// #nosec G204 -- "pgrep" is a fixed binary name and the only argument is
+		// strconv.Itoa(int), never reachable from external input.
 		childrenRaw, err := exec.Command("pgrep", "-P", strconv.Itoa(parent)).Output()
 		if err != nil {
 			continue
@@ -1985,6 +2095,7 @@ func collectProcessTreePIDsViaPgrep(rootPID int) []int {
 }
 
 func isLikelyCodexProcessPID(pid int) bool {
+	// #nosec G204 -- "ps" is a fixed binary; only arg is strconv.Itoa(int).
 	argsOut, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
 	if err != nil {
 		return false
@@ -2064,6 +2175,9 @@ for f in /proc/[0-9]*/fd/*; do
 done`,
 		codexProbeMissingSentinel,
 	)
+	// #nosec G204 -- "docker exec" with internal SandboxContainer name and a
+	// hardcoded shell probe script (codexProbeMissingSentinel is a compile-time
+	// constant); no external input flows here.
 	out, err := exec.Command("docker", "exec", i.SandboxContainer, "sh", "-lc", script).Output()
 	if err != nil {
 		return "", ""
@@ -2087,6 +2201,7 @@ func (i *Instance) queryCodexSessionFromHostLsof() (string, string) {
 			continue
 		}
 
+		// #nosec G204 -- "lsof" is a fixed binary; only arg is strconv.Itoa(int).
 		out, err := exec.Command("lsof", "-p", strconv.Itoa(pid)).Output()
 		if err != nil {
 			var execErr *exec.Error
@@ -2513,8 +2628,27 @@ func (i *Instance) ensureClaudeSessionIDFromDiskForRestart() {
 		slog.String("reason", "jsonl_discovery_restart"))
 }
 
-// Start starts the session in tmux
+// Start starts the session in tmux.
+//
+// Issue #1040: gated by acquireInstanceSpawnLock plus a "spawned-while-
+// we-waited" stamp so concurrent `agent-deck session start <id>`
+// invocations after a Claude exit don't each fall through the "tmux
+// session does not exist" gate and spawn parallel sessions. The lock
+// and gate are inlined here (rather than wrapping the whole body in a
+// SpawnAttempt helper) to preserve the structural-grep contract that
+// checks Start()'s body for the #745 IsForkAwaitingStart guard.
 func (i *Instance) Start() error {
+	beforeLock := nowFn()
+	release, lockErr := acquireInstanceSpawnLock(i.ID)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
+	if spawnedSince(i.ID, beforeLock) {
+		return nil
+	}
+	defer recordInstanceSpawn(i.ID)
+
 	if i.tmuxSession == nil {
 		return fmt.Errorf("tmux session not initialized")
 	}
@@ -2575,6 +2709,10 @@ func (i *Instance) Start() error {
 		}
 	case i.Tool == "gemini":
 		command = i.buildGeminiCommand(i.Command)
+	case i.Tool == "copilot":
+		command = buildCopilotCommand(i)
+		// Record start time for session ID detection (Unix millis)
+		i.CopilotStartedAt = time.Now().UnixMilli()
 	case i.Tool == "opencode":
 		command = i.buildOpenCodeCommand(i.Command)
 		// Record start time for session ID detection (Unix millis)
@@ -2583,6 +2721,12 @@ func (i *Instance) Start() error {
 		command = i.buildCodexCommand(i.Command)
 		// Record start time for session ID detection (Unix millis)
 		i.CodexStartedAt = time.Now().UnixMilli()
+	case i.Tool == "copilot":
+		command = i.buildCopilotCommand(i.Command)
+	case i.Tool == "cursor":
+		command = i.buildCursorCommand(i.Command, false)
+	case i.Tool == "hermes":
+		command = i.buildHermesCommand(i.Command)
 	default:
 		// Check if this is a custom tool with session resume config
 		if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -2651,6 +2795,10 @@ func (i *Instance) Start() error {
 	}
 	// OpenCode and Codex IDs are detected asynchronously; SyncSessionIDsToTmux() handles
 	// propagation once they are available.
+	// Copilot session ID propagation (if already known from prior session)
+	if i.CopilotSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("COPILOT_SESSION_ID", i.CopilotSessionID)
+	}
 
 	// Propagate COLORFGBG into the tmux session environment so that any new
 	// shell or process spawned inside the session inherits the correct
@@ -2685,6 +2833,12 @@ func (i *Instance) Start() error {
 		go i.detectCodexSessionAsync()
 	}
 
+	// Start async session ID detection for Copilot
+	// This runs in background and captures the session ID from events.jsonl
+	if i.Tool == "copilot" && i.CopilotSessionID == "" {
+		go i.detectCopilotSessionAsync()
+	}
+
 	return nil
 }
 
@@ -2692,7 +2846,22 @@ func (i *Instance) Start() error {
 // The message is sent synchronously after detecting the agent's prompt
 // This approach is more reliable than embedding send logic in the tmux command
 // Works for Claude, Gemini, OpenCode, and other agents
+//
+// Issue #1040: same per-instance spawn lock as Start() — a concurrent
+// `launch -m "..."` racing with a poller-triggered Start() must not
+// produce two parallel tmux sessions.
 func (i *Instance) StartWithMessage(message string) error {
+	beforeLock := nowFn()
+	release, lockErr := acquireInstanceSpawnLock(i.ID)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
+	if spawnedSince(i.ID, beforeLock) {
+		return nil
+	}
+	defer recordInstanceSpawn(i.ID)
+
 	if i.tmuxSession == nil {
 		return fmt.Errorf("tmux session not initialized")
 	}
@@ -2754,8 +2923,14 @@ func (i *Instance) StartWithMessage(message string) error {
 	case IsCodexCompatible(i.Tool):
 		command = i.buildCodexCommand(i.Command)
 		i.CodexStartedAt = time.Now().UnixMilli()
+	case i.Tool == "copilot":
+		command = i.buildCopilotCommand(i.Command)
 	case i.Tool == "crush":
 		command = i.buildCrushCommand(i.Command)
+	case i.Tool == "cursor":
+		command = i.buildCursorCommand(i.Command, false)
+	case i.Tool == "hermes":
+		command = i.buildHermesCommand(i.Command)
 	default:
 		// Check if this is a custom tool with session resume config
 		if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -3188,6 +3363,15 @@ func (i *Instance) UpdateStatus() error {
 	i.mu.Unlock()
 	status, err := i.tmuxSession.GetStatus()
 	i.mu.Lock()
+
+	// Issue #953: a concurrent Kill() may have published StatusStopped
+	// while we were unlocked for the GetStatus call above. Honoring a
+	// stale tmux-derived status now would clobber the user-initiated
+	// stop with idle/running/error and the next render would show the
+	// wrong icon (the original v1.9.20 user-visible symptom).
+	if i.Status == StatusStopped {
+		return nil
+	}
 
 	if err != nil {
 		i.Status = StatusError
@@ -3809,10 +3993,48 @@ func (i *Instance) PostStartSync(maxWait time.Duration) {
 	switch {
 	case IsClaudeCompatible(i.Tool):
 		i.WaitForClaudeSession(maxWait)
+		i.autoConfirmClaudeResumePicker()
 	case i.Tool == "gemini":
 		i.UpdateGeminiSession(nil)
+	case i.Tool == "copilot":
+		// Copilot uses async detection via detectCopilotSessionAsync().
+		// If the session was not yet detected, attempt a quick sync check.
+		if i.CopilotSessionID == "" {
+			cwd := i.EffectiveWorkingDir()
+			startedAfter := time.Now().Add(-30 * time.Second)
+			if i.CopilotStartedAt > 0 {
+				startedAfter = time.UnixMilli(i.CopilotStartedAt).Add(-2 * time.Second)
+			}
+			if sid := detectCopilotSessionFromDisk(cwd, startedAfter); sid != "" {
+				i.CopilotSessionID = sid
+				i.CopilotDetectedAt = time.Now()
+				if i.tmuxSession != nil {
+					_ = i.tmuxSession.SetEnvironment("COPILOT_SESSION_ID", sid)
+				}
+			}
+		}
 	}
 	// OpenCode/Codex: async detection already started by Start(), skip here
+}
+
+// autoConfirmClaudeResumePicker handles the "Resume from summary" picker that
+// claude --resume shows on long-running sessions (>~250k tokens). Without
+// this, an unattended conductor sits frozen on the picker indefinitely.
+// See issue #67. Disable via [claude].auto_resume_summary = false.
+func (i *Instance) autoConfirmClaudeResumePicker() {
+	if i.tmuxSession == nil {
+		return
+	}
+	cfg, _ := LoadUserConfig()
+	if cfg != nil && !cfg.Claude.GetAutoResumeSummary() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = autoResolveClaudeResumePicker(ctx, i.tmuxSession, i.tmuxSession, autoResumeOptions{
+		PollInterval: 250 * time.Millisecond,
+		Timeout:      3 * time.Second,
+	})
 }
 
 // Preview returns the last 3 lines of terminal output
@@ -3895,6 +4117,11 @@ func (i *Instance) SyncSessionIDsToTmux() {
 	if i.CodexSessionID != "" {
 		_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", i.CodexSessionID)
 	}
+
+	// Sync CopilotSessionID
+	if i.CopilotSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("COPILOT_SESSION_ID", i.CopilotSessionID)
+	}
 }
 
 func (i *Instance) clearSessionBindingForFreshStart() {
@@ -3923,6 +4150,12 @@ func (i *Instance) clearSessionBindingForFreshStart() {
 		i.mu.Lock()
 		i.pendingCodexRestartWarning = ""
 		i.mu.Unlock()
+	}
+
+	if i.Tool == "copilot" {
+		i.CopilotSessionID = ""
+		i.CopilotDetectedAt = time.Time{}
+		i.CopilotStartedAt = 0
 	}
 }
 
@@ -3986,6 +4219,13 @@ func (i *Instance) SyncSessionIDsFromTmux() {
 
 	if id, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && id != "" {
 		i.CodexSessionID = id
+	}
+
+	if id, err := i.tmuxSession.GetEnvironment("COPILOT_SESSION_ID"); err == nil && id != "" {
+		i.CopilotSessionID = id
+		if i.CopilotDetectedAt.IsZero() {
+			i.CopilotDetectedAt = time.Now()
+		}
 	}
 }
 
@@ -4675,8 +4915,26 @@ func (i *Instance) killInternal(sync bool) error {
 	// SIGKILL anything still alive.
 	i.reapTrackedMCPChildren()
 
-	// Kill tmux session first, but always continue to container cleanup.
+	// Issue #953: kill the tmux session AND publish StatusStopped
+	// atomically under i.mu so concurrent UpdateStatus() callers (most
+	// notably the TUI's backgroundStatusUpdate poller) cannot observe
+	// the intermediate state where the tmux pane is gone but Status
+	// still reflects the pre-kill running/idle value. The pre-existing
+	// !tmuxSession.Exists() branch in UpdateStatus then short-circuits
+	// on `Status == StatusStopped` (lines around 3221/3237) and leaves
+	// the status alone. Setting Status only AFTER the tmux Kill (and
+	// not before) also prevents the symmetric "Status is stopped, tmux
+	// is alive — must be a user-initiated restart, flip to Running"
+	// path at line 3245 from firing during the cleanup window.
+	//
+	// Holding the lock around the kill is safe: tmuxSession.Kill() is
+	// a single tmux command (the process-tree reaping is deferred to a
+	// goroutine via ensureProcessesDead). The KillAndWait variant can
+	// take up to 3s when escalating to SIGKILL — only short-lived CLI
+	// processes (session remove) take that path, and they have no
+	// concurrent TUI render contending for the lock.
 	var tmuxErr error
+	i.mu.Lock()
 	if i.tmuxSession != nil {
 		if sync {
 			tmuxErr = i.tmuxSession.KillAndWait()
@@ -4684,6 +4942,8 @@ func (i *Instance) killInternal(sync bool) error {
 			tmuxErr = i.tmuxSession.Kill()
 		}
 	}
+	i.Status = StatusStopped
+	i.mu.Unlock()
 
 	// Clean up sandbox container (only if name matches our prefix convention).
 	// Runs regardless of tmux kill result to avoid orphaned containers.
@@ -4714,7 +4974,9 @@ func (i *Instance) killInternal(sync bool) error {
 	// dir on an unclean shutdown is harmless, just wasteful.
 	i.CleanupWorkerScratchConfigDir()
 
-	i.Status = StatusStopped
+	// Issue #953: StatusStopped was already written under i.mu at the top
+	// of this function. Re-asserting it here without the lock would
+	// reintroduce the write/write data race with concurrent UpdateStatus.
 
 	if tmuxErr != nil {
 		return fmt.Errorf("failed to kill tmux session: %w", tmuxErr)
@@ -4725,7 +4987,25 @@ func (i *Instance) killInternal(sync bool) error {
 // Restart restarts the Claude session
 // For Claude sessions with known ID: sends Ctrl+C twice and resume command to existing session
 // For dead sessions or unknown ID: recreates the tmux session
+//
+// Issue #1040: gated by acquireInstanceSpawnLock plus a "spawned-while-
+// we-waited" stamp so concurrent callers (TUI poller + RC-exit handler
+// in-process; multiple `agent-deck session start` CLI invocations
+// cross-process) cannot each race to recreate a tmux session for the
+// same instance. A legitimate manual restart still proceeds because the
+// stamp from any prior spawn pre-dates the new caller's beforeLock.
 func (i *Instance) Restart() error {
+	beforeLock := nowFn()
+	release, lockErr := acquireInstanceSpawnLock(i.ID)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
+	if spawnedSince(i.ID, beforeLock) {
+		return nil
+	}
+	defer recordInstanceSpawn(i.ID)
+
 	mcpLog.Debug(
 		"restart_called",
 		slog.String("tool", i.Tool),
@@ -5031,8 +5311,14 @@ func (i *Instance) Restart() error {
 			command = i.buildCodexCommand(i.Command)
 			// Record start time for async session ID detection
 			i.CodexStartedAt = time.Now().UnixMilli()
+		case i.Tool == "copilot":
+			command = i.buildCopilotCommand(i.Command)
 		case i.Tool == "crush":
 			command = i.buildCrushCommand(i.Command)
+		case i.Tool == "cursor":
+			command = i.buildCursorCommand(i.Command, true)
+		case i.Tool == "hermes":
+			command = i.buildHermesCommand(i.Command)
 		default:
 			// Check if this is a custom tool with session resume config
 			if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -6632,6 +6918,9 @@ func sandboxTmpExecutable(ctx context.Context, ctr *docker.Container) bool {
 func sandboxExecProbe(ctx context.Context, ctr *docker.Container, script string) bool {
 	prefix := ctr.ExecPrefixNonInteractive()
 	args := append(prefix[1:], "bash", "-lc", script)
+	// #nosec G204 -- prefix comes from docker.Container.ExecPrefixNonInteractive
+	// (returns ["docker", "exec", containerName]); script is a hardcoded probe
+	// snippet from callers above. No external input.
 	_, err := exec.CommandContext(ctx, prefix[0], args...).CombinedOutput()
 	return err == nil
 }
