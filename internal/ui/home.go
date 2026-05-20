@@ -808,6 +808,19 @@ type teardownResultMsg struct {
 	err   error
 }
 
+// teardownMoveGroupMsg fires after the rename has settled and asks the UI to
+// move the session to maia/standby. Splitting the y-key flow into staged
+// messages prevents the tmux rename and the group-move from racing each other.
+type teardownMoveGroupMsg struct {
+	inst *session.Instance
+}
+
+// teardownStartMsg fires after the group move has settled and kicks off the
+// async make-down/restart/!gr//clear sequence.
+type teardownStartMsg struct {
+	inst *session.Instance
+}
+
 // remoteSessionsFetchedMsg is sent when async remote sessions fetch completes.
 type remoteSessionsFetchedMsg struct {
 	sessions map[string][]session.RemoteSessionInfo
@@ -5004,6 +5017,30 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case teardownMoveGroupMsg:
+		// Stage 2 of the y-key flow: move into maia/standby after the rename
+		// has had ~800ms to propagate through tmux + persist.
+		if msg.inst != nil {
+			h.groupTree.MoveSessionToGroup(msg.inst, "maia/standby")
+			h.instancesMu.Lock()
+			h.instances = h.groupTree.GetAllInstances()
+			h.instancesMu.Unlock()
+			h.rebuildFlatItems()
+			h.saveInstances()
+			h.resumingSessions[msg.inst.ID] = time.Now()
+		}
+		inst := msg.inst
+		return h, tea.Tick(800*time.Millisecond, func(_ time.Time) tea.Msg {
+			return teardownStartMsg{inst: inst}
+		})
+
+	case teardownStartMsg:
+		// Stage 3: kick off the async make-down/restart/!gr//clear sequence.
+		if msg.inst == nil {
+			return h, nil
+		}
+		return h, h.teardownSession(msg.inst)
+
 	case teardownResultMsg:
 		if msg.err != nil {
 			h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
@@ -7095,6 +7132,9 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y":
 		// Teardown: rename session to "o", move to "maia/standby", restart,
 		// then send `!gr` + `/clear`. Mirrors the MAIA `/teardown` skill end-state.
+		// Each agent-deck step is staged via tea.Tick so the rename can settle
+		// before the group move, and the group move can settle before the
+		// async make-down/restart sequence kicks in.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
@@ -7103,14 +7143,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				inst.SyncTmuxDisplayName()
 				h.pendingTitleChanges[inst.ID] = "o"
 				h.invalidatePreviewCache(inst.ID)
-				h.groupTree.MoveSessionToGroup(inst, "maia/standby")
-				h.instancesMu.Lock()
-				h.instances = h.groupTree.GetAllInstances()
-				h.instancesMu.Unlock()
-				h.rebuildFlatItems()
 				h.saveInstances()
-				h.resumingSessions[inst.ID] = time.Now()
-				return h, h.teardownSession(inst)
+				return h, tea.Tick(800*time.Millisecond, func(_ time.Time) tea.Msg {
+					return teardownMoveGroupMsg{inst: inst}
+				})
 			}
 		}
 		return h, nil
@@ -14713,10 +14749,11 @@ func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
 				uiLog.Info("teardown_make_down_failed", "session", s.Title, "dir", wd, "err", err, "output", string(out))
 			}
 		}
+		time.Sleep(2 * time.Second)
 		if err := s.Restart(); err != nil {
 			return teardownResultMsg{title: s.Title, err: fmt.Errorf("restart: %w", err)}
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(5 * time.Second)
 		tmuxSession := s.GetTmuxSession()
 		if tmuxSession == nil {
 			return teardownResultMsg{title: s.Title, err: fmt.Errorf("no tmux pane after restart")}
@@ -14724,10 +14761,11 @@ func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
 		if err := tmuxSession.SendKeysAndEnter("!gr"); err != nil {
 			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send !gr: %w", err)}
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(5 * time.Second)
 		if err := tmuxSession.SendKeysAndEnter("/clear"); err != nil {
 			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send /clear: %w", err)}
 		}
+		time.Sleep(2 * time.Second)
 		return teardownResultMsg{title: s.Title}
 	}
 }
