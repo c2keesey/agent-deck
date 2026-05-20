@@ -6744,11 +6744,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "o":
-		// Move session to different group
+		// Move session to different group. Pin the dialog to this session's
+		// ID so a background flatItems reshuffle while the dialog is open
+		// can't retarget the move to a different session under the cursor.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
-			if item.Type == session.ItemTypeSession {
-				h.groupDialog.ShowMove(h.scopedGroupPaths())
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				h.groupDialog.ShowMove(h.scopedGroupPaths(), item.Session.ID)
 			}
 		}
 		return h, nil
@@ -8256,11 +8258,15 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.saveInstances()
 			}
 		case GroupDialogMove:
+			// Resolve the session by ID captured at dialog open, not by the
+			// current cursor position: flatItems can reshuffle while the
+			// dialog is open (status ticks, group reorders), and reading
+			// h.flatItems[h.cursor] here would target the wrong session.
 			targetGroupPath := h.groupDialog.GetSelectedGroup()
-			if targetGroupPath != "" && h.cursor < len(h.flatItems) {
-				item := h.flatItems[h.cursor]
-				if item.Type == session.ItemTypeSession {
-					h.groupTree.MoveSessionToGroup(item.Session, targetGroupPath)
+			sessionID := h.groupDialog.GetSessionID()
+			if targetGroupPath != "" && sessionID != "" {
+				if inst := h.getInstanceByID(sessionID); inst != nil {
+					h.groupTree.MoveSessionToGroup(inst, targetGroupPath)
 					h.instancesMu.Lock()
 					h.instances = h.groupTree.GetAllInstances()
 					h.instancesMu.Unlock()
