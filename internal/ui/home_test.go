@@ -537,13 +537,13 @@ func TestHomeMoveSessionWithDuplicateGroupNamesUsesSelectedPath(t *testing.T) {
 	}
 	home.cursor = sessionIdx
 
-	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}})
+	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	h, ok := model.(*Home)
 	if !ok {
 		t.Fatal("Update should return *Home")
 	}
 	if !h.groupDialog.IsVisible() || h.groupDialog.Mode() != GroupDialogMove {
-		t.Fatal("move dialog should be visible after pressing M on a session")
+		t.Fatal("move dialog should be visible after pressing 'o' on a session")
 	}
 
 	targetIdx := -1
