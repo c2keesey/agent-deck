@@ -53,7 +53,43 @@ var hostHasTelegramConductor = func() bool {
 	if err != nil || cfg == nil {
 		return false
 	}
-	return strings.TrimSpace(cfg.Conductor.Telegram.Token) != ""
+	return configDeclaresTelegram(cfg)
+}
+
+// configDeclaresTelegram reports whether the host runs a telegram conductor
+// under EITHER the legacy single-bot topology OR the modern per-conductor
+// env_file topology (issue #1163).
+//
+// The legacy field `[conductor.telegram].token` is empty under the 7-bot
+// setup — each conductor declares its bot via a `[conductors.<name>].claude.env_file`
+// whose .envrc exports TELEGRAM_STATE_DIR. Reading only the legacy field left
+// the scratch-pin gate (#759/#1137) permanently disarmed, so conductor-spawned
+// children inherited the conductor's telegram=true CLAUDE_CONFIG_DIR and fired
+// duplicate default-bot pollers. Detecting the modern topology re-arms the gate
+// for every spawn path.
+func configDeclaresTelegram(cfg *UserConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	// Legacy single-bot token.
+	if strings.TrimSpace(cfg.Conductor.Telegram.Token) != "" {
+		return true
+	}
+	// Modern topology: any conductor whose env_file defines TELEGRAM_STATE_DIR.
+	for _, c := range cfg.Conductors {
+		ef := strings.TrimSpace(c.Claude.EnvFile)
+		if ef == "" {
+			continue
+		}
+		data, err := os.ReadFile(ExpandPath(ef))
+		if err != nil {
+			continue // missing/unreadable env_file is not a telegram declaration
+		}
+		if strings.Contains(string(data), "TELEGRAM_STATE_DIR") {
+			return true
+		}
+	}
+	return false
 }
 
 // NeedsWorkerScratchConfigDir is true when a scratch CLAUDE_CONFIG_DIR
@@ -73,7 +109,8 @@ var hostHasTelegramConductor = func() bool {
 func (i *Instance) NeedsWorkerScratchConfigDir() bool {
 	return needsScratchForTelegram(i) ||
 		needsScratchForExplicitPlugins(i) ||
-		needsScratchForGlobalChannelConflict(i)
+		needsScratchForGlobalChannelConflict(i) ||
+		needsScratchForTelegramChannelOwner(i)
 }
 
 func needsScratchForTelegram(i *Instance) bool {
@@ -143,8 +180,43 @@ func globalTelegramEnablementSet(sourceProfileDir string) bool {
 }
 
 func computeDenyList(i *Instance) []string {
+	// Issue #1134: channel-owning sessions MUST keep their channel
+	// plugin enabled — `--channels` is a routing/wiring directive and
+	// claude only opens the MCP stdio transport when the plugin is
+	// enabled in settings.json. Denying telegram here causes the bun
+	// child to spawn in task-mode (no MCP handshake) and crash-respawn,
+	// taking Telegram inbound offline for the conductor.
+	// computeChannelPluginAllowList re-enables the plugin in scratch
+	// settings.json; we must also stop denying it here so the deny
+	// pass doesn't overwrite the allow.
+	if sessionHasTelegramChannel(i) {
+		return nil
+	}
 	if needsScratchForTelegram(i) || needsScratchForGlobalChannelConflict(i) {
 		return []string{telegramPluginID}
+	}
+	return nil
+}
+
+// computeChannelPluginAllowList returns plugin IDs that this session
+// references via .Channels and MUST therefore be ENABLED in the
+// scratch settings.json. Channel plugins are wired by claude's
+// `--channels` arg AFTER the plugin's MCP server starts; if the plugin
+// is disabled in settings.json the server never starts, `--channels`
+// has nothing to wire, and bun crashes in a respawn loop. Issue #1134.
+//
+// Today only telegram is a channel plugin; if other channel plugins
+// land in the future, add their (channel-prefix, plugin-id) pairs
+// here. The allow list is applied AFTER computeAllowList so it cannot
+// be silently dropped by the catalog default-false pass.
+func computeChannelPluginAllowList(i *Instance) []string {
+	if i == nil {
+		return nil
+	}
+	for _, ch := range i.Channels {
+		if strings.HasPrefix(ch, telegramChannelPrefix) {
+			return []string{telegramPluginID}
+		}
 	}
 	return nil
 }
@@ -261,6 +333,15 @@ func (i *Instance) EnsureWorkerScratchConfigDir(sourceProfileDir string) (string
 	}
 	allowSet := map[string]struct{}{}
 	for _, id := range computeAllowList(i) {
+		plugins[id] = true
+		allowSet[id] = struct{}{}
+	}
+	// Issue #1134: channel-owning sessions need their channel plugin
+	// enabled so claude's `--channels` flag has a live MCP server to
+	// wire its routing to. Applied AFTER computeAllowList so the
+	// catalog default-false pass below treats channel plugins as
+	// attached and leaves them true.
+	for _, id := range computeChannelPluginAllowList(i) {
 		plugins[id] = true
 		allowSet[id] = struct{}{}
 	}
@@ -410,6 +491,21 @@ func (i *Instance) prepareWorkerScratchConfigDirForSpawn() {
 		return
 	}
 	i.WorkerScratchConfigDir = scratch
+
+	// Issue #1138: post-write verification. After the scratch
+	// settings.json is rewritten, confirm the channel plugin is
+	// actually enabled in the EFFECTIVE config dir (scratch when
+	// present, ambient otherwise). Any failure here means `--channels`
+	// would land on a disabled plugin and bun-telegram would never
+	// spawn — surface it loudly so operators can heal manually if the
+	// force-correct itself somehow drifted.
+	effectiveDir := scratch
+	if effectiveDir == "" {
+		effectiveDir = sourceDir
+	}
+	if result := VerifyTelegramChannelEnabled(effectiveDir, i.Channels); !result.OK {
+		EmitTelegramChannelDriftWarning(i.Title, i.ID, effectiveDir, i.Channels, result)
+	}
 }
 
 // macOSScratchWarningEmitter is the package-level seam that lets tests

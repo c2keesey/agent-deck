@@ -285,6 +285,13 @@ type Home struct {
 	lastFullStatusSweep atomic.Int64             // UnixNano timestamp of last full background status sweep
 	lastPersistedStatus map[string]string        // instanceID -> last status written to SQLite
 
+	// Issue #1143: auto-stop dormant child sessions via central poll.
+	// Coalesced into the existing 2-second statusWorker tick by way of
+	// idleTimeoutLastTick, so we don't burn extra goroutines and the watcher
+	// only runs every ~60s.
+	idleTimeoutWatcher  *session.IdleTimeoutWatcher
+	idleTimeoutLastTick atomic.Int64 // UnixNano
+
 	// PERFORMANCE: Worker pool for output-driven status updates (Priority 2)
 	// Caps the number of goroutines spawned for %output events from control pipes
 	logUpdateChan chan *session.Instance // Buffers status update requests from PipeManager
@@ -466,6 +473,10 @@ type Home struct {
 	remoteSessionsMu   sync.RWMutex
 	lastRemoteFetch    time.Time // When remote sessions were last fetched
 	remotesFetchActive bool      // Prevents overlapping fetches
+	// remoteSessionRefreshSec is the poll cadence (seconds) for re-fetching
+	// the remote session list, resolved once at construction from
+	// [ui] remote_session_refresh_secs. Issue #1170.
+	remoteSessionRefreshSec int
 
 	// Remote latency (issue #1103) — measured per remote host on the same
 	// cadence as CPU/RAM (see UISettings.GetRemoteLatencyRefreshSecs).
@@ -543,6 +554,10 @@ type Home struct {
 	insertBuf           strings.Builder
 	insertFlushPending  bool
 	insertBatchDuration time.Duration
+	// insertPreviewRefreshPending guards the fast preview-refresh tick armed
+	// after an insert keystroke (#1131). Only one tick is in flight at a time;
+	// see scheduleInsertPreviewRefresh.
+	insertPreviewRefreshPending bool
 	// openInNewWindowSink is an optional override used by tests to capture
 	// Shift+Enter dispatches without spawning a real iTerm2 window. When
 	// nil, the dispatch calls terminal.OpenSessionInNewWindow directly.
@@ -826,6 +841,10 @@ type remoteSessionsFetchedMsg struct {
 	sessions map[string][]session.RemoteSessionInfo
 	// #1101: per-remote cost summary collected on the same SSH fanout.
 	costs map[string]*costs.RemoteCostSummary
+	// failed marks remotes whose fetch errored this round (issue #1170).
+	// The handler keeps their last-good sessions instead of wiping them,
+	// so one slow/offline remote can't flicker the whole list.
+	failed map[string]bool
 }
 
 // remoteLatenciesFetchedMsg is sent when an async batch of latency
@@ -969,6 +988,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		worktreeDirtyCacheTs: make(map[string]time.Time),
 		statusTrigger:        make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
 		statusWorkerDone:     make(chan struct{}),
+		idleTimeoutWatcher:   session.NewIdleTimeoutWatcher(session.IdleTimeoutWatcherConfig{}),
 		lastPersistedStatus:  make(map[string]string),
 		logUpdateChan:        make(chan *session.Instance, 100), // Buffered to absorb bursts
 		hotkeys:              make(map[string]string),
@@ -997,12 +1017,14 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(cfg, actualProfile)
 		h.previewPct = cfg.UI.GetPreviewPct()
 		h.remoteLatencyRefreshSec = cfg.UI.GetRemoteLatencyRefreshSecs(cfg.SystemStats.GetRefreshSeconds())
+		h.remoteSessionRefreshSec = cfg.UI.GetRemoteSessionRefreshSecs()
 	} else {
 		h.fullRepaint = (session.DisplaySettings{}).GetFullRepaint()
 		h.activeFilterExcludes = (session.DisplaySettings{}).GetActiveFilterExcludes()
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(nil, actualProfile)
 		h.previewPct = session.DefaultPreviewPct
 		h.remoteLatencyRefreshSec = (session.UISettings{}).GetRemoteLatencyRefreshSecs(0)
+		h.remoteSessionRefreshSec = (session.UISettings{}).GetRemoteSessionRefreshSecs()
 	}
 	h.remoteLatency = make(map[string]session.RemoteLatency)
 
@@ -2278,34 +2300,97 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 		return remoteSessionsFetchedMsg{sessions: nil}
 	}
 
-	results := make(map[string][]session.RemoteSessionInfo)
+	results := make(map[string][]session.RemoteSessionInfo, len(config.Remotes))
 	// #1101: remote cost summaries piggy-back on the existing remote-fetch
 	// channel so the status-line cost segment doesn't lag behind the session
 	// list. nil-valued entries indicate fetch failures (e.g., older remote
 	// agent-deck without `costs summary --json`); the renderer treats those
 	// as "remote contributes zero" so a single broken remote can't poison
 	// the displayed total.
-	costResults := make(map[string]*costs.RemoteCostSummary)
-	ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
-	defer cancel()
+	costResults := make(map[string]*costs.RemoteCostSummary, len(config.Remotes))
+	// #1170: track remotes that errored so the handler keeps their last-good
+	// sessions instead of dropping them.
+	failed := make(map[string]bool, len(config.Remotes))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 
+	// #1170: fetch every remote in parallel, each with its OWN timeout, so a
+	// single slow/offline remote can't starve the others. The previous code
+	// shared one 15s budget across all remotes fetched sequentially, which
+	// made healthy remotes drop out of the result map (and flicker in the
+	// TUI) whenever an earlier remote was slow.
 	for name, rc := range config.Remotes {
-		runner := session.NewSSHRunner(name, rc)
-		sessions, err := runner.FetchSessions(ctx)
-		if err != nil {
+		wg.Add(1)
+		go func(name string, rc session.RemoteConfig) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
+			defer cancel()
+
+			runner := session.NewSSHRunner(name, rc)
+			sessions, err := runner.FetchSessions(ctx)
+			if err != nil {
+				mu.Lock()
+				failed[name] = true
+				mu.Unlock()
+				return
+			}
+			for i := range sessions {
+				sessions[i].RemoteName = name
+			}
+			summary, costErr := runner.FetchCostSummary(ctx)
+
+			mu.Lock()
+			results[name] = sessions
+			if costErr == nil && summary != nil {
+				costResults[name] = summary
+			}
+			mu.Unlock()
+		}(name, rc)
+	}
+	wg.Wait()
+
+	return remoteSessionsFetchedMsg{sessions: results, costs: costResults, failed: failed}
+}
+
+// mergeRemoteSessions reconciles a freshly fetched remote-session map against
+// the previously displayed one (issue #1170). The contract:
+//
+//   - remotes present in fetched → replaced wholesale (new sessions appear,
+//     removed sessions drop);
+//   - remotes in failed (errored this round) → keep their last-good sessions
+//     from prev, so a transient SSH hiccup never wipes a remote;
+//   - remotes absent from both fetched and failed → dropped (deconfigured).
+//
+// It is a pure function so the reconciliation logic is unit-testable without
+// SSH or the Bubble Tea event loop.
+func mergeRemoteSessions(prev, fetched map[string][]session.RemoteSessionInfo, failed map[string]bool) map[string][]session.RemoteSessionInfo {
+	merged := make(map[string][]session.RemoteSessionInfo, len(fetched)+len(failed))
+	for name, sess := range fetched {
+		merged[name] = sess
+	}
+	for name := range failed {
+		if _, ok := merged[name]; ok {
+			// A successful result for this remote (if any) always wins.
 			continue
 		}
-		for i := range sessions {
-			sessions[i].RemoteName = name
-		}
-		results[name] = sessions
-
-		if summary, costErr := runner.FetchCostSummary(ctx); costErr == nil && summary != nil {
-			costResults[name] = summary
+		if prevSess, ok := prev[name]; ok && len(prevSess) > 0 {
+			merged[name] = prevSess
 		}
 	}
+	return merged
+}
 
-	return remoteSessionsFetchedMsg{sessions: results, costs: costResults}
+// shouldFetchRemoteSessions reports whether the periodic tick should kick off
+// a remote-session re-fetch: the configured interval has elapsed since the
+// last fetch and no fetch is currently in flight. Issue #1170.
+func (h *Home) shouldFetchRemoteSessions(now time.Time) bool {
+	interval := h.remoteSessionRefreshSec
+	if interval <= 0 {
+		interval = session.DefaultRemoteSessionRefreshSecs
+	}
+	h.remoteSessionsMu.RLock()
+	defer h.remoteSessionsMu.RUnlock()
+	return !h.remotesFetchActive && now.Sub(h.lastRemoteFetch) >= time.Duration(interval)*time.Second
 }
 
 // measureRemoteLatencies measures round-trip latency to every configured
@@ -3160,6 +3245,21 @@ func (h *Home) backgroundStatusUpdate() {
 	copy(instances, h.instances)
 	h.instancesMu.RUnlock()
 
+	// Issue #1143: rate-limit the idle-timeout watcher to one tick per minute.
+	// The background sweep runs every 2s; capture-pane on every session every
+	// 2s would add unnecessary tmux load. 60s is the same cadence the spec
+	// suggests and matches how the lifecycle log surfaces dormant workers.
+	if h.idleTimeoutWatcher != nil {
+		const idleTickEvery = 60 * time.Second
+		nowNano := time.Now().UnixNano()
+		lastNano := h.idleTimeoutLastTick.Load()
+		if lastNano == 0 || time.Duration(nowNano-lastNano) >= idleTickEvery {
+			if h.idleTimeoutLastTick.CompareAndSwap(lastNano, nowNano) {
+				h.idleTimeoutWatcher.Tick(instances)
+			}
+		}
+	}
+
 	// PERFORMANCE: Gradually configure unconfigured sessions in background
 	// Configure one session per tick to avoid blocking the status update
 	// This ensures all sessions get configured within ~1 minute even without user interaction
@@ -3850,6 +3950,32 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case insertPreviewRefreshMsg:
+		// #1131: fast echo path. After an insert keystroke this fires ~60ms
+		// later and re-fetches the focused session's preview, BYPASSING the
+		// 2s previewCacheTTL gate in the tickMsg handler — that gate was why a
+		// typed character could take up to ~2s to appear. Local sessions only;
+		// remote previews stay on their SSH-throttled cadence to avoid
+		// hammering the link per keystroke.
+		h.insertPreviewRefreshPending = false
+		if !h.insertMode {
+			return h, nil
+		}
+		inst, key, winIdx := h.selectedPreviewTarget()
+		if inst == nil || key == "" {
+			return h, nil
+		}
+		h.previewCacheMu.Lock()
+		alreadyFetching := h.previewFetchingID == key
+		if !alreadyFetching {
+			h.previewFetchingID = key
+		}
+		h.previewCacheMu.Unlock()
+		if alreadyFetching {
+			return h, nil
+		}
+		return h, h.fetchPreview(inst, key, winIdx)
+
 	case loadSessionsMsg:
 		// Clear loading indicators and store file mtime for external change detection
 		h.reloadMu.Lock()
@@ -4437,7 +4563,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case remoteSessionsFetchedMsg:
 		h.remoteSessionsMu.Lock()
-		h.remoteSessions = msg.sessions
+		// #1170: merge rather than wholesale-replace so a remote that errored
+		// this round keeps its last-good sessions instead of flickering out.
+		h.remoteSessions = mergeRemoteSessions(h.remoteSessions, msg.sessions, msg.failed)
 		h.lastRemoteFetch = time.Now()
 		h.remotesFetchActive = false
 		h.remoteSessionsMu.Unlock()
@@ -4446,6 +4574,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.remoteCostsMu.Lock()
 		h.remoteCosts = msg.costs
 		h.remoteCostsMu.Unlock()
+		// #1112 bug 1: a remote running→waiting transition wouldn't update
+		// the header pill ("[◐ Waiting N]") because countSessionStatuses
+		// caches for 500ms. The row icon updated (read from the map
+		// directly), but the pill froze on the previous fetch's totals.
+		// Invalidate so the next View() recomputes.
+		h.cachedStatusCounts.valid.Store(false)
 		h.rebuildFlatItems()
 		return h, nil
 
@@ -5136,11 +5270,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.saveUIState()
 		}
 
-		// Periodic remote session fetch (every 30 seconds)
-		h.remoteSessionsMu.RLock()
-		shouldFetch := !h.remotesFetchActive && time.Since(h.lastRemoteFetch) >= 30*time.Second
-		h.remoteSessionsMu.RUnlock()
-		if shouldFetch {
+		// Periodic remote session fetch (issue #1170). Cadence is configurable
+		// via [ui] remote_session_refresh_secs (default 15s); see
+		// shouldFetchRemoteSessions for the stale/in-flight gating.
+		if h.shouldFetchRemoteSessions(time.Now()) {
 			h.remoteSessionsMu.Lock()
 			h.remotesFetchActive = true
 			h.remoteSessionsMu.Unlock()
@@ -5702,34 +5835,24 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Resolve worktree target if enabled; actual worktree creation runs in async command.
 		var worktreePath, worktreeRepoRoot string
 		if worktreeEnabled && branchName != "" {
-			// Validate path is a git repo OR a bare-repo project root (#742 /
-			// #715): IsGitRepoOrBareProjectRoot accepts a directory that
-			// contains a nested .bare/ even though the directory itself has
-			// no .git. Downstream GetWorktreeBaseRoot + CreateWorktreeWithSetup
-			// handle both layouts transparently.
-			if !git.IsGitRepoOrBareProjectRoot(path) {
-				h.newDialog.SetError("Path is not a git repository")
+			// resolveWorktreeTarget validates the path is a git repo OR a
+			// bare-repo project root (#742 / #715) and implements the #1185
+			// fallback: a worktree enabled by config default (not an explicit
+			// user toggle) on a non-repo dir falls back to a normal session
+			// instead of erroring, while an explicit worktree still fails loud.
+			wtPath, repoRoot, fallback, errMsg := resolveWorktreeTarget(path, branchName, h.newDialog.IsWorktreeExplicit())
+			if errMsg != "" {
+				h.newDialog.SetError(errMsg)
 				return h, nil
 			}
-
-			repoRoot, err := git.GetWorktreeBaseRoot(path)
-			if err != nil {
-				h.newDialog.SetError(fmt.Sprintf("Failed to get repo root: %v", err))
-				return h, nil
+			if fallback {
+				// #1185: create a normal session on this non-repo dir.
+				worktreeEnabled = false
+				branchName = ""
+			} else {
+				worktreePath = wtPath
+				worktreeRepoRoot = repoRoot
 			}
-
-			// Generate worktree path using configured location/template
-			wtSettings := session.GetWorktreeSettings()
-			worktreePath = git.WorktreePath(git.WorktreePathOptions{
-				Branch:    branchName,
-				Location:  wtSettings.DefaultLocation,
-				RepoDir:   repoRoot,
-				SessionID: git.GeneratePathID(),
-				Template:  wtSettings.Template(),
-			})
-
-			// Store repo root for later use
-			worktreeRepoRoot = repoRoot
 		}
 
 		// Build generic toolOptionsJSON from tool-specific options
@@ -5816,6 +5939,15 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		)
 
 	case "esc":
+		// #1162: when the model picker dropdown is open, Esc dismisses only the
+		// picker and keeps the new-session form alive (focus stays on the model
+		// field) rather than cancelling the whole flow. Forward to the dialog so
+		// its picker-level Esc handler runs.
+		if h.newDialog.IsModelPickerOpen() {
+			var cmd tea.Cmd
+			h.newDialog, cmd = h.newDialog.Update(msg)
+			return h, cmd
+		}
 		h.newDialog.Hide()
 		h.clearError() // Clear any validation error
 		return h, nil
@@ -6153,7 +6285,16 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Insert mode (#1069): short-circuit before any normal-mode handling.
 	// Keystrokes are sent to the focused session's tmux pane; Esc exits.
 	if h.insertMode {
-		return h.handleInsertModeKey(msg)
+		model, cmd := h.handleInsertModeKey(msg)
+		// #1131: after any insert keystroke, arm a fast preview refresh so the
+		// user's echo appears in ~60ms instead of waiting up to the 2s
+		// background tick. Skip once the keystroke exited insert mode (Esc) —
+		// the normal tick cadence resumes there. scheduleInsertPreviewRefresh
+		// self-guards against stacking ticks during a typing burst.
+		if h2, ok := model.(*Home); ok && h2.insertMode {
+			return h2, tea.Batch(cmd, h2.scheduleInsertPreviewRefresh())
+		}
+		return model, cmd
 	}
 
 	raw := msg.String()
@@ -8371,35 +8512,25 @@ func (h *Home) handleForkDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				source := item.Session
 
 				// Resolve worktree target if enabled; actual creation runs in async command.
+				// Bare-repo project roots must pass — same contract as the
+				// new-session path (#742). #1185: a worktree enabled by config
+				// default (not an explicit toggle) on a non-repo dir falls back
+				// to a normal fork instead of erroring.
 				if worktreeEnabled && branchName != "" {
-					// Bare-repo project roots must pass — same contract as
-					// the new-session path (#742).
-					if !git.IsGitRepoOrBareProjectRoot(source.ProjectPath) {
-						h.forkDialog.SetError("Path is not a git repository")
+					worktreePath, repoRoot, fallback, errMsg := resolveWorktreeTarget(source.ProjectPath, branchName, h.forkDialog.IsWorktreeExplicit())
+					if errMsg != "" {
+						h.forkDialog.SetError(errMsg)
 						return h, nil
 					}
-					repoRoot, err := git.GetWorktreeBaseRoot(source.ProjectPath)
-					if err != nil {
-						h.forkDialog.SetError(fmt.Sprintf("Failed to get repo root: %v", err))
-						return h, nil
+					if !fallback {
+						if opts == nil {
+							opts = &session.ClaudeOptions{}
+						}
+						opts.WorkDir = worktreePath
+						opts.WorktreePath = worktreePath
+						opts.WorktreeRepoRoot = repoRoot
+						opts.WorktreeBranch = branchName
 					}
-
-					wtSettings := session.GetWorktreeSettings()
-					worktreePath := git.WorktreePath(git.WorktreePathOptions{
-						Branch:    branchName,
-						Location:  wtSettings.DefaultLocation,
-						RepoDir:   repoRoot,
-						SessionID: git.GeneratePathID(),
-						Template:  wtSettings.Template(),
-					})
-					if opts == nil {
-						opts = &session.ClaudeOptions{}
-					}
-
-					opts.WorkDir = worktreePath
-					opts.WorktreePath = worktreePath
-					opts.WorktreeRepoRoot = repoRoot
-					opts.WorktreeBranch = branchName
 				}
 
 				parentID := h.forkDialog.GetParentSessionID()
@@ -8677,13 +8808,8 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 				if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create parent directory: %w", err), tempID: tempID}
 				}
-				var setupBuf bytes.Buffer
-				setupErr, err := git.CreateWorktreeWithSetup(worktreeRepoRoot, worktreePath, worktreeBranch, &setupBuf, &setupBuf, session.GetWorktreeSettings().SetupTimeout())
-				if err != nil {
+				if err := createWorktreeWithSetupAndLog(worktreeRepoRoot, worktreePath, worktreeBranch); err != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create worktree: %w", err), tempID: tempID}
-				}
-				if setupErr != nil {
-					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupBuf.String()))
 				}
 			}
 			path = worktreePath
@@ -8758,62 +8884,13 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 				}
 				inst.MultiRepoTempDir = parentDir
 
-				// Create worktrees inside parentDir, named after each repo
-				dirnames := session.DeduplicateDirnames(allPaths)
-				var newProjectPath string
-				var newAdditionalPaths []string
-				for i, p := range allPaths {
-					wtPath := filepath.Join(parentDir, dirnames[i])
-					// Accept bare-repo project roots in the multi-repo
-					// path too (#742). Without this, a .bare layout
-					// silently fell through to os.Symlink below,
-					// skipping worktree creation AND the setup hook.
-					if git.IsGitRepoOrBareProjectRoot(p) {
-						repoRoot, rootErr := git.GetWorktreeBaseRoot(p)
-						if rootErr != nil {
-							uiLog.Warn("multi_repo_worktree_skip", slog.String("path", p), slog.String("error", rootErr.Error()))
-							// Copy path as-is into the parent dir via symlink
-							_ = os.Symlink(p, wtPath)
-							if i == 0 {
-								newProjectPath = wtPath
-							} else {
-								newAdditionalPaths = append(newAdditionalPaths, wtPath)
-							}
-							continue
-						}
-						if err := git.CreateWorktree(repoRoot, wtPath, worktreeBranch); err != nil {
-							uiLog.Warn("multi_repo_worktree_create_fail", slog.String("path", p), slog.String("error", err.Error()))
-							_ = os.Symlink(p, wtPath)
-							if i == 0 {
-								newProjectPath = wtPath
-							} else {
-								newAdditionalPaths = append(newAdditionalPaths, wtPath)
-							}
-							continue
-						}
-						inst.MultiRepoWorktrees = append(inst.MultiRepoWorktrees, session.MultiRepoWorktree{
-							OriginalPath: p,
-							WorktreePath: wtPath,
-							RepoRoot:     repoRoot,
-							Branch:       worktreeBranch,
-						})
-						if i == 0 {
-							newProjectPath = wtPath
-						} else {
-							newAdditionalPaths = append(newAdditionalPaths, wtPath)
-						}
-					} else {
-						// Non-git paths: symlink into parent dir
-						_ = os.Symlink(p, wtPath)
-						if i == 0 {
-							newProjectPath = wtPath
-						} else {
-							newAdditionalPaths = append(newAdditionalPaths, wtPath)
-						}
-					}
+				wtResult := session.CreateMultiRepoWorktrees(allPaths, parentDir, worktreeBranch, session.GetWorktreeSettings().SetupTimeout())
+				for _, w := range wtResult.Warnings {
+					uiLog.Warn("multi_repo_worktree", slog.String("detail", w))
 				}
-				inst.ProjectPath = newProjectPath
-				inst.AdditionalPaths = newAdditionalPaths
+				inst.MultiRepoWorktrees = wtResult.Worktrees
+				inst.ProjectPath = wtResult.MappedPaths[0]
+				inst.AdditionalPaths = wtResult.MappedPaths[1:]
 			} else {
 				// Multi-repo without worktree: create a persistent parent dir with symlinks.
 				home, _ := os.UserHomeDir()
@@ -8847,6 +8924,22 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			if inst.GetTmuxSession() != nil {
 				inst.GetTmuxSession().WorkDir = inst.MultiRepoTempDir
 			}
+
+			// Pre-accept the Claude trust dialog and emit a parent CLAUDE.md
+			// describing the layout (#1149, credit @spawnia). Skips silently
+			// for non-claude tools or empty repo lists. Failures are logged
+			// but non-fatal — the session can still launch; user just sees
+			// the usual trust prompt.
+			repoNames := make([]string, 0, len(inst.AllProjectPaths()))
+			for _, p := range inst.AllProjectPaths() {
+				repoNames = append(repoNames, filepath.Base(p))
+			}
+			if ctxErr := session.ApplyMultiRepoClaudeContext(
+				inst.Tool, inst.MultiRepoEnabled,
+				session.GetUserMCPRootPath(), inst.MultiRepoTempDir, repoNames,
+			); ctxErr != nil {
+				uiLog.Warn("multi_repo_claude_context", slog.String("error", ctxErr.Error()))
+			}
 		}
 
 		if parentSessionID != "" {
@@ -8865,6 +8958,21 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		uiLog.Info("session_create_succeeded", slog.String("id", inst.ID))
 		return sessionCreatedMsg{instance: inst, tempID: tempID}
 	}
+}
+
+// createWorktreeWithSetupAndLog creates a worktree, runs .worktreeinclude and
+// worktree-setup.sh, and logs setup failures. Returns only the creation error;
+// setup failures are non-fatal and logged to uiLog.
+func createWorktreeWithSetupAndLog(repoRoot, wtPath, branch string) error {
+	var buf bytes.Buffer
+	setupErr, err := git.CreateWorktreeWithSetup(repoRoot, wtPath, branch, &buf, &buf, session.GetWorktreeSettings().SetupTimeout())
+	if err != nil {
+		return err
+	}
+	if setupErr != nil {
+		uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", buf.String()))
+	}
+	return nil
 }
 
 // createSessionTool maps a free-form command to (tool, command). Built-in
@@ -9238,13 +9346,8 @@ func (h *Home) forkSessionCmdWithOptions(
 				if err := os.MkdirAll(filepath.Dir(opts.WorktreePath), 0o755); err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("failed to create directory: %w", err), sourceID: sourceID}
 				}
-				var setupBuf bytes.Buffer
-				setupErr, err := git.CreateWorktreeWithSetup(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch, &setupBuf, &setupBuf, session.GetWorktreeSettings().SetupTimeout())
-				if err != nil {
+				if err := createWorktreeWithSetupAndLog(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch); err != nil {
 					return sessionForkedMsg{err: fmt.Errorf("worktree creation failed: %w", err), sourceID: sourceID}
-				}
-				if setupErr != nil {
-					uiLog.Warn("worktree_setup_script_failed", slog.String("error", setupErr.Error()), slog.String("output", setupBuf.String()))
 				}
 			}
 		}
@@ -9354,11 +9457,17 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	return func() tea.Msg {
 		killErr := inst.Kill()
 		if isWorktree {
-			if err := git.RemoveWorktree(worktreeRepoRoot, worktreePath, true); err != nil {
+			// #1200: route worktree teardown through the session guard so a
+			// worktree_reuse session (WorktreePath == the user's original repo)
+			// is never os.RemoveAll'd. Only genuine agent-deck-created linked
+			// worktrees are removed; a reused repo is left intact and merely
+			// dropped from the registry.
+			snap := &session.Instance{WorktreePath: worktreePath, WorktreeRepoRoot: worktreeRepoRoot}
+			switch removed, err := session.RemoveSessionWorktree(snap); {
+			case err != nil:
 				uiLog.Warn("worktree_remove_err", slog.String("path", worktreePath), slog.String("err", err.Error()))
-			}
-			if err := git.PruneWorktrees(worktreeRepoRoot); err != nil {
-				uiLog.Warn("worktree_prune_err", slog.String("repo", worktreeRepoRoot), slog.String("err", err.Error()))
+			case !removed:
+				uiLog.Info("worktree_remove_skipped", slog.String("path", worktreePath), slog.String("repo", worktreeRepoRoot), slog.String("reason", "reused or non-linked worktree (#1200 guard)"))
 			}
 		}
 		if isMultiRepo {
@@ -10931,8 +11040,9 @@ func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	var b strings.Builder
 
 	// Calculate panel widths from configurable split (issue #1092 — [ui] preview_pct)
-	leftWidth := h.sessionsPaneWidth()
-	rightWidth := h.width - leftWidth - 3 // -3 for separator
+	// with chrome / min-width clamping (issue #1113) so the PREVIEW pane never
+	// shrinks below its title width.
+	leftWidth, rightWidth := h.splitPaneWidths()
 
 	// Panel title is exactly 2 lines (title + underline)
 	// Panel content gets the remaining space: contentHeight - 2

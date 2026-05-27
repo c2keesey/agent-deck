@@ -187,6 +187,7 @@ type NewDialog struct {
 	modelLineOffset       int      // Content line where model suggestions overlay should appear.
 	// Worktree support.
 	worktreeEnabled bool
+	worktreeToggled bool // true once the user explicitly toggled the worktree checkbox (vs config default_enabled); see #1185.
 	branchInput     textinput.Model
 	branchAutoSet   bool   // true if branch was auto-derived from session name.
 	branchPrefix    string // configured prefix for auto-generated branch names.
@@ -223,6 +224,7 @@ type dialogSnapshot struct {
 	modelInput       string
 	sandboxEnabled   bool
 	worktreeEnabled  bool
+	worktreeToggled  bool
 	branch           string
 	branchAutoSet    bool
 	claudeOptions    *session.ClaudeOptions
@@ -390,6 +392,7 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 	d.updateToolOptions()
 	// Reset worktree fields from global config defaults.
 	d.worktreeEnabled = false
+	d.worktreeToggled = false
 	d.branchInput.SetValue("")
 	d.branchAutoSet = false
 	d.branchPrefix = "feature/" // default; overridden below if config provides one.
@@ -426,6 +429,13 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 		}
 		d.inheritedSettings = buildInheritedSettings(userConfig.Docker)
 		d.branchPrefix = userConfig.Worktree.Prefix()
+		// #1172: preselect the configured default model so users who set
+		// [claude].default_model aren't forced to switch off Sonnet on every
+		// new session. Overrides the empty value set above; left empty when
+		// no (valid, in-catalog) default is configured.
+		if dm := preselectDefaultModel(userConfig, d.GetSelectedCommand()); dm != "" {
+			d.modelInput.SetValue(dm)
+		}
 	}
 	d.branchInput.Placeholder = d.branchPrefix + "branch-name"
 	d.rebuildFocusTargets()
@@ -554,6 +564,17 @@ func (d *NewDialog) IsModelSuggestionsActive() bool {
 	return d.modelSuggestionActive
 }
 
+// IsModelPickerOpen reports whether the model picker dropdown is currently
+// shown: focus is on the model field, the tool supports a model override, and
+// the picker has not been explicitly dismissed. The parent (home.go) uses this
+// so Esc dismisses only the picker rather than cancelling the whole
+// new-session flow (#1162).
+func (d *NewDialog) IsModelPickerOpen() bool {
+	return d.currentTarget() == focusModel &&
+		d.selectedToolSupportsModel() &&
+		!d.modelSuggestionHidden
+}
+
 func (d *NewDialog) IsModelTypeCustomHighlighted() bool {
 	return d.modelSuggestionActive && d.modelSuggestionCursor == 0
 }
@@ -610,6 +631,7 @@ func (d *NewDialog) saveSnapshot() *dialogSnapshot {
 		modelInput:       d.modelInput.Value(),
 		sandboxEnabled:   d.sandboxEnabled,
 		worktreeEnabled:  d.worktreeEnabled,
+		worktreeToggled:  d.worktreeToggled,
 		branch:           d.branchInput.Value(),
 		branchAutoSet:    d.branchAutoSet,
 		claudeOptions:    claudeOpts,
@@ -630,6 +652,7 @@ func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
 	d.modelInput.SetValue(s.modelInput)
 	d.sandboxEnabled = s.sandboxEnabled
 	d.worktreeEnabled = s.worktreeEnabled
+	d.worktreeToggled = s.worktreeToggled
 	d.branchInput.SetValue(s.branch)
 	d.branchAutoSet = s.branchAutoSet
 	if s.claudeOptions != nil {
@@ -723,6 +746,7 @@ func (d *NewDialog) previewRecentSession(rs *statedb.RecentSessionRow) {
 
 	// Reset worktree (ephemeral, never pre-filled)
 	d.worktreeEnabled = false
+	d.worktreeToggled = false
 	d.branchInput.SetValue("")
 	d.branchAutoSet = false
 
@@ -817,6 +841,37 @@ func knownModelIDsForTool(tool string) []string {
 	}
 }
 
+// preselectDefaultModel returns the model ID to prefill in the new-session
+// model field for the given tool. It honors the per-tool configured
+// default_model but only when that value is present in the tool's known-model
+// catalog — an empty default, an unset config, or a stale/typo'd value (e.g.
+// an alias like "opus" or a removed pin) all degrade gracefully to "" so the
+// dialog leaves the model unset and the tool falls back to its own default
+// rather than launching a bogus --model flag (#1172). Today only Claude routes
+// its launch model through this dialog field; the other tools apply their
+// default_model at command-build time.
+func preselectDefaultModel(config *session.UserConfig, tool string) string {
+	if config == nil {
+		return ""
+	}
+	var configured string
+	switch {
+	case session.IsClaudeCompatible(tool):
+		configured = config.Claude.DefaultModel
+	default:
+		return ""
+	}
+	if configured = strings.TrimSpace(configured); configured == "" {
+		return ""
+	}
+	for _, id := range knownModelIDsForTool(tool) {
+		if id == configured {
+			return configured
+		}
+	}
+	return ""
+}
+
 func (d *NewDialog) filterModelSuggestions() {
 	all := knownModelIDsForTool(d.GetSelectedCommand())
 	query := strings.ToLower(strings.TrimSpace(d.modelInput.Value()))
@@ -884,10 +939,20 @@ func (d *NewDialog) GetValues() (name, path, command string) {
 // When enabling, auto-populates the branch name from the session name.
 func (d *NewDialog) ToggleWorktree() {
 	d.worktreeEnabled = !d.worktreeEnabled
+	d.worktreeToggled = true // user made an explicit choice; see #1185.
 	if d.worktreeEnabled {
 		d.autoBranchFromName()
 	}
 	d.rebuildFocusTargets()
+}
+
+// IsWorktreeExplicit reports whether the worktree state reflects an explicit
+// user choice (the checkbox was toggled) rather than the config default
+// (`[worktree] default_enabled`). Used by #1185 to decide whether a worktree on
+// a non-repo dir should fail loudly (explicit) or fall back to a normal
+// session (default).
+func (d *NewDialog) IsWorktreeExplicit() bool {
+	return d.worktreeToggled
 }
 
 // autoBranchFromName sets the branch input to "<prefix><session-name>" if the
@@ -1433,9 +1498,14 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				return d, nil
 			case " ", "enter":
 				// Space: apply highlighted entry + close dropdown (stay in form).
+				// #1190: selecting the synthetic "✎ Type custom path…" entry
+				// (cursor 0) must land the user in the focused path input so they
+				// can type — it must NOT advance focus to the next field. Only
+				// Enter on a real suggestion (cursor > 0) applies + advances.
+				customSelected := d.pathSuggestionCursor == 0
 				d.ApplyHighlightedSuggestion()
 				d.DismissSuggestions()
-				if msg.String() == "enter" {
+				if msg.String() == "enter" && !customSelected {
 					d.moveFocus(1)
 				}
 				return d, nil
@@ -1470,9 +1540,13 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				}
 				return d, nil
 			case " ", "enter":
+				// #1190: selecting the synthetic "✎ Type custom model ID…" entry
+				// (cursor 0) keeps focus on the model input so the user can type;
+				// only Enter on a real suggestion (cursor > 0) applies + advances.
+				customSelected := d.modelSuggestionCursor == 0
 				d.ApplyHighlightedModelSuggestion()
 				d.DismissModelSuggestions()
-				if msg.String() == "enter" {
+				if msg.String() == "enter" && !customSelected {
 					d.moveFocus(1)
 				}
 				return d, nil
@@ -1741,6 +1815,16 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				// Cancel editing, revert to the stored value
 				d.multiRepoEditing = false
 				d.pathInput.Blur()
+				return d, nil
+			}
+			// #1162 bug 2: Esc inside the model picker dismisses ONLY the picker
+			// and keeps the form alive with focus on the model field, instead of
+			// cancelling the entire new-session flow. A second Esc (picker already
+			// dismissed) falls through to Hide(). The parent forwards Esc here
+			// whenever IsModelPickerOpen() is true.
+			if d.IsModelPickerOpen() {
+				d.DismissModelSuggestions()
+				d.modelInput.Focus()
 				return d, nil
 			}
 			d.Hide()
@@ -2265,7 +2349,19 @@ func (d *NewDialog) View() string {
 		}
 		content.WriteString("\n  ")
 		content.WriteString(d.modelInput.View())
-		d.modelLineOffset = strings.Count(content.String(), "\n")
+		// #1162 bug 1: position the dropdown overlay using the *visual* (wrapped)
+		// line count, not the raw newline count. The command-button row above the
+		// model field wraps to extra lines at narrow widths; a newline count would
+		// undercount those and paint the dropdown directly over the model input,
+		// hiding whatever the user typed. lipgloss.Height of the width-wrapped
+		// content-so-far yields the row just below the input (the path field has
+		// no wrapping above it, so its newline count already lands correctly).
+		innerWidth := dialogWidth - 8 // Padding(2,4) → 4 columns each side.
+		if innerWidth < 1 {
+			innerWidth = 1
+		}
+		wrapped := lipgloss.NewStyle().Width(innerWidth).Render(content.String())
+		d.modelLineOffset = lipgloss.Height(wrapped)
 		if hint := d.modelInputHint(); hint != "" {
 			dimStyle := lipgloss.NewStyle().Foreground(ColorComment)
 			content.WriteString("\n  ")

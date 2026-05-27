@@ -28,6 +28,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/docker"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/send"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -237,6 +238,16 @@ type Instance struct {
 	// RFC: docs/rfc/PLUGIN_ATTACH.md.
 	Plugins []string `json:"plugins,omitempty"`
 
+	// InheritTelegramEnv is the explicit opt-in for #1133: when true, a
+	// non-channel-owning claude child KEEPS the conductor's TELEGRAM_*
+	// env vars (TELEGRAM_STATE_DIR, TELEGRAM_BOT_TOKEN, etc.). Default
+	// false strips them so a child can't spawn a duplicate `bun telegram`
+	// poller that races the conductor for getUpdates (Telegram 409
+	// Conflict + dropped inbound messages). CLI flag:
+	// `--inherit-telegram-env` on `agent-deck launch`. Rare use case;
+	// existing behavior is preserved when the flag is absent.
+	InheritTelegramEnv bool `json:"inherit_telegram_env,omitempty"`
+
 	// PluginChannelLinkDisabled opts the session out of the catalog-driven
 	// auto-link between Plugins and Channels (RFC §4.7). When true, an
 	// `--plugin foo` whose catalog entry has EmitsChannel=true does NOT
@@ -261,6 +272,12 @@ type Instance struct {
 	// conductor sessions, explicit telegram channel owners, and
 	// non-claude tools — they use the ambient profile as-is.
 	WorkerScratchConfigDir string `json:"worker_scratch_config_dir,omitempty"`
+
+	// IdleTimeoutSecs is the auto-stop threshold (#1143). When > 0, a central
+	// watcher poll triggers Kill() if the tmux pane content stays unchanged
+	// for this many seconds. 0 = disabled (current behavior). Default is 0
+	// so existing sessions are unaffected on upgrade.
+	IdleTimeoutSecs int64 `json:"idle_timeout_secs,omitempty"`
 
 	// IsForkAwaitingStart signals that this instance was produced by
 	// CreateForkedInstanceWithOptions and holds a pre-built fork command
@@ -746,14 +763,16 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	}
 
 	// S8 (v1.7.40) defense-in-depth: non-channel-owning claude spawns
-	// wrap the final exec in `env -u TELEGRAM_STATE_DIR` so the child
-	// process is guaranteed to start without TSD even if the shell
-	// unset in buildEnvSourceCommand is somehow bypassed. Empty string
-	// for conductors, explicit telegram channel owners, and non-claude
-	// tools (see telegramStateDirStripExpr for the predicate).
+	// wrap the final exec in `env -u TELEGRAM_*` so the child process
+	// is guaranteed to start without telegram env even if the shell
+	// unset in buildEnvSourceCommand is somehow bypassed. #1133
+	// broadens the flag list from TELEGRAM_STATE_DIR alone to every
+	// var in telegramEnvVarsToStrip. Empty string for conductors,
+	// explicit telegram channel owners, --inherit-telegram-env opt-in,
+	// and non-claude tools (see telegramStateDirStripExpr predicate).
 	execEnvPrefix := ""
-	if telegramStateDirStripExpr(i) != "" {
-		execEnvPrefix = "env -u TELEGRAM_STATE_DIR "
+	if flags := telegramExecEnvStripFlags(i); flags != "" {
+		execEnvPrefix = "env " + flags + " "
 	}
 
 	// If baseCommand is just "claude", build the appropriate command
@@ -2609,6 +2628,29 @@ func (i *Instance) ensureClaudeSessionIDFromDisk() {
 // is safe to bypass here. ClaudeDetectedAt is then stamped so subsequent
 // callers (status refresh, persistence) see a consistent capture time.
 func (i *Instance) ensureClaudeSessionIDFromDiskForRestart() {
+	// Issue #1147: an explicit `--session-id <uuid>` in i.Command is the
+	// user's authoritative declaration of WHICH conversation this session
+	// owns. In multi-session-per-cwd setups (5 tenant sessions sharing one
+	// project dir, each with its own --session-id), the pre-#1147
+	// disk-discovery walk picks the newest sibling JSONL by mtime and
+	// silently hijacks every sibling's id onto whichever transcript was
+	// written last. The dup-sweeper then kills 4 of 5 sessions for
+	// sharing a CLAUDE_SESSION_ID. Adopting the explicit id BEFORE the
+	// non-empty short-circuit ensures it also corrects a previously-
+	// hijacked id from an earlier buggy run.
+	if explicit, ok := extractExplicitClaudeSessionID(i.Command); ok {
+		if i.ClaudeSessionID != explicit {
+			i.ClaudeSessionID = explicit
+			sessionLog.Info("resume: id="+explicit+" reason=session_id_flag_explicit_restart",
+				slog.String("instance_id", i.ID),
+				slog.String("claude_session_id", explicit),
+				slog.String("reason", "session_id_flag_explicit_restart"))
+		}
+		if i.ClaudeDetectedAt.IsZero() {
+			i.ClaudeDetectedAt = time.Now()
+		}
+		return
+	}
 	if i.ClaudeSessionID != "" {
 		return
 	}
@@ -3672,18 +3714,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 		if sessionID == i.CodexSessionID {
 			return
 		}
-		sessionLog.Debug("codex_session_update_from_hook",
-			slog.String("old_id", i.CodexSessionID),
-			slog.String("new_id", sessionID),
-			slog.String("event", status.Event),
-		)
-		i.CodexSessionID = sessionID
-		i.CodexDetectedAt = time.Now()
-		i.hookSessionID = sessionID
-
-		if i.tmuxSession != nil && i.tmuxSession.Exists() {
-			_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID)
-		}
+		i.bindCodexSessionFromHook(sessionID, status.Event)
 	case i.Tool == "gemini":
 		if sessionID == i.GeminiSessionID {
 			return
@@ -3691,18 +3722,86 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 		// Quality gate: only accept when candidate session appears valid on disk,
 		// OR when current session is empty (first detection/bootstrap).
 		if i.GeminiSessionID == "" || geminiSessionHasConversationData(sessionID, i.ProjectPath) {
-			sessionLog.Debug("gemini_session_update_from_hook",
-				slog.String("old_id", i.GeminiSessionID),
-				slog.String("new_id", sessionID),
-				slog.String("event", status.Event),
-			)
-			i.GeminiSessionID = sessionID
-			i.GeminiDetectedAt = time.Now()
-			i.hookSessionID = sessionID
+			i.bindGeminiSessionFromHook(sessionID, status.Event)
+		}
+	}
+}
 
-			if i.tmuxSession != nil && i.tmuxSession.Exists() {
-				_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", sessionID)
-			}
+// bindCodexSessionFromHook is the Codex counterpart of
+// bindClaudeSessionFromHook (see that function's doc comment for the
+// PERSIST-12 rationale). It performs the same bookkeeping that the
+// inlined pre-#1139 code did — debug log, in-memory mutation, tmux env
+// propagation — and then persists the new binding to SQLite so
+// DB-direct consumers and peer agent-deck processes observe the new
+// codex_session_id immediately, instead of reloading the stale row and
+// clobbering the in-memory mutation on the next save cycle.
+func (i *Instance) bindCodexSessionFromHook(sessionID, hookEvent string) {
+	sessionLog.Debug("codex_session_update_from_hook",
+		slog.String("old_id", i.CodexSessionID),
+		slog.String("new_id", sessionID),
+		slog.String("event", hookEvent),
+	)
+	i.CodexSessionID = sessionID
+	i.CodexDetectedAt = time.Now()
+	i.hookSessionID = sessionID
+
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID)
+	}
+
+	// Persist the rebind to SQLite. See bindClaudeSessionFromHook for the
+	// full rationale: none of the three UpdateHookStatus callers (TUI
+	// tick, web refresh, CLI status refresh) save after a hook-triggered
+	// rebind, so tool_data.codex_session_id stays pinned at the stale
+	// UUID indefinitely for DB-direct consumers, and peer processes
+	// holding stale snapshots keep clobbering the in-memory mutation —
+	// producing a runaway loop of fresh "rebind" decisions on every
+	// poll. WriteCodexSessionBinding rewrites only the typed schema
+	// fields via json_set, leaving every other tool_data key untouched.
+	if db := statedb.GetGlobal(); db != nil {
+		if err := db.WriteCodexSessionBinding(i.ID, sessionID, i.CodexDetectedAt); err != nil {
+			sessionLog.Warn("codex_session_rebind_persist_failed",
+				slog.String("instance_id", i.ID),
+				slog.String("new_id", sessionID),
+				slog.String("error", err.Error()))
+		}
+	}
+}
+
+// bindGeminiSessionFromHook is the Gemini counterpart of
+// bindClaudeSessionFromHook. See that function's doc comment for the
+// PERSIST-12 rationale. The quality gate (GeminiSessionID == "" ||
+// geminiSessionHasConversationData(...)) is enforced by the caller in
+// UpdateHookStatus before this function is invoked, mirroring the
+// invariant the inlined pre-#1139 code preserved.
+func (i *Instance) bindGeminiSessionFromHook(sessionID, hookEvent string) {
+	sessionLog.Debug("gemini_session_update_from_hook",
+		slog.String("old_id", i.GeminiSessionID),
+		slog.String("new_id", sessionID),
+		slog.String("event", hookEvent),
+	)
+	i.GeminiSessionID = sessionID
+	i.GeminiDetectedAt = time.Now()
+	i.hookSessionID = sessionID
+
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", sessionID)
+	}
+
+	// Persist the rebind to SQLite. See bindClaudeSessionFromHook for
+	// the full rationale on why the in-memory mutation alone is not
+	// enough: the bug pattern (#1138 for Claude, #1139 for
+	// Codex/Gemini) is that UpdateHookStatus callers don't call Save
+	// afterwards, so peer agent-deck processes keep reloading the stale
+	// row and clobbering this instance's in-memory state. The targeted
+	// json_set UPDATE atomically rewrites only $.gemini_session_id and
+	// $.gemini_detected_at, preserving the rest of tool_data.
+	if db := statedb.GetGlobal(); db != nil {
+		if err := db.WriteGeminiSessionBinding(i.ID, sessionID, i.GeminiDetectedAt); err != nil {
+			sessionLog.Warn("gemini_session_rebind_persist_failed",
+				slog.String("instance_id", i.ID),
+				slog.String("new_id", sessionID),
+				slog.String("error", err.Error()))
 		}
 	}
 }
@@ -6435,6 +6534,36 @@ func (i *Instance) bindClaudeSessionFromHook(sessionID, hookSource, hookEvent, a
 
 	if i.tmuxSession != nil && i.tmuxSession.Exists() {
 		_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", sessionID)
+	}
+
+	// Persist the rebind to SQLite. The PERSIST-12 contract above assumed
+	// an "external save cycle" would pick this up, but none of the three
+	// UpdateHookStatus callers (TUI tick, web refresh, CLI status refresh)
+	// actually save after rebind — leaving tool_data.claude_session_id
+	// stuck at the pre-/clear UUID indefinitely for DB-direct consumers,
+	// and producing a runaway loop of fresh "rebind" lifecycle entries
+	// because peer processes keep reloading the stale row and clobbering
+	// the in-memory mutation.
+	//
+	// What this UPDATE guarantees: the write is atomic at SQLite's row
+	// lock against WriteStatus (different columns) and SaveInstance
+	// (same row, serialized). What it does NOT prevent: a concurrent
+	// SaveInstance from a peer process holding a stale Instance snapshot
+	// can still clobber the value we just wrote, because
+	// claude_session_id is a typed schema field — MergeToolDataExtras
+	// only protects keys outside that typed set, so the peer's stale
+	// typed value wins. The runaway-rebind loop terminates anyway
+	// because the writer that decided to rebind also persists
+	// synchronously here, not because clobbering is impossible — a
+	// later peer reload that observes the new ID will short-circuit at
+	// the `sessionID == i.ClaudeSessionID` check in UpdateHookStatus.
+	if db := statedb.GetGlobal(); db != nil {
+		if err := db.WriteClaudeSessionBinding(i.ID, sessionID, i.ClaudeDetectedAt); err != nil {
+			sessionLog.Warn("claude_session_rebind_persist_failed",
+				slog.String("instance_id", i.ID),
+				slog.String("new_id", sessionID),
+				slog.String("error", err.Error()))
+		}
 	}
 }
 

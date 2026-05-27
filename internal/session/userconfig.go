@@ -207,6 +207,12 @@ type UISettings struct {
 	// range: 2-300. Default: matches [system_stats].refresh_seconds (5s)
 	// so the latency marker ticks alongside CPU/RAM/load.
 	RemoteLatencyRefreshSecs int `toml:"remote_latency_refresh_secs"`
+	// RemoteSessionRefreshSecs sets how often the TUI re-fetches the remote
+	// session list over SSH (issue #1170). Remote sessions created after the
+	// TUI launched were invisible until quit+relaunch; this is the poll
+	// cadence that reconciles the list. Valid range: 5-300. Default: 15s,
+	// tightening the visibility latency reported on v1.9.30.
+	RemoteSessionRefreshSecs int `toml:"remote_session_refresh_secs"`
 }
 
 // DefaultPreviewPct is the default preview-pane width percentage.
@@ -254,6 +260,33 @@ func (u UISettings) GetITermOpenAs() string {
 		return ITermOpenAsTab
 	}
 	return DefaultITermOpenAs
+}
+
+// Remote session-list poll cadence bounds (issue #1170). The default is
+// deliberately tighter than the historical hardcoded 30s so new remote
+// sessions surface promptly; the min keeps a floor on SSH frequency.
+const (
+	DefaultRemoteSessionRefreshSecs = 15
+	MinRemoteSessionRefreshSecs     = 5
+	MaxRemoteSessionRefreshSecs     = 300
+)
+
+// GetRemoteSessionRefreshSecs returns the remote session-list poll interval
+// in seconds, clamped to [MinRemoteSessionRefreshSecs,
+// MaxRemoteSessionRefreshSecs]. Unset (<= 0) falls back to
+// DefaultRemoteSessionRefreshSecs. See issue #1170.
+func (u UISettings) GetRemoteSessionRefreshSecs() int {
+	val := u.RemoteSessionRefreshSecs
+	if val <= 0 {
+		return DefaultRemoteSessionRefreshSecs
+	}
+	if val < MinRemoteSessionRefreshSecs {
+		return MinRemoteSessionRefreshSecs
+	}
+	if val > MaxRemoteSessionRefreshSecs {
+		return MaxRemoteSessionRefreshSecs
+	}
+	return val
 }
 
 // GetRemoteLatencyRefreshSecs returns the remote latency refresh interval
@@ -792,6 +825,12 @@ type ClaudeSettings struct {
 	// dialog default. They are persisted as discrete TOML array entries and
 	// copied to Instance.ExtraArgs when a Claude session is created.
 	ExtraArgs []string `toml:"extra_args"`
+
+	// DefaultModel is the model to preselect for new Claude sessions
+	// (e.g., "claude-opus-4-7"). Mirrors [gemini]/[opencode]/[copilot]
+	// default_model. When empty, the dialog leaves the model unset and Claude
+	// Code falls back to its own default (#1172).
+	DefaultModel string `toml:"default_model"`
 
 	// UseChrome enables --chrome by default for Claude sessions.
 	UseChrome bool `toml:"use_chrome"`
@@ -2738,6 +2777,8 @@ func CreateExampleConfig() error {
 # use_happy = true
 # Extra Claude CLI flags remembered from the New Session dialog
 # extra_args = ["--agent", "reviewer"]
+# Default model preselected for new sessions (must be a known catalog model)
+# default_model = "claude-opus-4-7"
 # Enable Chrome / teammate mode by default
 # use_chrome = false
 # use_teammate_mode = false

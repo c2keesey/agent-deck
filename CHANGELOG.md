@@ -7,6 +7,186 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.39] - 2026-05-27
+
+### Fixed
+
+- **Typing into a session now echoes in ~60ms instead of lagging up to ~2s** ([#1131](https://github.com/asheshgoplani/agent-deck/issues/1131), thanks @ddorman-dn). The insert-mode preview pane refreshes immediately after each keystroke instead of only on the 2s background tick.
+
+## [1.9.38] - 2026-05-27
+
+### Fixed (CRITICAL / data loss)
+
+- **Dismissing a session created via `worktree_reuse` no longer deletes the user's original repository** ([#1200](https://github.com/asheshgoplani/agent-deck/issues/1200), thanks @mic-web). The dismiss path could run `os.RemoveAll` on the user's original repo; worktree removal is now guarded to only delete agent-deck-created worktrees under the managed dir.
+
+## [1.9.37] - 2026-05-27
+
+### Fixed
+
+- **`worktree.default_enabled` now falls back to a normal session on non-git directories instead of failing** ([#1185](https://github.com/asheshgoplani/agent-deck/issues/1185), thanks @marekaf). When the default-worktree setting was on and you created a session in a directory that isn't a git repo, creation errored; it now degrades gracefully to a plain session.
+- **New-session dialog "Type custom path/model" inputs now accept typed input** ([#1190](https://github.com/asheshgoplani/agent-deck/issues/1190), thanks @marekaf). Selecting the custom path or model option kept focus on the list instead of the text field, so keystrokes were swallowed (root cause [#1023](https://github.com/asheshgoplani/agent-deck/issues/1023)).
+
+### Added
+
+- **Capability-level E2E test suite** — lifecycle (launch/stop/fork) and echo-agent round-trip coverage with a snapshot dashboard ([#1191](https://github.com/asheshgoplani/agent-deck/issues/1191), [#1193](https://github.com/asheshgoplani/agent-deck/issues/1193), [#1194](https://github.com/asheshgoplani/agent-deck/issues/1194)).
+
+### Changed
+
+- Go dependency bumps (go-minor-patch group, [#1180](https://github.com/asheshgoplani/agent-deck/issues/1180)).
+- Release workflow gained a `workflow_dispatch` escape hatch for publishing a tag manually.
+
+## [1.9.36] - 2026-05-26
+
+Two inter-agent comms backbone fixes that make conductor↔worker signalling trustworthy. As always the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Fixed
+
+- **Conductors now get a trustworthy worker-"finished" signal** ([#1186](https://github.com/asheshgoplani/agent-deck/issues/1186)). The worker prints a completion sentinel (`===AGENTDECK_DONE=== status=… summary=…`) and agent-deck emits a real `[DONE] Child finished` event on the Stop hook edge instead of the ambiguous "waiting" status, so conductors no longer have to poll artifacts to know a task finished.
+- **EVENT notifications no longer re-fire 10-40× for an idle session** ([#1187](https://github.com/asheshgoplani/agent-deck/issues/1187)). The dedup key is now derived from append-only transcript content instead of the clock (which was re-stamped on every pane redraw), so an idle-but-animating Claude pane emits its `[EVENT]` once.
+
+## [1.9.35] - 2026-05-26
+
+Two community contributions: a configurable default model for new Claude sessions ([#1172](https://github.com/asheshgoplani/agent-deck/issues/1172), credit [@marekaf](https://github.com/marekaf)) and a tmux pane that now fills the full terminal width when a Claude session opens ([#1167](https://github.com/asheshgoplani/agent-deck/issues/1167), credit [@OrNatanAxon](https://github.com/OrNatanAxon)). As always the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Added
+
+- **Configurable `default_model` for new Claude sessions** ([#1172](https://github.com/asheshgoplani/agent-deck/issues/1172), credit [@marekaf](https://github.com/marekaf)). The `[claude]` config block now accepts a `default_model` key so new Claude sessions preselect your chosen model instead of always defaulting to Sonnet.
+
+### Fixed
+
+- **Claude session pane now fills the full terminal width on open** ([#1167](https://github.com/asheshgoplani/agent-deck/issues/1167), credit [@OrNatanAxon](https://github.com/OrNatanAxon)). The attach PTY is now pre-sized to the terminal before attach, so the pane no longer opens at a narrow default width.
+- **Hardened the #1167 attach-width tests against CI load races** ([#1178](https://github.com/asheshgoplani/agent-deck/issues/1178)). The tests now poll until the expected width is reached instead of relying on a fixed sleep, so they no longer flake under release-runner load.
+
+## [1.9.32] - 2026-05-25
+
+Three community-reported bug fixes: a remote-update false-success loop ([#1171](https://github.com/asheshgoplani/agent-deck/issues/1171), credit [@javierciccarelli](https://github.com/javierciccarelli)), the new-session model picker hiding typed input and swallowing Esc ([#1162](https://github.com/asheshgoplani/agent-deck/issues/1162), credit [@wbonnefond](https://github.com/wbonnefond)), and federated remote sessions flickering out on transient SSH errors ([#1170](https://github.com/asheshgoplani/agent-deck/issues/1170), credit [@devtechwebsource](https://github.com/devtechwebsource)). As always the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Fixed
+
+- **`remote update` no longer reports a false success while leaving the remote on the old version** ([#1171](https://github.com/asheshgoplani/agent-deck/issues/1171), credit [@javierciccarelli](https://github.com/javierciccarelli)). Root cause: `DeployBinary` SCP'd the new binary to the bare relative path `agent-deck` (→ `~/agent-deck` in the SSH user's home), while `CheckBinary` ran `agent-deck version` through the remote `$PATH` (→ `~/.local/bin/agent-deck` from `install.sh`). Deploy and check targeted *different files*, so the command printed `✓ Installed vX` while the remote kept running the old binary; a second `remote update` again reported "outdated", looping forever. Two-part fix: (1) `ResolveRemotePath` now deploys to the binary the remote actually executes — `command -v agent-deck`, falling back to the `install.sh` default `$HOME/.local/bin/agent-deck` — and creates the parent directory unconditionally; (2) `InstallBinary` verifies the remote's `$PATH` binary reports the new version *before* claiming success, surfacing an actionable error (e.g. "deployed to X but remote runs vY from $PATH") instead of a false ✓. Pinned by `internal/session/issue1171_remote_update_path_test.go`. **Upgrade note:** hosts left with a stray `~/agent-deck` from earlier broken runs can delete it (`rm ~/agent-deck`); it is harmless and never executed.
+- **New-session model picker now echoes typed input and scopes Esc to the picker** ([#1162](https://github.com/asheshgoplani/agent-deck/issues/1162), credit [@wbonnefond](https://github.com/wbonnefond)). Two UX bugs: (1) the suggestions dropdown overlay was positioned by counting raw content newlines, but the command-button row above the model field wraps to extra visual lines at narrow widths, so the undercount dropped the dropdown on top of the model input and hid whatever the user typed — now positioned from the visual (width-wrapped) line count via `lipgloss.Height`; (2) `Esc` killed the entire new-session flow because `home.go` called `newDialog.Hide()` before the dialog could treat it as close-self for the picker — now the parent forwards `Esc` to the dialog when `IsModelPickerOpen()` is true, dismissing only the picker (form stays alive, typed value preserved) while a second `Esc`, or `Esc` on any other field, cancels the flow as before. Pinned by `internal/ui/issue1162_model_picker_test.go`.
+- **Federated remote sessions no longer flicker out on a transient SSH error** ([#1170](https://github.com/asheshgoplani/agent-deck/issues/1170), credit [@devtechwebsource](https://github.com/devtechwebsource)). The 30s poll shared a single 15s context across all remotes fetched sequentially (one slow/offline remote starved the others) and the handler did a wholesale `h.remoteSessions = msg.sessions`, wiping last-good data for any remote missing from a partial fetch. Fix: each remote is now fetched in parallel with its own 15s timeout, and the new pure `mergeRemoteSessions` keeps last-good sessions for errored remotes while successful fetches replace wholesale (new sessions appear, removed sessions drop, deconfigured remotes drop). Poll cadence is configurable via `[ui] remote_session_refresh_secs` (default 15s, clamped 5–300). Pinned by `internal/session/issue1170_remote_session_refresh_test.go` and `internal/ui/issue1170_remote_refresh_test.go`.
+
+## [1.9.31] - 2026-05-23
+
+A targeted release led by the **structural telegram-leak fix** ([#1164](https://github.com/asheshgoplani/agent-deck/pull/1164), closes [#1163](https://github.com/asheshgoplani/agent-deck/issues/1163)) — the flagship change of this cycle — plus four community contributions from [@spawnia](https://github.com/spawnia) (multi-repo trust + imports, hidden-terminal fix, CSRF protection) and a security bump of `golang.org/x/net`. v1.9.31 is the **twenty-sixth release cut under the Option A pipeline** ([#981](https://github.com/asheshgoplani/agent-deck/pull/981) in v1.9.6); the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Fixed
+
+- **Telegram can no longer leak into conductor-spawned children (three structural defenses)** ([#1164](https://github.com/asheshgoplani/agent-deck/pull/1164), closes [#1163](https://github.com/asheshgoplani/agent-deck/issues/1163)). Root cause (forensic investigation): conductor children inherited the conductor's `CLAUDE_CONFIG_DIR` — a worker-scratch profile whose `settings.json` has `telegram@claude-plugins-official: true` — because the scratch-pin gate `hostHasTelegramConductor()` read only the legacy single-bot `[conductor.telegram].token`, which is empty (`""`) under the modern 7-bot `env_file` topology. The gate stayed disarmed, no per-child `telegram=false` scratch was created, the child loaded the telegram plugin with no `TELEGRAM_STATE_DIR`, fell back to the default bot dir, and spawned a duplicate `bun telegram` poller (409 Conflict storm, dropped messages). Three by-construction fixes:
+  - **Change 1 — repaired the dead gate.** `configDeclaresTelegram()` now detects telegram via the modern topology: any `[conductors.<name>].claude.env_file` whose `.envrc` exports `TELEGRAM_STATE_DIR` arms the gate, in addition to the legacy token. This single repair re-enables the existing #1137 scratch-pin defense for every spawn path. Verified live: all 7 conductor env_files arm the gate while the legacy token is empty.
+  - **Change 2 — `childenv` chokepoint + forbidigo lint.** New leaf package `internal/childenv` (and `session.ChildLaunchEnv`) strips inherited `CLAUDE_CONFIG_DIR` (#1163) **and** every `TELEGRAM_*` var (#1152) from a child's env, pinning the child's own config dir. The pooled-MCP spawn paths (`internal/mcppool/{http_server,socket_proxy}.go`) route their base env through it. A `.golangci.yml` forbidigo rule bans raw `os.Environ()` in spawn paths so the leak cannot be reintroduced.
+  - **Change 3 — process-group reaping.** `internal/mcppool/http_server.go` now spawns with `Setpgid` and SIGTERM/SIGKILLs the whole process group on stop (matching `socket_proxy.go`), so a launcher's grandchildren (bun wrappers, npx/uvx subprocesses) are reaped as a unit instead of orphaning under PID 1.
+  - Pinned by `internal/session/issue1163_telegram_structural_test.go`, `internal/session/issue1163_procgroup_unix_test.go`, `internal/session/issue1163_forbidigo_test.go`, and `internal/childenv/childenv_test.go`.
+
+- **Hidden terminal tab no longer shrinks the tmux window** ([PR #1157](https://github.com/asheshgoplani/agent-deck/pull/1157), credit [@spawnia](https://github.com/spawnia)). A hidden Web terminal tab reported a zero/stale viewport size, causing tmux to resize the underlying window down to the hidden tab's dimensions and corrupting the visible session's layout. Fix prevents the hidden tab from driving the tmux resize.
+
+- **CSRF protection for Web UI mutation endpoints** ([PR #1158](https://github.com/asheshgoplani/agent-deck/pull/1158), credit [@spawnia](https://github.com/spawnia)). Web UI state-changing endpoints lacked CSRF defenses. Adds token-based CSRF protection (`internal/web/csrf.go`, pinned by `internal/web/csrf_test.go`) so mutation requests cannot be forged cross-origin.
+
+### Added
+
+- **Multi-repo Claude trust pre-accept + parent `CLAUDE.md` emission** ([PR #1155](https://github.com/asheshgoplani/agent-deck/pull/1155), closes [#1149](https://github.com/asheshgoplani/agent-deck/issues/1149), credit [@spawnia](https://github.com/spawnia)). Pre-accepts Claude's trust prompt and emits a parent `CLAUDE.md` for multi-repo sessions so additional working directories are trusted without manual confirmation.
+
+- **Multi-repo `@path` imports + permission settings in Claude context** ([PR #1156](https://github.com/asheshgoplani/agent-deck/pull/1156), credit [@spawnia](https://github.com/spawnia)). Enhances the generated Claude context for multi-repo sessions with `@path` imports and permission settings so each repo's instructions and permissions are wired in automatically.
+
+### Security
+
+- **Bumped `golang.org/x/net` to v0.55.0** ([GO-2026-5026](https://pkg.go.dev/vuln/GO-2026-5026)). Pulls in the upstream fix for the advisory.
+
+## [1.9.30] - 2026-05-22
+
+A 5-fix improvement-cycle release on top of v1.9.29, closing four production-observable issues plus one Web UI parity gap. v1.9.30 is the **twenty-fifth release cut under the Option A pipeline** ([#981](https://github.com/asheshgoplani/agent-deck/pull/981) in v1.9.6); the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Fixed
+
+- **Explicit `--session-id` preserved in multi-session-per-cwd JSONL routing** ([PR #1148](https://github.com/asheshgoplani/agent-deck/pull/1148), closes [#1147](https://github.com/asheshgoplani/agent-deck/issues/1147), credit [@KrE80r](https://github.com/KrE80r)'s RCA). When two child sessions shared a cwd, the second session's explicit `--session-id` flag was silently overwritten by the first session's id, causing JSONL transcript hijack between unrelated agents. Fix preserves the caller-provided session-id verbatim through the multi-session-per-cwd path so each session writes to its own JSONL.
+
+- **Lefthook pre-push race between css-verify and lint** ([PR #1151](https://github.com/asheshgoplani/agent-deck/pull/1151), closes [#1146](https://github.com/asheshgoplani/agent-deck/issues/1146)). The recurring v1.9.x release pain — pre-push hooks intermittently failing because css-verify and lint shared a working tree and stomped each other's intermediate artifacts. Fix serializes the two pre-push commands so they never run concurrently, removing the race that has bitten multiple recent release attempts.
+
+- **All `TELEGRAM_*` env vars stripped from child sessions** ([PR #1152](https://github.com/asheshgoplani/agent-deck/pull/1152), closes [#1133](https://github.com/asheshgoplani/agent-deck/issues/1133)). Paired with the telegram reliability work in #1137: child sessions were inheriting conductor-scoped `TELEGRAM_*` env vars (including `TELEGRAM_STATE_DIR` and bot token), causing children to inadvertently bind to the parent's telegram channel. Fix scrubs every `TELEGRAM_*` env var from the child env before spawn so channel ownership stays with the conductor that registered it.
+
+- **GitHub releases API calls authenticated to avoid anonymous rate limit** ([PR #1154](https://github.com/asheshgoplani/agent-deck/pull/1154), closes [#1150](https://github.com/asheshgoplani/agent-deck/issues/1150), credit [@DaniFdz](https://github.com/DaniFdz)). The update checker hit GitHub's 60-req/hour anonymous rate limit on shared NAT egress IPs, leaving users on the same network unable to receive update notifications. Fix sends `GITHUB_TOKEN` (when present) as a `Bearer` auth header, raising the cap to 5000 req/hour for token-holders and degrading gracefully to anonymous when no token is set.
+
+### Added
+
+- **Web UI `worktree-finish` endpoint + UI** ([PR #1153](https://github.com/asheshgoplani/agent-deck/pull/1153), closes [#1126](https://github.com/asheshgoplani/agent-deck/issues/1126)). Closes a `PARITY_MATRIX.md` gap: the TUI's worktree-finish action (merge child branch back, clean up worktree) had no Web UI equivalent. New endpoint `POST /api/sessions/{id}/worktree/finish` plus a Sidebar control bring the Web view to parity. Pinned by `internal/web/issue1126_worktree_finish_test.go` (227 LOC) and `tests/web/e2e/worktree-finish.spec.js`.
+
+## [1.9.29] - 2026-05-21
+
+A 3-fix follow-up to v1.9.28 closing out the recursive self-improvement → file-issue → TDD-fix cycle that surfaced three production-observable gaps. v1.9.29 is the **twenty-fourth release cut under the Option A pipeline** ([#981](https://github.com/asheshgoplani/agent-deck/pull/981) in v1.9.6); the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Fixed
+
+- **Codex + Gemini session-id rebinds now persisted to SQLite** ([PR #1141](https://github.com/asheshgoplani/agent-deck/pull/1141), fixes [#1139](https://github.com/asheshgoplani/agent-deck/issues/1139), mirror of [#1138](https://github.com/asheshgoplani/agent-deck/issues/1138) in v1.9.28). The Claude `/clear` rebind persistence fix in #1140 left the same gap open for the codex and gemini wrappers: when those tiles rebound to a fresh session-id, the in-memory `Instance` updated but `state.db` kept pinning the pre-rebind UUID in `tool_data.codex_session_id` / `tool_data.gemini_session_id`. Third-party consumers joining on `tool_data` saw stale UUIDs and could not follow the live conversation. Fix mirrors the Claude rebind-persist path for both wrappers, with 636 lines of regression tests (`issue1139_codex_session_persist_test.go` + `issue1139_gemini_session_persist_test.go`) pinning the invariant.
+
+- **Status-transition notifier de-duplicates identical `[EVENT]` notifications** ([PR #1144](https://github.com/asheshgoplani/agent-deck/pull/1144), closes [#1142](https://github.com/asheshgoplani/agent-deck/issues/1142)). Self-improvement telemetry surfaced a 47×-loop pattern: a single child status flap could fan out 47 duplicate `[EVENT]` lines to the conductor within seconds when output-hashes matched. Fix keys de-duplication on `(child, status, output-hash)` so identical events collapse to one delivery, eliminating the loop while keeping legitimate distinct events. Pinned by `internal/session/issue1142_event_dedup_test.go`.
+
+### Added
+
+- **`--idle-timeout <duration>` flag on `launch` + `session`** ([PR #1145](https://github.com/asheshgoplani/agent-deck/pull/1145), closes [#1143](https://github.com/asheshgoplani/agent-deck/issues/1143)). Self-improvement telemetry surfaced a 4×-dormant-worker pattern: child sessions sitting idle for hours after their parent had moved on, holding tmux + claude resources. New `--idle-timeout` flag auto-stops dormant children once they exceed the configured duration (e.g. `--idle-timeout 30m`). Configurable per-session at any time via `agent-deck session set <id> idle_timeout 30m`. Idle watcher lives in `internal/session/idle_timeout_watcher.go` with persistence in `idle_timeout_persist.go`. Pinned by `issue1143_idle_timeout_test.go` (368 LOC) + `issue1143_idle_timeout_cli_test.go`.
+
+## [1.9.28] - 2026-05-21
+
+A single-fix follow-up to v1.9.27 closing the Claude `/clear` rebind persistence gap reported in [#1138](https://github.com/asheshgoplani/agent-deck/issues/1138). v1.9.28 is the **twenty-third release cut under the Option A pipeline** ([#981](https://github.com/asheshgoplani/agent-deck/pull/981) in v1.9.6); the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Fixed
+
+- **Claude session-id rebind now persisted to SQLite after `/clear`** ([PR #1140](https://github.com/asheshgoplani/agent-deck/pull/1140), fixes [#1138](https://github.com/asheshgoplani/agent-deck/issues/1138), credit @tarekrached). When a Claude tile ran `/clear` and rebound to a fresh session-id, the in-memory `Instance` updated but `state.db` kept pinning the pre-`/clear` UUID in `tool_data.claude_session_id` forever. Third-party consumers that join on `tool_data` (e.g. claudopticon) saw stale UUIDs and could not follow the live conversation. Fix persists the rebind through to SQLite at the moment of rebind, with a 398-line regression test (`internal/session/instance_rebind_persist_test.go`) pinning the invariant.
+
+## [1.9.27] - 2026-05-21
+
+A telegram-reliability double-fix release on top of v1.9.26, hardening the recurring telegram MCP drop on conductor restart. v1.9.27 is the **twenty-second release cut under the Option A pipeline** ([#981](https://github.com/asheshgoplani/agent-deck/pull/981) in v1.9.6); the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Fixed
+
+- **Recurring telegram MCP drops on conductor restart** ([PR #1136](https://github.com/asheshgoplani/agent-deck/pull/1136), [PR #1137](https://github.com/asheshgoplani/agent-deck/pull/1137), fixes [#1134](https://github.com/asheshgoplani/agent-deck/issues/1134), [#1138](https://github.com/asheshgoplani/agent-deck/issues/1138)). Two-layer defense: scratch `settings.json` is force-corrected on every spawn (#1137) so a channel-owning conductor session can never start with the telegram plugin disabled, plus a post-spawn health warning if the plugin fails to load. The initial fix in #1136 wrote `settings.json` correctly on session creation but did not enforce the invariant on subsequent spawns; #1137 closes that gap with a 4th gate that re-validates on every spawn.
+
+### Added
+
+- **`agent-deck telegram-doctor` CLI** ([PR #1137](https://github.com/asheshgoplani/agent-deck/pull/1137)). New runtime health-monitoring command that audits the telegram plugin across all conductor sessions — reports per-session plugin status, settings.json correctness, and surfaces drift between expected and live state. Backed by a CI regression workflow (`.github/workflows/telegram-reliability.yml`) that pins the invariants going forward.
+
+## [1.9.26] - 2026-05-21
+
+A same-day web UI feature parity wave on top of v1.9.25, focused on the `PARITY_MATRIX.md` gap list: the Children panel flips from stub to functional, 30 session state fields land on `MenuSession` JSON (unblocking the Edit-dialog stream), and the non-destructive Close + Undo Delete lifecycle ops reach parity with the TUI's Shift+D / Ctrl+Z. v1.9.26 is the **twenty-first release cut under the Option A pipeline** ([#981](https://github.com/asheshgoplani/agent-deck/pull/981) in v1.9.6); the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Added
+
+- **Children panel for conductor sessions** ([PR #1127](https://github.com/asheshgoplani/agent-deck/pull/1127), closes [#1125](https://github.com/asheshgoplani/agent-deck/issues/1125)). The right-rail "Children (conductor)" pane previously rendered the stub `Conductor child topology not exposed via web API.`; this PR closes that gap. New endpoint `GET /api/sessions/{id}/children` returns a nested tree built from the same `MenuSnapshot` the session list uses, so child status and hook refresh stay consistent with the rest of the web view. Cycle-safe via a visited set against corrupt parent pointers. Unknown session id returns `404 NOT_FOUND`, non-conductor sessions return `200` with `children:[]` (per spec, not 404), leaf nodes always return `children:[]` (never null), non-GET returns `405`. UI lands in `internal/web/static/app/RightRail.js` as a collapsible tree.
+
+- **All session state fields exposed on `MenuSession` JSON** ([PR #1128](https://github.com/asheshgoplani/agent-deck/pull/1128), closes 30 MISSING rows in `tests/web/PARITY_MATRIX.md`). Promotes 30 state-field rows from MISSING to Present by surfacing the matching `*session.Instance` fields on `MenuSession` JSON so a web client can render the same edit form as the TUI without a secondary lookup; unblocks the Edit-dialog parity stream (top-5 priority #1 from the master plan). New fields (all `omitempty`, backward compatible): `is_conductor`, `claude_session_id`, `gemini_session_id`, `gemini_model`, `gemini_yolo_mode` (`*bool`, where `&false` marshals as `false`), `codex_session_id`, `opencode_session_id`, `latest_prompt`, `notes`, `color`, `command`, `wrapper`, `channels`, `extra_args`, `tool_options_json`, `sandbox`, `sandbox_container`, `ssh_host`, `ssh_remote_path`, `multi_repo_enabled`, `additional_paths`, `multi_repo_temp_dir`, `multi_repo_worktrees`, `worktree_path`, `worktree_repo_root`, `worktree_branch`, `title_locked`, `no_transition_notify`, `loaded_mcp_names`, `gemini_analytics`. Three rows stay MISSING with documented reasons (`is_fork_awaiting_start`, `skip_mcp_regenerate` are `json:"-"` transients; the third is a TUI-only render flag).
+
+- **Non-destructive Close + Undo Delete for web sessions** ([PR #1129](https://github.com/asheshgoplani/agent-deck/pull/1129), closes 2 MISSING rows in `tests/web/PARITY_MATRIX.md`). Adds the two lifecycle operations that previously existed only in the TUI: `POST /api/sessions/{id}/close` stops the tmux process but keeps metadata in storage (mirrors TUI Shift+D); `POST /api/sessions/undelete` is a Chrome-style undo of the most-recent delete within a 30s window (`web.DefaultUndoWindow`; mirrors TUI Ctrl+Z). `SessionMutator` gains `CloseSession` + `UndoDelete`. The `WebMutator` pushes the deleted `Instance` onto an in-memory undo stack (capped at 10, FIFO eviction) before `storage.DeleteInstance`; `UndoDelete` pops, `Restart()`s, and re-saves. SPA wiring in `internal/web/static/app/AppShell.js` (Shift+D now POSTs `/close` instead of `/stop`; Ctrl+Z POSTs `/undelete`), with `KeyboardShortcuts.js` help overlay updated. Pinned by 12 new cases in `internal/web/handlers_sessions_test.go` (happy / error / disabled / nil-mutator / SSE for both endpoints) and `tests/web/e2e/close-undo.spec.js` (delete→undelete roundtrip, LIFO ordering, 404 on empty stack, Shift+D UI flow).
+
+### Internal
+
+- **Deduplicate `parent_session_id` row in `PARITY_MATRIX.md`** ([PR #1130](https://github.com/asheshgoplani/agent-deck/pull/1130)). The matrix sweep in #1128 left a duplicate `parent_session_id` row that broke the `tests/web/PARITY_MATRIX.md`-shape assertions on `main`. Hotfix removes the duplicate row. Test-data only, no behavior change.
+
+## [1.9.25] - 2026-05-21
+
+A multi-track follow-up to v1.9.24: two more remote-session fixes from @ddorman-dn (closing the #1112 cluster + the screen-scaling / insert-buffer regression #1113), the iTerm badge fix for #1114 from @tarekrached, and a multi-repo correctness fix + refactor from @spawnia restoring `.worktreeinclude` and per-repo setup. On top of the bug bucket, **both the Skills and MCP management surfaces** land in the Web UI — the two tabs flip from empty stubs to functional, closing the remaining MISSING rows in `PARITY_MATRIX.md`. v1.9.25 is the **twentieth release cut under the Option A pipeline** ([#981](https://github.com/asheshgoplani/agent-deck/pull/981) in v1.9.6); the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.
+
+### Added
+
+- **Skills management endpoints + Web UI** ([PR #1122](https://github.com/asheshgoplani/agent-deck/pull/1122), closes the Skills MISSING rows in `PARITY_MATRIX.md`). The web UI gains a full Skills surface: list/attach/detach pool skills, view SKILL.md contents, and manage user vs pool scope — mirroring the CLI/TUI affordances so the web client is no longer a second-class citizen for skill workflows. Endpoints land in `internal/web/skills_handlers.go` with the SPA wiring in `internal/web/static/app/SkillsPanel.js` and `internal/web/static/app/AppShell.js`. Pinned by `internal/web/skills_handlers_test.go` and `tests/web/e2e/skills-panel.spec.js`.
+
+- **MCP management endpoints + Web UI** ([PR #1124](https://github.com/asheshgoplani/agent-deck/pull/1124), closes the 4 MCP MANAGEMENT MISSING rows in `PARITY_MATRIX.md`). The web UI gains parity with the TUI's `m` key MCPDialog: list the catalog from `config.toml`, attach/detach MCPs per session, and toggle pooled ↔ local scope — all without a terminal. Five new endpoints (`GET /api/mcps`, `GET/POST/DELETE/PATCH /api/sessions/{id}/mcps[/{name}]`) route through a hermetic `MCPManager` seam whose default delegates to the same `internal/session` helpers the TUI uses, so write paths are by construction equivalent to the TUI. Implementation lands in `internal/web/handlers_mcps.go` + `internal/web/static/app/panes/McpPane.js`. Pinned by `internal/web/handlers_mcps_test.go` (17 Go tests covering list/attach/detach/move, scope validation, mutations-disabled gate, unknown session, UTF-8 names, manager errors) and `tests/web/e2e/mcps.spec.js` (12 Playwright cases). Combined with #1122, the Web UI's Skills and MCP tabs both flip from empty stubs to first-class surfaces in this release.
+
+### Fixed
+
+- **iTerm badge updates route through the attach process** ([PR #1116](https://github.com/asheshgoplani/agent-deck/pull/1116), closes [#1114](https://github.com/asheshgoplani/agent-deck/issues/1114), credit @tarekrached). Renaming a session left the iTerm badge stuck on the old name because the badge escape was emitted from the wrong process and never reached the user's terminal. Fix routes the badge update through the attach process so iTerm picks it up on the next paint. Pinned by `internal/tmux/issue1114_badge_test.go`. Credit @tarekrached for the report and patch.
+
+- **Multi-repo worktrees run `.worktreeinclude` and the setup script per repo** ([PR #1118](https://github.com/asheshgoplani/agent-deck/pull/1118), credit @spawnia). Multi-repo worktree creation was skipping `.worktreeinclude` processing and the per-repo setup hook for every repo after the first, leaving auxiliary repos in a half-initialized state. Fix iterates the full repo set so each one gets its own include resolution + setup script invocation. Credit @spawnia for the report and patch.
+
+- **Remote sessions: waiting-status + arrow keys + insert perf** ([PR #1120](https://github.com/asheshgoplani/agent-deck/pull/1120), closes [#1112](https://github.com/asheshgoplani/agent-deck/issues/1112), follow-ups to [#1102](https://github.com/asheshgoplani/agent-deck/issues/1102) / [#1110](https://github.com/asheshgoplani/agent-deck/pull/1110), credit @ddorman-dn). The remote-session surface in v1.9.24 still had three rough edges: the waiting-status indicator never updated, arrow keys weren't reaching the remote pty, and insert-mode perf was slower than the local fix in #1110. This PR wires waiting-status detection through the remote codepath, threads the arrow-key sequences through the remote keysender, and lifts the local insert-mode batching into the remote path so latency now matches local. Credit @ddorman-dn for the real-user report.
+
+- **Screen scaling at narrow widths + insert buffer stale on session switch** ([PR #1123](https://github.com/asheshgoplani/agent-deck/pull/1123), closes [#1113](https://github.com/asheshgoplani/agent-deck/issues/1113), credit @ddorman-dn). Two coupled UI bugs: narrow terminals were laying out columns at the wrong width (overflowing the Sessions list), and the insert-mode keystroke buffer kept the previous session's pending keys when the user switched sessions, so the first keystroke into a new session looked like garbage. Fix recomputes the scaling on resize and resets the insert buffer at the session-switch boundary. Credit @ddorman-dn for the real-user report.
+
+### Internal
+
+- **golangci-lint v2 pinned in the Makefile** ([PR #1119](https://github.com/asheshgoplani/agent-deck/pull/1119), credit @spawnia). The repo's `.golangci.yml` has been v2 for a while, but the Makefile was still installing the v1 linter, so contributors hit confusing errors locally. Fix installs golangci-lint v2 to match the config. Build/lint-only, no behavior change. Credit @spawnia for the patch.
+
+- **Extract `CreateMultiRepoWorktrees` into a testable function** ([PR #1121](https://github.com/asheshgoplani/agent-deck/pull/1121), credit @spawnia). Multi-repo worktree creation was inlined in the CLI command, which made it impossible to unit-test the #1118 fix above. This refactor extracts the orchestration into `CreateMultiRepoWorktrees` with its own test, locking the behavior in place. Refactor-only, no behavior change. Credit @spawnia for the patch.
+
 ## [1.9.24] - 2026-05-20
 
 A second hotfix wave on top of v1.9.23, also same-day: five user-feedback fixes from @ddorman-dn (covering the remote-session surface — Shift+Enter, preview pane + cost/usage, latency markers, insert-mode perf), the re-close of the long-running #953 stopped-status bucket bug from @halfmu, plus two internal build/lint hotfixes that kept `main` green. v1.9.24 is the **nineteenth release cut under the Option A pipeline** ([#981](https://github.com/asheshgoplani/agent-deck/pull/981) in v1.9.6); the local release worker stops at `git push origin <tag>` and `.github/workflows/release.yml` is the single source of truth for `goreleaser release --clean`.

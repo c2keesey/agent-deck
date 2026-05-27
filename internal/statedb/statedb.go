@@ -846,6 +846,86 @@ func (s *StateDB) WriteStatus(id, status, tool string) error {
 	})
 }
 
+// WriteClaudeSessionBinding atomically updates claude_session_id and
+// claude_detected_at inside the tool_data JSON column for the given
+// instance. Used by the hook-rebind path (UpdateHookStatus →
+// bindClaudeSessionFromHook) to persist the new session ID without a
+// whole-row INSERT OR REPLACE — which would clobber any concurrent
+// writes to other tool_data fields by writers holding a stale snapshot
+// of the instance.
+//
+// PERSIST-12 (see instance.go:bindClaudeSessionFromHook doc comment)
+// originally deferred this to an external "save cycle", but none of the
+// three UpdateHookStatus callers (TUI tick, web refresh, CLI status
+// refresh) actually call Save after rebind. Without this targeted
+// write, tool_data.claude_session_id stays pinned at the pre-/clear
+// UUID indefinitely for any DB-direct consumer (claudopticon, etc.) —
+// and the lifecycle log accumulates fresh "rebind" entries forever
+// because concurrent processes keep reloading the stale row from disk
+// and clobbering the in-memory mutation.
+//
+// Wrapped in withBusyRetry: SQLite serializes writers through a single
+// write lock, so under contention with WriteStatus / SaveInstance /
+// heartbeat writers a transient SQLITE_BUSY would otherwise drop this
+// update — matching the WriteStatus rationale above.
+func (s *StateDB) WriteClaudeSessionBinding(id, sessionID string, detectedAt time.Time) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.claude_session_id', ?,
+			         '$.claude_detected_at', ?)
+			 WHERE id = ?`,
+			sessionID, detectedAt.Unix(), id,
+		)
+		return err
+	})
+}
+
+// WriteCodexSessionBinding is the Codex counterpart of
+// WriteClaudeSessionBinding: it atomically rewrites $.codex_session_id
+// and $.codex_detected_at inside the tool_data JSON column without
+// touching any unrelated keys. See WriteClaudeSessionBinding for the
+// full rationale (PERSIST-12, json_set vs. tool_data = ?, withBusyRetry).
+// This sibling exists because the Codex rebind path in
+// bindCodexSessionFromHook has the same in-memory-only mutation shape
+// that the Claude fix in #1140 addressed — tracked as #1139.
+func (s *StateDB) WriteCodexSessionBinding(id, sessionID string, detectedAt time.Time) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.codex_session_id', ?,
+			         '$.codex_detected_at', ?)
+			 WHERE id = ?`,
+			sessionID, detectedAt.Unix(), id,
+		)
+		return err
+	})
+}
+
+// WriteGeminiSessionBinding is the Gemini counterpart of
+// WriteClaudeSessionBinding. See that function's doc comment for the
+// PERSIST-12 / json_set / withBusyRetry rationale; the Gemini rebind
+// path in bindGeminiSessionFromHook had the same persistence gap
+// (#1139).
+func (s *StateDB) WriteGeminiSessionBinding(id, sessionID string, detectedAt time.Time) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.gemini_session_id', ?,
+			         '$.gemini_detected_at', ?)
+			 WHERE id = ?`,
+			sessionID, detectedAt.Unix(), id,
+		)
+		return err
+	})
+}
+
 // ReadAllStatuses returns status + acknowledged flag for every instance.
 func (s *StateDB) ReadAllStatuses() (map[string]StatusRow, error) {
 	rows, err := s.db.Query("SELECT id, status, tool, acknowledged FROM instances")

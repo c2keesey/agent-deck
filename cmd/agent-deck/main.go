@@ -38,7 +38,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.24" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.39" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -290,6 +290,9 @@ func main() {
 			return
 		case "conductor":
 			handleConductor(profile, args[1:])
+			return
+		case "telegram-doctor":
+			handleTelegramDoctor(profile, args[1:])
 			return
 		case "watcher":
 			handleWatcher(profile, args[1:])
@@ -2945,6 +2948,7 @@ func printHelp() {
 	fmt.Println("  web              Start TUI with web UI server running alongside")
 	fmt.Println("  remote           Manage remote agent-deck instances")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
+	fmt.Println("  telegram-doctor  Audit channel-owning sessions for telegram drops (#1138)")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
 	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")

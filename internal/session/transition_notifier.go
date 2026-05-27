@@ -20,6 +20,24 @@ const (
 	defaultSendTimeout      = 30 * time.Second
 	defaultQueueMaxAge      = 10 * time.Minute
 	defaultQueueMaxAttempts = 20
+
+	// defaultOutputHashDedupTTL caps the (child, to_status, output_hash)
+	// suppression window from issue #1142. A dormant child that re-emits
+	// the same transition with the same pane content is silenced for the
+	// TTL, then re-emits once as a liveness ping so the operator still
+	// sees the child is alive. 2h matches the worst-case 20.2-min mean
+	// interval observed in the 2026-05-21 self-improvement report (47
+	// fires over 15.5 hours) while still giving the operator periodic
+	// confirmation a child hasn't died silently.
+	defaultOutputHashDedupTTL = 2 * time.Hour
+
+	// shortWindowDedupSeconds preserves the pre-#1142 90-second
+	// idempotency window. It catches duplicate polls inside one daemon
+	// tick (e.g. when a hook fires the same transition that the
+	// status-poll also observes). Independent of output-hash dedup so
+	// callers that haven't been wired to populate LastOutputHash still
+	// get the legacy guarantee.
+	shortWindowDedupSeconds = 90
 )
 
 type TransitionNotificationEvent struct {
@@ -30,15 +48,42 @@ type TransitionNotificationEvent struct {
 	ToStatus       string    `json:"to_status"`
 	Timestamp      time.Time `json:"timestamp"`
 
+	// LastOutputHash is a cheap stable signal (e.g. SHA-1 of the last N
+	// bytes of the child's tmux pane at transition time) used by the
+	// notifier's #1142 dedup to suppress repeated [EVENT] notifications
+	// for a dormant child whose pane content hasn't changed. Optional —
+	// empty string disables hash-based dedup and falls back to the legacy
+	// 90s short window.
+	LastOutputHash string `json:"last_output_hash,omitempty"`
+
 	TargetSessionID string `json:"target_session_id,omitempty"`
 	TargetKind      string `json:"target_kind,omitempty"` // parent | conductor
 	DeliveryResult  string `json:"delivery_result,omitempty"`
+
+	// Kind distinguishes a finished event (issue #1186) from the default
+	// status-transition event. Empty means the legacy transition event
+	// ("[EVENT] Child is waiting"); transitionKindFinished means a
+	// worker-asserted completion ("[DONE] Child finished: status=…").
+	Kind string `json:"kind,omitempty"`
+
+	// DoneStatus/DoneSummary carry the parsed completion sentinel for a
+	// finished event. Unused for transition events.
+	DoneStatus  string `json:"done_status,omitempty"`
+	DoneSummary string `json:"done_summary,omitempty"`
 }
+
+// transitionKindFinished marks a TransitionNotificationEvent as a worker-
+// asserted task-completion signal rather than a status transition.
+const transitionKindFinished = "finished"
 
 type transitionNotifyRecord struct {
 	From string `json:"from"`
 	To   string `json:"to"`
 	At   int64  `json:"at"`
+	// OutputHash mirrors TransitionNotificationEvent.LastOutputHash at
+	// the moment of the last accepted (non-deduped) emission. Used by
+	// isDuplicate to suppress identical re-fires within the TTL.
+	OutputHash string `json:"output_hash,omitempty"`
 }
 
 type transitionNotifyState struct {
@@ -141,6 +186,14 @@ type TransitionNotifier struct {
 	// hangs past sendTimeout.
 	watchersWG sync.WaitGroup
 	sendersWG  sync.WaitGroup
+
+	// outputHashDedupTTLOverride lets tests shrink the issue #1142
+	// output-hash dedup window without waiting hours of wall-clock time.
+	// Zero means "use defaultOutputHashDedupTTL". Production never sets
+	// it. Tests that need a deterministic boundary drive the TTL via
+	// synthetic event.Timestamp values instead — this override exists
+	// only for the rare suite that wants to assert TTL math directly.
+	outputHashDedupTTLOverride time.Duration
 }
 
 func NewTransitionNotifier() *TransitionNotifier {
@@ -259,6 +312,45 @@ func (n *TransitionNotifier) NotifyTransition(event TransitionNotificationEvent)
 	// Ready to send: mark notified synchronously so subsequent polls don't
 	// redispatch while the async send is in flight, then fire-and-forget.
 	n.markNotified(plan.event)
+	n.dispatchAsync(plan.event.TargetSessionID, plan.message, plan.event)
+
+	plan.event.DeliveryResult = transitionDeliveryDispatching
+	return plan.event
+}
+
+// NotifyFinished dispatches a worker-asserted completion event (issue #1186)
+// to the child's parent. Unlike NotifyTransition it is not gated by
+// ShouldNotifyTransition (a finished event has no from→to transition); per-task
+// idempotency is the daemon's responsibility (it only calls this when the
+// detected sentinel actually changed). It reuses prepareDispatch so a finished
+// event still benefits from parent resolution, conductor/orphan suppression,
+// and the busy-defer retry queue.
+func (n *TransitionNotifier) NotifyFinished(event TransitionNotificationEvent) TransitionNotificationEvent {
+	event.Kind = transitionKindFinished
+	event.Profile = strings.TrimSpace(event.Profile)
+	event.ChildTitle = strings.TrimSpace(event.ChildTitle)
+	event.ChildSessionID = strings.TrimSpace(event.ChildSessionID)
+	event.DoneStatus = strings.ToLower(strings.TrimSpace(event.DoneStatus))
+	event.DoneSummary = strings.TrimSpace(event.DoneSummary)
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
+
+	if event.ChildSessionID == "" || event.Profile == "" {
+		event.DeliveryResult = transitionDeliveryDropped
+		return event
+	}
+	if isConductorSessionTitle(event.ChildTitle) {
+		event.DeliveryResult = transitionDeliveryDropped
+		return event
+	}
+
+	plan := n.prepareDispatch(event)
+	if plan.finalized {
+		n.logEvent(plan.event)
+		return plan.event
+	}
+
 	n.dispatchAsync(plan.event.TargetSessionID, plan.message, plan.event)
 
 	plan.event.DeliveryResult = transitionDeliveryDispatching
@@ -470,6 +562,18 @@ func (n *TransitionNotifier) Flush() {
 }
 
 func buildTransitionMessage(event TransitionNotificationEvent) string {
+	if event.Kind == transitionKindFinished {
+		// Issue #1186: a worker-asserted completion. Distinct [DONE] prefix
+		// and outcome so the conductor gets "done + status + summary" in one
+		// signal instead of polling artifacts.
+		return fmt.Sprintf(
+			"[DONE] Child '%s' (%s) finished: status=%s summary=%s",
+			event.ChildTitle,
+			event.ChildSessionID,
+			event.DoneStatus,
+			event.DoneSummary,
+		)
+	}
 	return fmt.Sprintf(
 		"[EVENT] Child '%s' (%s) is %s.\nCheck: agent-deck -p %s session output %s -q",
 		event.ChildTitle,
@@ -513,6 +617,21 @@ func isLiveSessionStatus(status Status) bool {
 	}
 }
 
+// isDuplicate reports whether the event should be suppressed because the
+// parent has already seen an equivalent [EVENT] line. Two layered checks:
+//
+//  1. Short-window (legacy): identical (from→to) within shortWindowDedupSeconds.
+//     Catches duplicate polls inside one daemon tick and back-compat callers
+//     that don't populate LastOutputHash.
+//
+//  2. Output-hash (issue #1142): identical to_status AND identical
+//     LastOutputHash within outputHashDedupTTL. Suppresses a dormant child
+//     re-emitting the same transition with no new pane content. After the
+//     TTL elapses, the event re-emits once as a liveness ping and the
+//     stored record resets via markNotified.
+//
+// Either layer matching is enough to dedup. From-status is intentionally
+// ignored in layer 2 since ShouldNotifyTransition already pins from=running.
 func (n *TransitionNotifier) isDuplicate(event TransitionNotificationEvent) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -521,10 +640,74 @@ func (n *TransitionNotifier) isDuplicate(event TransitionNotificationEvent) bool
 	if !ok {
 		return false
 	}
-	if record.From != event.FromStatus || record.To != event.ToStatus {
-		return false
+
+	elapsed := event.Timestamp.Unix() - record.At
+
+	if record.From == event.FromStatus && record.To == event.ToStatus && elapsed <= shortWindowDedupSeconds {
+		return true
 	}
-	return event.Timestamp.Unix()-record.At <= 90
+
+	if event.LastOutputHash != "" &&
+		record.To == event.ToStatus &&
+		record.OutputHash == event.LastOutputHash &&
+		elapsed <= int64(n.outputHashTTL().Seconds()) {
+		return true
+	}
+
+	return false
+}
+
+// outputHashTTL returns the active TTL for the output-hash dedup layer. The
+// override field is reserved for tests; production callers get the default.
+func (n *TransitionNotifier) outputHashTTL() time.Duration {
+	if n.outputHashDedupTTLOverride > 0 {
+		return n.outputHashDedupTTLOverride
+	}
+	return defaultOutputHashDedupTTL
+}
+
+// transitionEventOutputHash derives the stable content signal used by the
+// issue #1142 output-hash dedup. The key must be IDENTICAL across polls while
+// the child's logical state is unchanged, and MUST change on a genuine new
+// turn.
+//
+// issue #1187: the previous implementation keyed on
+// inst.GetLastActivityTime().UnixNano(), but that timestamp is re-stamped to
+// time.Now() on every tmux window_activity tick (tmux.go:2956/3102/3303). A
+// live Claude pane sitting at the prompt animates its footer/token-counter/
+// cursor/hint lines, so window_activity bumped every poll → the key moved
+// every poll → layer-2 dedup could never match → the same [EVENT] re-fired
+// 10-40x. The signal was clock-derived, structurally incapable of matching a
+// live pane.
+//
+// The fix derives the key from session CONTENT (the transcript), which the
+// animated chrome never touches. See transitionContentSignal. Empty string for
+// nil/missing/non-transcript tools — falls back to the legacy 90s dedup window,
+// exactly as before.
+func transitionEventOutputHash(inst *Instance) string {
+	if inst == nil {
+		return ""
+	}
+	return transitionContentSignal(inst)
+}
+
+// transitionContentSignal returns a dedup signal derived from the child's
+// transcript size. A Claude-compatible JSONL transcript is append-only and
+// grows ONLY when a real message is written (user prompt, assistant turn, tool
+// call) — it is completely untouched when the pane merely redraws its animated
+// chrome. So the signal stays identical across idle polls and strictly changes
+// on a genuine new turn. Returns "" when no transcript is resolvable (e.g.
+// non-Claude tools), which routes the caller to the legacy 90s window.
+func transitionContentSignal(inst *Instance) string {
+	path := inst.GetJSONLPath()
+	if path == "" {
+		return ""
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("jsonl:%d", info.Size())
 }
 
 func (n *TransitionNotifier) markNotified(event TransitionNotificationEvent) {
@@ -535,9 +718,10 @@ func (n *TransitionNotifier) markNotified(event TransitionNotificationEvent) {
 		n.state.Records = map[string]transitionNotifyRecord{}
 	}
 	n.state.Records[event.ChildSessionID] = transitionNotifyRecord{
-		From: event.FromStatus,
-		To:   event.ToStatus,
-		At:   event.Timestamp.Unix(),
+		From:       event.FromStatus,
+		To:         event.ToStatus,
+		At:         event.Timestamp.Unix(),
+		OutputHash: event.LastOutputHash,
 	}
 	_ = n.saveStateLocked()
 }
@@ -695,7 +879,13 @@ func (n *TransitionNotifier) enqueueDeferredAtForTest(event TransitionNotificati
 }
 
 func deferredKey(event TransitionNotificationEvent) string {
-	return event.ChildSessionID + "|" + event.FromStatus + "|" + event.ToStatus
+	key := event.ChildSessionID + "|" + event.FromStatus + "|" + event.ToStatus
+	if event.Kind != "" {
+		// Finished events (issue #1186) have no from→to; key on kind + outcome
+		// so distinct completions don't collapse onto one another in the queue.
+		key += "|" + event.Kind + "|" + event.DoneStatus + "|" + event.DoneSummary
+	}
+	return key
 }
 
 // targetAvailabilityResolver reports whether the given target session is

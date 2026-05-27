@@ -35,6 +35,11 @@ func handleLaunch(profile string, args []string) {
 	// from overwriting the agent-deck title.
 	titleLock := fs.Bool("title-lock", false, "Lock session title so Claude's session name never overrides it (#697)")
 	noTitleSync := fs.Bool("no-title-sync", false, "Alias for --title-lock")
+	// #1133: opt-in to inherit the conductor's TELEGRAM_* env vars in the
+	// child. Off by default — a child inheriting TELEGRAM_STATE_DIR /
+	// TELEGRAM_BOT_TOKEN spawns a duplicate `bun telegram` poller that
+	// races the conductor for the bot lock (Telegram 409, dropped messages).
+	inheritTelegramEnv := fs.Bool("inherit-telegram-env", false, "Keep TELEGRAM_* env vars in the child (#1133); off by default to prevent duplicate plugin pollers")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
@@ -90,6 +95,9 @@ func handleLaunch(profile string, args []string) {
 	// `agent-deck add --tmux-socket`: overrides `[tmux].socket_name` for
 	// this one session, captured once and persisted on the Instance.
 	tmuxSocket := fs.String("tmux-socket", "", "tmux -L socket name for this session (overrides [tmux].socket_name)")
+
+	// Issue #1143: auto-stop dormant child sessions.
+	idleTimeout := fs.String("idle-timeout", "", "Auto-stop session after this duration of no tmux output (Go duration: 30m, 1h, 24h). 0 or unset = disabled")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck launch [path] [options]")
@@ -337,6 +345,11 @@ func handleLaunch(profile string, args []string) {
 		newInstance.TitleLocked = true
 	}
 
+	// #1133: explicit opt-in for inheriting the conductor's telegram env.
+	if *inheritTelegramEnv {
+		newInstance.InheritTelegramEnv = true
+	}
+
 	if sessionCommandInput != "" {
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		newInstance.Command = sessionCommandResolved
@@ -394,6 +407,15 @@ func handleLaunch(profile string, args []string) {
 		newInstance.WorktreeRepoRoot = worktreeRepoRoot
 		newInstance.WorktreeBranch = wtBranch
 		newInstance.WorktreeType = worktreeType
+	}
+
+	// Issue #1143: --idle-timeout 30m → 1800s on the Instance, picked up by
+	// the central watcher on its next tick.
+	if idleSecs, err := session.ParseIdleTimeoutFlag(strings.TrimSpace(*idleTimeout)); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	} else {
+		newInstance.IdleTimeoutSecs = idleSecs
 	}
 
 	if *resumeSession != "" {
