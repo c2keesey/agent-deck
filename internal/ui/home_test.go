@@ -342,7 +342,7 @@ func TestHomeUpdateNewDialog(t *testing.T) {
 	home.width = 100
 	home.height = 30
 
-	// Press n to open new dialog
+	// Personal fork: 'n' opens the simple MaiaWorkerPicker, not the full NewDialog.
 	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}}
 	model, _ := home.Update(msg)
 
@@ -350,8 +350,11 @@ func TestHomeUpdateNewDialog(t *testing.T) {
 	if !ok {
 		t.Fatal("Update should return *Home")
 	}
-	if !h.newDialog.IsVisible() {
-		t.Error("New dialog should be visible after pressing n")
+	if !h.maiaWorkerPicker.IsVisible() {
+		t.Error("MAIA worker picker should be visible after pressing n")
+	}
+	if h.newDialog.IsVisible() {
+		t.Error("Full new dialog must NOT open from 'n' on this fork")
 	}
 }
 

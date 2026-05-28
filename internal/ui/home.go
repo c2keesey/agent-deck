@@ -218,6 +218,7 @@ type Home struct {
 	worktreeFinishDialog *WorktreeFinishDialog // For finishing worktree sessions (merge + cleanup)
 	feedbackDialog       *FeedbackDialog       // For in-app feedback popup (Phase 2)
 	zoxidePicker         *ZoxidePicker         // Quick-open picker backed by the zoxide DB
+	maiaWorkerPicker     *MaiaWorkerPicker     // Simple new-session picker scoped to MAIA worktrees (replaces 'n' dialog)
 	feedbackState        *feedback.State       // Loaded at first show, avoids repeated disk I/O
 	feedbackSender       *feedback.Sender      // Sender constructed once in NewHome (Phase 3, per D-05)
 	watcherPanel         *WatcherPanel         // For showing watcher status and events
@@ -959,6 +960,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		worktreeFinishDialog: NewWorktreeFinishDialog(),
 		feedbackDialog:       NewFeedbackDialog(),
 		zoxidePicker:         NewZoxidePicker(),
+		maiaWorkerPicker:     NewMaiaWorkerPicker(),
 		feedbackSender:       feedback.NewSender(),
 		watcherPanel:         NewWatcherPanel(),
 		insertBatchDuration:  defaultInsertBatchDuration,
@@ -5559,6 +5561,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h.handleZoxidePickerKey(msg)
 		}
 
+		if h.maiaWorkerPicker.IsVisible() {
+			return h.handleMaiaWorkerPickerKey(msg)
+		}
+
 		if h.showCostDashboard {
 			keyStr := msg.String()
 			if keyStr == "q" || keyStr == "$" || keyStr == "esc" {
@@ -7047,110 +7053,19 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "n":
-		// If the cursor is on a remote group/session, quick-create on the
-		// remote instead of opening the local new-session dialog (#743).
-		// Pre-v1.7.68 behaviour that d9a5de8 accidentally removed: the local
-		// dialog has no remote awareness, so falling through to it created
-		// the session on localhost even though the user was clearly operating
-		// in the Remotes section.
+		// Personal fork: 'n' opens the simple MAIA worker picker instead
+		// of the full NewDialog. The user always uses Claude in pre-created
+		// MAIA worktrees and wants a 2-key flow: 'n' → pick worktree → Enter.
+		// The full NewDialog is still in the tree but unreachable by 'n'.
+		// Remote sessions keep their dedicated branch (#743).
 		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
 				return h, h.createRemoteSession(item.RemoteName)
 			}
 		}
-
-		// Collect unique project paths sorted by most recently accessed
-		type pathInfo struct {
-			path           string
-			lastAccessedAt time.Time
-		}
-		pathMap := make(map[string]*pathInfo)
-		for _, inst := range h.instances {
-			if inst.ProjectPath == "" {
-				continue
-			}
-			// Prefer the original repo root over worktree paths so suggestions
-			// don't show ephemeral worktree directories.
-			p := inst.ProjectPath
-			if inst.WorktreeRepoRoot != "" {
-				p = inst.WorktreeRepoRoot
-			}
-			existing, ok := pathMap[p]
-			if !ok {
-				// First time seeing this path.
-				accessTime := inst.LastAccessedAt
-				if accessTime.IsZero() {
-					accessTime = inst.CreatedAt // Fall back to creation time.
-				}
-				pathMap[p] = &pathInfo{
-					path:           p,
-					lastAccessedAt: accessTime,
-				}
-			} else {
-				// Update if this instance was accessed more recently.
-				accessTime := inst.LastAccessedAt
-				if accessTime.IsZero() {
-					accessTime = inst.CreatedAt
-				}
-				if accessTime.After(existing.lastAccessedAt) {
-					existing.lastAccessedAt = accessTime
-				}
-			}
-		}
-
-		// Convert to slice and sort by most recent first
-		pathInfos := make([]*pathInfo, 0, len(pathMap))
-		for _, info := range pathMap {
-			pathInfos = append(pathInfos, info)
-		}
-		sort.Slice(pathInfos, func(i, j int) bool {
-			return pathInfos[i].lastAccessedAt.After(pathInfos[j].lastAccessedAt)
-		})
-
-		// Extract sorted paths
-		paths := make([]string, len(pathInfos))
-		for i, info := range pathInfos {
-			paths[i] = info.path
-		}
-		h.newDialog.SetPathSuggestions(paths)
-
-		// Load recent sessions for the picker
-		if recents, err := h.storage.LoadRecentSessions(); err == nil {
-			h.newDialog.SetRecentSessions(recents)
-		}
-
-		// Apply user's preferred default tool from config
-		h.newDialog.SetDefaultTool(session.GetDefaultTool())
-
-		// Auto-select parent group from current cursor position
-		groupPath := session.DefaultGroupPath
-		groupName := session.DefaultGroupName
-		if h.groupScope != "" {
-			// Scoped mode: default to scope root
-			groupPath = h.groupScope
-			if group, exists := h.groupTree.Groups[h.groupScope]; exists {
-				groupName = group.Name
-			}
-		}
-		if h.cursor < len(h.flatItems) {
-			item := h.flatItems[h.cursor]
-			switch item.Type {
-			case session.ItemTypeGroup:
-				groupPath = item.Group.Path
-				groupName = item.Group.Name
-			case session.ItemTypeSession:
-				// Use the session's group
-				groupPath = item.Path
-				if group, exists := h.groupTree.Groups[groupPath]; exists {
-					groupName = group.Name
-				}
-			}
-		}
-		defaultPath := h.getDefaultPathForGroup(groupPath)
-		conductors := h.activeConductorSessions()
-		suggestedParentID := h.suggestConductorParent()
-		h.newDialog.ShowInGroup(groupPath, groupName, defaultPath, conductors, suggestedParentID)
+		h.maiaWorkerPicker.SetSize(h.width, h.height)
+		h.maiaWorkerPicker.Show()
 		return h, nil
 
 	case "a":
@@ -9197,6 +9112,64 @@ func (h *Home) handleZoxidePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// handleMaiaWorkerPickerKey routes keys for the simple new-session picker
+// that replaces the 'n' dialog. Enter creates the session, Esc cancels;
+// everything else (incl. arrow keys) goes through the picker's Update so
+// the cursor moves and the textinput accepts typing.
+func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		h.maiaWorkerPicker.Hide()
+		return h, nil
+	case "enter":
+		selected := h.maiaWorkerPicker.SelectedPath()
+		custom := h.maiaWorkerPicker.IsCustomPath()
+		h.maiaWorkerPicker.Hide()
+		if selected == "" {
+			return h, nil
+		}
+		if custom {
+			// Custom path: derive group from path via the standard quickCreate flow.
+			return h, h.quickCreateSessionAt(selected)
+		}
+		// MAIA worktree pick: pin to maia/active per the user's defaults.
+		return h, h.createMaiaWorkerSession(selected)
+	default:
+		h.maiaWorkerPicker, _ = h.maiaWorkerPicker.Update(msg)
+		return h, nil
+	}
+}
+
+// createMaiaWorkerSession creates a Claude session rooted at the given MAIA
+// worktree path with group=maia/active and an auto-generated name. Wraps
+// createSessionInGroupWithWorktreeAndOptions with the user's preferred
+// defaults for the simple new-session flow.
+func (h *Home) createMaiaWorkerSession(projectPath string) tea.Cmd {
+	tool := session.GetDefaultTool()
+	if tool == "" {
+		tool = "claude"
+	}
+	command := tool
+
+	preferred := deriveSessionNameFromPath(projectPath)
+	h.instancesMu.RLock()
+	name := ensureUniqueSessionTitle(preferred, h.instances)
+	h.instancesMu.RUnlock()
+
+	return h.createSessionInGroupWithWorktreeAndOptions(
+		name, projectPath, command,
+		"maia/active", // pinned group per user's workflow
+		"", "", "", // no worktree (path is already a pre-created worktree)
+		false, false, nil,
+		nil, // no extra claude args
+		"",  // no claude startup query
+		"",  // no explicit model override
+		false, nil,
+		"", "",
+		"",
+	)
+}
+
 // quickCreateSessionAt creates a session rooted at the given path with an
 // auto-generated name and the user's configured default tool, bypassing
 // cursor-context tool inheritance so the zoxide flow always lands on the
@@ -10353,6 +10326,9 @@ func (h *Home) View() string {
 	}
 	if h.zoxidePicker.IsVisible() {
 		return h.zoxidePicker.View()
+	}
+	if h.maiaWorkerPicker.IsVisible() {
+		return h.maiaWorkerPicker.View()
 	}
 	if h.showCostDashboard {
 		return h.costDashboard.View()
