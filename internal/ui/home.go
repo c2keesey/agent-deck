@@ -12520,20 +12520,30 @@ func (h *Home) renderSessionItem(
 	)
 	row += sshBadge
 
-	// Trailing broadcast slot: shows the tmux pane title (what the agent
-	// is doing right now via OSC escapes) on every row, not just the
-	// selected one. Dim so it doesn't compete with the bold stored title
-	// on the left. cellWidth (not lipgloss.Width) for the budget guard —
-	// pane titles often contain keycap/emoji glyphs that uniseg under-
-	// reports vs how terminals actually render them (#937 v2).
-	if instState.paneTitle != "" {
+	// Trailing broadcast slot — always rendered. When the tmux pane title
+	// is empty (non-Claude tools, idle prompt, just-launched sessions),
+	// fall back to the session's status as a word ("idle", "running",
+	// "stopped", etc.) so the slot is never blank. Status repeats info
+	// from the status icon at row start, but having a verbal anchor on
+	// every row makes the column read as a real signal rather than a
+	// flicker that only shows up when Claude happens to be working.
+	//
+	// Width guard relaxed to 4 cells so short placeholders fit even on
+	// rows packed with long branches + worktrees + other badges.
+	// cellWidth (not lipgloss.Width) for the budget — pane titles often
+	// contain keycap/emoji glyphs that uniseg under-reports vs how
+	// terminals actually render them (#937 v2).
+	trailingText := instState.paneTitle
+	if trailingText == "" {
+		trailingText = string(instState.status)
+	}
+	if trailingText != "" {
 		remaining := h.width - cellWidth(row) - 2
-		if remaining > 10 {
-			pt := instState.paneTitle
-			if cellWidth(pt) > remaining {
-				pt = cellTruncate(pt, remaining, "…")
+		if remaining > 4 {
+			if cellWidth(trailingText) > remaining {
+				trailingText = cellTruncate(trailingText, remaining, "…")
 			}
-			row += DimStyle.Render(" · " + pt)
+			row += DimStyle.Render(" · " + trailingText)
 		}
 	}
 
