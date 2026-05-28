@@ -38,7 +38,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.39" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.43" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -337,6 +337,9 @@ func main() {
 			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
+			return
+		case "run-task":
+			handleRunTask(args[1:])
 			return
 		case "inbox":
 			handleInbox(args[1:])
@@ -3031,9 +3034,9 @@ func printHelp() {
 	fmt.Println("  agent-deck skill attach my-app react  # Attach skill to project")
 	fmt.Println("  agent-deck group move my-app work     # Move session to group")
 	fmt.Println("  agent-deck web                        # TUI + web server on 127.0.0.1:8420")
-	fmt.Println("  agent-deck web --listen :9000         # TUI + web on custom port")
+	fmt.Println("  agent-deck web --listen 127.0.0.1:9000  # TUI + web on a custom loopback port")
 	fmt.Println("  agent-deck web --read-only            # TUI + web in read-only mode")
-	fmt.Println("  agent-deck web --token secret         # TUI + web with auth token")
+	fmt.Println("  agent-deck web --token secret         # auth token (REQUIRED to bind a non-loopback address)")
 	fmt.Println("  agent-deck web --help                 # Show web command flags")
 	fmt.Println()
 	fmt.Println("Environment Variables:")

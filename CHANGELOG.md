@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.43] - 2026-05-28
+
+### Added
+
+- **Opt-in kernel-exact task-worker completion** ([#1215](https://github.com/asheshgoplani/agent-deck/issues/1215)). A one-shot task worker's exit is caught exactly-once and wakes the launching session reliably, replacing poll-inference for that path. Interactive sessions are unchanged.
+
+### Fixed
+
+- **notify-daemon can no longer run stale code** ([#1215](https://github.com/asheshgoplani/agent-deck/issues/1215)). A `RuntimeMaxSec` recycle plus a version self-check stop the daemon from silently running old code — the cause of notification fixes not taking effect.
+
+## [1.9.42] - 2026-05-28
+
+### Fixed
+
+- **Attached-skills API now emits camelCase JSON** so the web UI can read attached-skill fields ([#1211](https://github.com/asheshgoplani/agent-deck/issues/1211)). `ProjectSkillAttachment` previously lacked `json:` tags, so the API emitted PascalCase while the frontend reads camelCase, and attached skills wouldn't display.
+
+### Internal
+
+- Web parity guards re-baselined and the skills-service wired into the test fixture.
+
+## [1.9.41] - 2026-05-27
+
+### Security
+
+- **Web: unauthenticated non-loopback bind is now refused** ([#1209](https://github.com/asheshgoplani/agent-deck/issues/1209)). Binding a non-loopback address now requires a token (closes the unauthenticated-RCE gap); use `--insecure-bind` to override explicitly. The terminal bridge is token-gated and query-string tokens are rejected.
+- **Remote: `remote update` verifies the release asset's SHA-256 before deploying** ([#1207](https://github.com/asheshgoplani/agent-deck/issues/1207)). Adds a safe SSH host-key stance with no insecure host-key bypass.
+- **install.sh verifies the downloaded binary's SHA-256 before install** ([#1210](https://github.com/asheshgoplani/agent-deck/issues/1210)). Adds a skill-migration `RemoveAll` path-containment guard, passes the webhook secret via env instead of a CLI flag, and shell-quotes spawn args (no injection via session/dir names).
+
+## [1.9.40] - 2026-05-27
+
+### Added
+
+- **Opt-in `[shell] exit_to_shell` — exit your agent, drop to a shell, then resume the same session** ([#1161](https://github.com/asheshgoplani/agent-deck/issues/1161), thanks @Djeeteg007). When enabled, exiting your agent (e.g. `/exit`) drops you to an interactive shell at the same cwd so you can run `aws-vault`/`direnv`/etc., then resume the same session with full context preserved (default off).
+
 ## [1.9.39] - 2026-05-27
 
 ### Fixed
