@@ -151,7 +151,12 @@ func renderBranchPrefix(branch string, selected bool) string {
 	if cellWidth(display) > maxBranchDisplayCells {
 		display = cellTruncate(display, maxBranchDisplayCells, "…")
 	}
-	style := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+	// ColorPurple: distinct from the folder-blue ColorAccent (which the
+	// user found too close to the folder icon hue), distinct from the
+	// status palette (green/yellow/red), and distinct from the orange
+	// Claude tool badge. Tokyo Night purple is #7847bd (light) / #bb9af7
+	// (dark) — bold makes it the row's strongest visual anchor.
+	style := lipgloss.NewStyle().Foreground(ColorPurple).Bold(true)
 	if selected {
 		style = SessionStatusSelStyle.Bold(true)
 	}
