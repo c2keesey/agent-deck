@@ -12412,7 +12412,29 @@ func (h *Home) renderSessionItem(
 		}
 	}
 
-	title := titleStyle.Render(inst.Title)
+	// Personal-fork title swap: when Claude (or any tool) is broadcasting
+	// a live pane title via tmux OSC, promote that to the row's primary
+	// text — that's the actionable "what's happening now" signal. The
+	// stored Instance.Title (adj-noun like "spring-ivy") becomes a dim
+	// trailing badge: still present as the stable identifier, just not
+	// hogging the primary slot. When no pane title is set (non-claude
+	// tools, sessions still starting, claude sitting at an idle prompt),
+	// fall back to the stored title — no behavior change for those rows.
+	mainText := inst.Title
+	storedTitleTrailing := ""
+	if instState.paneTitle != "" {
+		mainText = instState.paneTitle
+		storedTitleTrailing = inst.Title
+		// Cap very long pane titles so the row stays scannable. 60 cells
+		// is enough for "Implementing the foo bar baz feature in module"
+		// and forces longer descriptions to truncate rather than push
+		// trailing badges past the panel edge.
+		const maxMainCells = 60
+		if cellWidth(mainText) > maxMainCells {
+			mainText = cellTruncate(mainText, maxMainCells, "…")
+		}
+	}
+	title := titleStyle.Render(mainText)
 	tool := toolStyle.Render(" " + instTool)
 
 	// YOLO badge for Gemini/Codex sessions with YOLO mode enabled
@@ -12507,22 +12529,21 @@ func (h *Home) renderSessionItem(
 		sshBadge,
 	)
 
-	// Append pane title filling remaining row space (only for the selected item).
-	// #937 v2: cellWidth/cellTruncate (not lipgloss.Width / ansi.Truncate)
-	// for both the row budget and the pane-title fit check. pane titles
-	// often surface tmux pane content which can contain keycap glyphs
-	// (#️⃣ 0️⃣–9️⃣ *️⃣) — uniseg reports those at 1 cell, terminals render 2,
-	// so the prior measurement let the trailing pane-title text overflow
-	// the panel and shove subsequent rows down by one cell. See
-	// internal/ui/cellwidth.go for the upstream disagreement.
-	if selected && instState.paneTitle != "" {
-		remaining := h.width - cellWidth(row) - 2 // -2 for trailing margin
+	// Append the stored title (dim) when we swapped the primary slot to
+	// the live pane title. This keeps the stable identifier visible on
+	// every row, not just the selected one — the eye can still find
+	// "spring-ivy" while the live activity churns on the left. Width
+	// budget guard mirrors the upstream pane-title trailer: cellWidth
+	// (not lipgloss.Width) so keycap/emoji glyphs are measured per the
+	// terminal's rendering rather than uniseg's underestimate (#937 v2).
+	if storedTitleTrailing != "" {
+		remaining := h.width - cellWidth(row) - 2
 		if remaining > 10 {
-			pt := instState.paneTitle
-			if cellWidth(pt) > remaining {
-				pt = cellTruncate(pt, remaining, "…")
+			st := storedTitleTrailing
+			if cellWidth(st) > remaining {
+				st = cellTruncate(st, remaining, "…")
 			}
-			row += DimStyle.Render(" " + pt)
+			row += DimStyle.Render(" · " + st)
 		}
 	}
 
