@@ -44,7 +44,7 @@ func worktreeKey(inst *session.Instance) string {
 		return ""
 	}
 	if inst.WorktreeBranch != "" {
-		return inst.WorktreeBranch
+		return strings.TrimPrefix(inst.WorktreeBranch, "MAIA.")
 	}
 	if inst.ProjectPath == "" {
 		return ""
@@ -53,7 +53,9 @@ func worktreeKey(inst *session.Instance) string {
 	if base == "" || base == "." || base == "/" {
 		return ""
 	}
-	return base
+	// Normalize the MAIA. prefix out of the key so both the badge text
+	// and the color bucket are stable on the bare worker identifier.
+	return strings.TrimPrefix(base, "MAIA.")
 }
 
 // worktreeColor maps a key to a stable color from worktreePalette via
