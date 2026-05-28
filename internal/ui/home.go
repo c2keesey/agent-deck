@@ -12433,19 +12433,13 @@ func (h *Home) renderSessionItem(
 		yoloBadge = yoloStyle.Render(" [YOLO]")
 	}
 
-	// Worktree branch badge for sessions running in git worktrees.
-	worktreeBadge := ""
-	if inst.IsWorktree() && inst.WorktreeBranch != "" {
-		branch := inst.WorktreeBranch
-		if len(branch) > 15 {
-			branch = branch[:12] + "..."
-		}
-		wtStyle := lipgloss.NewStyle().Foreground(ColorCyan)
-		if selected {
-			wtStyle = SessionStatusSelStyle
-		}
-		worktreeBadge = wtStyle.Render(" [" + branch + "]")
-	}
+	// Worktree badge: shown for every session whose project path or
+	// worktree branch identifies a worktree. Color-coded via worktreeColor
+	// so sessions sharing a worktree share a hue at a glance. Personal-fork
+	// expansion of the upstream branch-only badge — covers pre-created
+	// worktrees like MAIA.worker-N where WorktreeBranch is empty but the
+	// ProjectPath basename is the meaningful identifier.
+	worktreeBadge := renderWorktreeBadge(inst, selected)
 
 	// Sandbox badge for containerized sessions.
 	sandboxBadge := ""
