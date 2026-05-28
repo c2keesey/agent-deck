@@ -12419,10 +12419,16 @@ func (h *Home) renderSessionItem(
 	}
 
 	title := titleStyle.Render(inst.Title)
-	tool := toolStyle.Render(" " + instTool)
-	// Branch prefix: dim, short, shown before the title when this
-	// session's worktree has a resolvable git HEAD. Lets the eye jump
-	// from row to row by branch name without opening each session.
+	// Personal fork: hide the tool word when it's "claude" — the user's
+	// default, repeated on nearly every row. Other tools (shell, gemini,
+	// codex, custom commands) still surface so the row isn't ambiguous.
+	tool := ""
+	if instTool != "claude" {
+		tool = toolStyle.Render(" " + instTool)
+	}
+	// Branch prefix: bold + accent color, shown before the title when
+	// this session's worktree has a resolvable git HEAD. The user's main
+	// row identifier — what the eye anchors on first when scanning.
 	branchPrefix := renderBranchPrefix(instState.branch, selected)
 
 	// YOLO badge for Gemini/Codex sessions with YOLO mode enabled

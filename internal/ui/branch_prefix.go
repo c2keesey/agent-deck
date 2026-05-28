@@ -103,27 +103,57 @@ func readGitBranch(repoDir string) string {
 	return ""
 }
 
-// maxBranchDisplayCells caps the branch prefix at a reasonable width.
-// Long ticket-prefixed branches (e.g. "ck/MAIA-1863-register-layer-sql-
-// deterministic") would otherwise push the worktree badge off the row;
-// truncating to ~24 cells keeps the ticket identifier visible.
-const maxBranchDisplayCells = 24
+// maxBranchDisplayCells caps the branch prefix at a reasonable width
+// AFTER convention prefixes are stripped. Long ticket-suffixed names
+// (e.g. "1863-register-layer-sql-deterministic") still get truncated
+// but the meaningful prefix (the ticket #) stays visible.
+const maxBranchDisplayCells = 26
 
-// renderBranchPrefix renders the dim branch tag that sits before the
-// session title. Empty string when there's no branch to show (.git not
-// found, detached HEAD with no SHA, etc.) — the row format string drops
-// it naturally.
+// branchPrefixesToStrip removes the repetitive convention noise from
+// branch display. Ordered longest-first so "ck/MAIA-" matches before the
+// bare "ck/" fallback. Personal-fork list:
+//
+//   - "ck/MAIA-" / "zh/MAIA-": user's & teammate's MAIA-ticket branches
+//   - "ck/" / "zh/": personal prefix for ad-hoc work
+//   - "chore/" / "feat/" / "fix/" / "docs/" / "refactor/": conventional-
+//     commits style branch prefixes used in shared repos
+//
+// Other devs forking this would update this list to their own convention.
+var branchPrefixesToStrip = []string{
+	"ck/MAIA-", "zh/MAIA-",
+	"ck/", "zh/",
+	"chore/", "feat/", "fix/", "docs/", "refactor/", "perf/",
+}
+
+// cleanBranchDisplay strips the user's branch-naming convention prefixes
+// so the meaningful suffix is what reads. "ck/MAIA-1863-register-layer"
+// becomes "1863-register-layer" — the ticket number is the actual ID
+// the user cares about scanning for.
+func cleanBranchDisplay(branch string) string {
+	for _, p := range branchPrefixesToStrip {
+		if strings.HasPrefix(branch, p) {
+			return strings.TrimPrefix(branch, p)
+		}
+	}
+	return branch
+}
+
+// renderBranchPrefix renders the branch tag that sits before the session
+// title. Bold + accent-colored so it reads as the primary row identifier
+// (the user explicitly wants branch as the main indicator, not grey).
+// Empty string when there's no branch to show — the row format string
+// drops it naturally.
 func renderBranchPrefix(branch string, selected bool) string {
 	if branch == "" {
 		return ""
 	}
-	display := branch
+	display := cleanBranchDisplay(branch)
 	if cellWidth(display) > maxBranchDisplayCells {
 		display = cellTruncate(display, maxBranchDisplayCells, "…")
 	}
-	style := lipgloss.NewStyle().Foreground(ColorTextDim)
+	style := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
 	if selected {
-		style = SessionStatusSelStyle
+		style = SessionStatusSelStyle.Bold(true)
 	}
 	return " " + style.Render(display)
 }
