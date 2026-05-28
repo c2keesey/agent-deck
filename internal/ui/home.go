@@ -2980,6 +2980,7 @@ type sessionRenderState struct {
 	status    session.Status
 	tool      string
 	paneTitle string // Current task description from tmux pane title (stripped of spinner/done markers)
+	branch    string // Current git branch of the session's ProjectPath (empty if not a repo / detached)
 }
 
 // cleanPaneTitle strips spinner/done marker characters from a tmux pane title
@@ -3050,6 +3051,11 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 				}
 			}
 		}
+		// Branch lookup is cached per-path with a short TTL — refreshing
+		// every snapshot tick (a few seconds) is enough since branches
+		// change rarely. Reads .git/HEAD directly to avoid spawning a
+		// git subprocess per session.
+		state.branch = cachedGitBranch(inst.EffectiveWorkingDir())
 		snap[inst.ID] = state
 	}
 	h.sessionRenderSnapshot.Store(snap)
@@ -12412,30 +12418,12 @@ func (h *Home) renderSessionItem(
 		}
 	}
 
-	// Personal-fork title swap: when Claude (or any tool) is broadcasting
-	// a live pane title via tmux OSC, promote that to the row's primary
-	// text — that's the actionable "what's happening now" signal. The
-	// stored Instance.Title (adj-noun like "spring-ivy") becomes a dim
-	// trailing badge: still present as the stable identifier, just not
-	// hogging the primary slot. When no pane title is set (non-claude
-	// tools, sessions still starting, claude sitting at an idle prompt),
-	// fall back to the stored title — no behavior change for those rows.
-	mainText := inst.Title
-	storedTitleTrailing := ""
-	if instState.paneTitle != "" {
-		mainText = instState.paneTitle
-		storedTitleTrailing = inst.Title
-		// Cap very long pane titles so the row stays scannable. 60 cells
-		// is enough for "Implementing the foo bar baz feature in module"
-		// and forces longer descriptions to truncate rather than push
-		// trailing badges past the panel edge.
-		const maxMainCells = 60
-		if cellWidth(mainText) > maxMainCells {
-			mainText = cellTruncate(mainText, maxMainCells, "…")
-		}
-	}
-	title := titleStyle.Render(mainText)
+	title := titleStyle.Render(inst.Title)
 	tool := toolStyle.Render(" " + instTool)
+	// Branch prefix: dim, short, shown before the title when this
+	// session's worktree has a resolvable git HEAD. Lets the eye jump
+	// from row to row by branch name without opening each session.
+	branchPrefix := renderBranchPrefix(instState.branch, selected)
 
 	// YOLO badge for Gemini/Codex sessions with YOLO mode enabled
 	yoloBadge := ""
@@ -12512,38 +12500,40 @@ func (h *Home) renderSessionItem(
 		windowChevron = chevronStyle.Render(chevronChar)
 	}
 
-	// Build row: [baseIndent][selection][tree][chevron][status] [title] [tool] [badges]
+	// Build row: [baseIndent][selection][tree][chevron][status] [branch] [title] [tool] [worktree] [other badges]
+	// Personal-fork ordering per user's spec: branch → title → worktree → broadcast trailer.
+	// Tool stays adjacent to title as a small qualifier; other badges keep their relative order.
 	row := fmt.Sprintf(
-		"%s%s%s%s%s %s%s%s%s%s%s%s",
+		"%s%s%s%s%s%s %s%s%s%s%s%s",
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
 		windowChevron,
 		status,
+		branchPrefix,
 		title,
 		tool,
 		yoloBadge,
 		worktreeBadge,
 		sandboxBadge,
 		multiRepoBadge,
-		sshBadge,
 	)
+	row += sshBadge
 
-	// Append the stored title (dim) when we swapped the primary slot to
-	// the live pane title. This keeps the stable identifier visible on
-	// every row, not just the selected one — the eye can still find
-	// "spring-ivy" while the live activity churns on the left. Width
-	// budget guard mirrors the upstream pane-title trailer: cellWidth
-	// (not lipgloss.Width) so keycap/emoji glyphs are measured per the
-	// terminal's rendering rather than uniseg's underestimate (#937 v2).
-	if storedTitleTrailing != "" {
+	// Trailing broadcast slot: shows the tmux pane title (what the agent
+	// is doing right now via OSC escapes) on every row, not just the
+	// selected one. Dim so it doesn't compete with the bold stored title
+	// on the left. cellWidth (not lipgloss.Width) for the budget guard —
+	// pane titles often contain keycap/emoji glyphs that uniseg under-
+	// reports vs how terminals actually render them (#937 v2).
+	if instState.paneTitle != "" {
 		remaining := h.width - cellWidth(row) - 2
 		if remaining > 10 {
-			st := storedTitleTrailing
-			if cellWidth(st) > remaining {
-				st = cellTruncate(st, remaining, "…")
+			pt := instState.paneTitle
+			if cellWidth(pt) > remaining {
+				pt = cellTruncate(pt, remaining, "…")
 			}
-			row += DimStyle.Render(" · " + st)
+			row += DimStyle.Render(" · " + pt)
 		}
 	}
 
