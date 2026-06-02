@@ -6,8 +6,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 // branchCache memoizes git HEAD lookups per repo dir. Branches change
@@ -103,12 +101,6 @@ func readGitBranch(repoDir string) string {
 	return ""
 }
 
-// maxBranchDisplayCells caps the branch prefix at a reasonable width
-// AFTER convention prefixes are stripped. Long ticket-suffixed names
-// (e.g. "1863-register-layer-sql-deterministic") still get truncated
-// but the meaningful prefix (the ticket #) stays visible.
-const maxBranchDisplayCells = 26
-
 // branchPrefixesToStrip removes the repetitive convention noise from
 // branch display. Ordered longest-first so "ck/MAIA-" matches before the
 // bare "ck/" fallback. Personal-fork list:
@@ -138,27 +130,13 @@ func cleanBranchDisplay(branch string) string {
 	return branch
 }
 
-// renderBranchPrefix renders the branch tag that sits before the session
-// title. Bold + accent-colored so it reads as the primary row identifier
-// (the user explicitly wants branch as the main indicator, not grey).
-// Empty string when there's no branch to show — the row format string
-// drops it naturally.
-func renderBranchPrefix(branch string, selected bool) string {
-	if branch == "" {
-		return ""
+// padToCells right-pads a pre-styled string with plain (unstyled) spaces
+// so its visible width reaches colCells. Plain spaces avoid carrying the
+// field's foreground/background into the gap between columns. No-op when
+// the content already meets or exceeds the target.
+func padToCells(s string, visible, colCells int) string {
+	if pad := colCells - visible; pad > 0 {
+		return s + strings.Repeat(" ", pad)
 	}
-	display := cleanBranchDisplay(branch)
-	if cellWidth(display) > maxBranchDisplayCells {
-		display = cellTruncate(display, maxBranchDisplayCells, "…")
-	}
-	// ColorPurple: distinct from the folder-blue ColorAccent (which the
-	// user found too close to the folder icon hue), distinct from the
-	// status palette (green/yellow/red), and distinct from the orange
-	// Claude tool badge. Tokyo Night purple is #7847bd (light) / #bb9af7
-	// (dark) — bold makes it the row's strongest visual anchor.
-	style := lipgloss.NewStyle().Foreground(ColorPurple).Bold(true)
-	if selected {
-		style = SessionStatusSelStyle.Bold(true)
-	}
-	return " " + style.Render(display)
+	return s
 }

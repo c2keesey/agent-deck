@@ -245,15 +245,17 @@ type Home struct {
 	analyticsCacheTime     map[string]time.Time                       // TTL cache: sessionID -> cache timestamp
 
 	// State
-	cursor              int            // Selected item index in flatItems
-	viewOffset          int            // First visible item index (for scrolling)
-	previewScrollOffset int            // Lines scrolled up from tail in the preview pane (#574). 0 = tail (default). Reset on cursor move.
-	isAttaching         atomic.Bool    // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
-	statusFilter        session.Status // Filter sessions by status ("" = all, or specific status)
-	groupScope          string         // Limit TUI to a specific group path ("" = all groups)
-	initialSelect       string         // Session ID or title to preselect on first load (#709). Does NOT scope groups.
-	initialSelectDone   bool           // Guard so preselection only fires once
-	previewMode         PreviewMode    // What to show in preview pane (both, output-only, analytics-only)
+	cursor              int                     // Selected item index in flatItems
+	viewOffset          int                     // First visible item index (for scrolling)
+	primaryColCells     int                     // Per-render width of the primary-label column (aligns the worktree chip into a table)
+	primaryLabels       map[string]primaryLabel // Per-render chosen identity label per session ID (dynamic precedence)
+	previewScrollOffset int                     // Lines scrolled up from tail in the preview pane (#574). 0 = tail (default). Reset on cursor move.
+	isAttaching         atomic.Bool             // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
+	statusFilter        session.Status          // Filter sessions by status ("" = all, or specific status)
+	groupScope          string                  // Limit TUI to a specific group path ("" = all groups)
+	initialSelect       string                  // Session ID or title to preselect on first load (#709). Does NOT scope groups.
+	initialSelectDone   bool                    // Guard so preselection only fires once
+	previewMode         PreviewMode             // What to show in preview pane (both, output-only, analytics-only)
 	err                 error
 	errTime             time.Time  // When error occurred (for auto-dismiss)
 	isReloading         bool       // Visual feedback during auto-reload
@@ -452,10 +454,10 @@ type Home struct {
 	lastNotifSwitchMu sync.Mutex
 
 	// MRU session cycling (alt-tab style)
-	mruCycleIndex    int                  // Current position in the MRU list
-	mruCycleSnapshot []*session.Instance  // Frozen MRU list during a switch chain
-	mruCycleOrigin   string               // Session ID where the chain started
-	mruCycleLastSwitch time.Time          // When the last Ctrl+W was pressed
+	mruCycleIndex      int                 // Current position in the MRU list
+	mruCycleSnapshot   []*session.Instance // Frozen MRU list during a switch chain
+	mruCycleOrigin     string              // Session ID where the chain started
+	mruCycleLastSwitch time.Time           // When the last Ctrl+W was pressed
 
 	// Undo delete stack (Chrome-style: Ctrl+Z restores in reverse order)
 	undoStack []deletedSessionEntry
@@ -6815,7 +6817,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-
 	case "m":
 		// MCP Manager - for Claude and Gemini sessions
 		if h.cursor < len(h.flatItems) {
@@ -9165,7 +9166,7 @@ func (h *Home) createMaiaWorkerSession(projectPath string) tea.Cmd {
 	return h.createSessionInGroupWithWorktreeAndOptions(
 		name, projectPath, command,
 		"maia/active", // pinned group per user's workflow
-		"", "", "", // no worktree (path is already a pre-created worktree)
+		"", "", "",    // no worktree (path is already a pre-created worktree)
 		false, false, nil,
 		nil, // no extra claude args
 		"",  // no claude startup query
@@ -11997,6 +11998,7 @@ func (h *Home) renderSessionList(width, height int) string {
 
 	snapshot := h.getSessionRenderSnapshot()
 	groupStats := h.buildGroupRenderStats(snapshot)
+	h.computeSessionLabels(snapshot)
 	var jumpHints []string
 	if h.jumpMode {
 		jumpHints = generateJumpHints(len(h.flatItems))
@@ -12095,6 +12097,48 @@ func (h *Home) buildGroupRenderStats(snapshot map[string]sessionRenderState) map
 	}
 
 	return stats
+}
+
+// maxPrimaryColCells caps the primary-label column so one long label (a
+// verbose Claude broadcast, say) can't shove the worktree chip off the
+// right edge. Branches/folders/names sit well under this; anything longer
+// truncates into the column rather than blowing out the table.
+const maxPrimaryColCells = 28
+
+// computeSessionLabels runs the dynamic-precedence identity pass once per
+// render: pass one tallies how many visible sessions share each branch (so
+// a branch shared across ro-dev sessions is recognized as non-
+// distinguishing), pass two picks each session's primary label and
+// measures the column. Derived from ALL session items in flatItems (not
+// just the visible window) so the column doesn't jump as the user scrolls.
+func (h *Home) computeSessionLabels(snapshot map[string]sessionRenderState) {
+	branchCount := map[string]int{}
+	for _, item := range h.flatItems {
+		if item.Type != session.ItemTypeSession || item.Session == nil || item.CreatingID != "" {
+			continue
+		}
+		if st, ok := snapshot[item.Session.ID]; ok && st.branch != "" {
+			branchCount[st.branch]++
+		}
+	}
+
+	labels := make(map[string]primaryLabel)
+	colW := 0
+	for _, item := range h.flatItems {
+		if item.Type != session.ItemTypeSession || item.Session == nil || item.CreatingID != "" {
+			continue
+		}
+		lbl := primaryLabelFor(item.Session, snapshot[item.Session.ID], branchCount)
+		labels[item.Session.ID] = lbl
+		if w := cellWidth(lbl.text); w > colW {
+			colW = w
+		}
+	}
+	if colW > maxPrimaryColCells {
+		colW = maxPrimaryColCells
+	}
+	h.primaryLabels = labels
+	h.primaryColCells = colW
 }
 
 // renderItem renders a single item (group or session) for the left panel
@@ -12418,7 +12462,35 @@ func (h *Home) renderSessionItem(
 		}
 	}
 
-	title := titleStyle.Render(inst.Title)
+	// Primary label: the single identity anchor for the row, chosen by
+	// dynamic precedence in computeSessionLabels (custom name > distinguishing
+	// branch > folder/worktree > Claude broadcast > auto name). Styled by the
+	// winning kind — branch is purple, a folder takes its own worktree color,
+	// broadcast/auto fade to dim, a real name uses the status title style.
+	// Padded to the measured column so the worktree chip lines up table-style.
+	lbl := h.primaryLabels[inst.ID]
+	if lbl.kind == primaryNone {
+		lbl = primaryLabelFor(inst, instState, nil)
+	}
+	primaryText := lbl.text
+	if h.primaryColCells > 0 && cellWidth(primaryText) > h.primaryColCells {
+		primaryText = cellTruncate(primaryText, h.primaryColCells, "…")
+	}
+	var primaryStyle lipgloss.Style
+	switch {
+	case selected:
+		primaryStyle = SessionTitleSelStyle
+	case lbl.kind == primaryBranch:
+		primaryStyle = lipgloss.NewStyle().Foreground(ColorPurple).Bold(true)
+	case lbl.kind == primaryFolder:
+		primaryStyle = lipgloss.NewStyle().Foreground(worktreeColor(lbl.text)).Bold(true)
+	case lbl.kind == primaryBroadcast, lbl.kind == primaryAuto:
+		primaryStyle = lipgloss.NewStyle().Foreground(ColorTextDim)
+	default: // primaryName — reuse the status-based title styling + per-session tint
+		primaryStyle = titleStyle
+	}
+	primary := " " + padToCells(primaryStyle.Render(primaryText), cellWidth(primaryText), h.primaryColCells)
+
 	// Personal fork: hide the tool word when it's "claude" — the user's
 	// default, repeated on nearly every row. Other tools (shell, gemini,
 	// codex, custom commands) still surface so the row isn't ambiguous.
@@ -12426,10 +12498,6 @@ func (h *Home) renderSessionItem(
 	if instTool != "claude" {
 		tool = toolStyle.Render(" " + instTool)
 	}
-	// Branch prefix: bold + accent color, shown before the title when
-	// this session's worktree has a resolvable git HEAD. The user's main
-	// row identifier — what the eye anchors on first when scanning.
-	branchPrefix := renderBranchPrefix(instState.branch, selected)
 
 	// YOLO badge for Gemini/Codex sessions with YOLO mode enabled
 	yoloBadge := ""
@@ -12455,7 +12523,14 @@ func (h *Home) renderSessionItem(
 	// expansion of the upstream branch-only badge — covers pre-created
 	// worktrees like MAIA.worker-N where WorktreeBranch is empty but the
 	// ProjectPath basename is the meaningful identifier.
-	worktreeBadge := renderWorktreeBadge(inst, selected)
+	//
+	// Suppressed when the folder already IS the primary label (e.g. an
+	// unnamed ro-dev session): repeating "ro-dev-2" as both the label and
+	// the chip is pure noise.
+	worktreeBadge := ""
+	if lbl.kind != primaryFolder {
+		worktreeBadge = renderWorktreeBadge(inst, selected)
+	}
 
 	// Sandbox badge for containerized sessions.
 	sandboxBadge := ""
@@ -12506,18 +12581,18 @@ func (h *Home) renderSessionItem(
 		windowChevron = chevronStyle.Render(chevronChar)
 	}
 
-	// Build row: [baseIndent][selection][tree][chevron][status] [branch] [title] [tool] [worktree] [other badges]
-	// Personal-fork ordering per user's spec: branch → title → worktree → broadcast trailer.
-	// Tool stays adjacent to title as a small qualifier; other badges keep their relative order.
+	// Build row: [baseIndent][selection][tree][chevron][status] [primary] [tool] [worktree] [other badges] · [trailer]
+	// Personal-fork layout: one dynamically-chosen identity label, then the
+	// color-coded worktree chip, then the live activity trailer. The primary
+	// label carries its own leading space, so no literal separator here.
 	row := fmt.Sprintf(
-		"%s%s%s%s%s%s %s%s%s%s%s%s",
+		"%s%s%s%s%s%s%s%s%s%s%s",
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
 		windowChevron,
 		status,
-		branchPrefix,
-		title,
+		primary,
 		tool,
 		yoloBadge,
 		worktreeBadge,
