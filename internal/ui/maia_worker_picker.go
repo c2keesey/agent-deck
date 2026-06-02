@@ -27,13 +27,13 @@ const maiaReposDir = "/Users/c2k/MAIA/Repos"
 // creates a session in the typed path with whatever group quickCreateSessionAt
 // derives — the escape hatch for non-MAIA dirs.
 type MaiaWorkerPicker struct {
-	visible    bool
-	pathInput  textinput.Model
-	worktrees  []string
-	cursor     int
-	width      int
-	height     int
-	scanErr    string
+	visible   bool
+	pathInput textinput.Model
+	worktrees []string
+	cursor    int
+	width     int
+	height    int
+	scanErr   string
 }
 
 // NewMaiaWorkerPicker constructs a picker. Worktrees are scanned on each
@@ -62,8 +62,10 @@ func (m *MaiaWorkerPicker) Hide() {
 	m.pathInput.Blur()
 }
 
-// IsVisible reports whether the picker is currently shown.
-func (m *MaiaWorkerPicker) IsVisible() bool { return m.visible }
+// IsVisible reports whether the picker is currently shown. Nil-safe: a Home
+// built without a worker picker (some test seams) treats it as not visible
+// rather than panicking on the key-routing / View overlay checks.
+func (m *MaiaWorkerPicker) IsVisible() bool { return m != nil && m.visible }
 
 // SelectedPath returns the path that Enter should act on:
 //   - if the textinput is non-empty, that typed path (custom dir mode)
@@ -227,4 +229,3 @@ func (m *MaiaWorkerPicker) dialogWidth() int {
 	}
 	return preferred
 }
-
