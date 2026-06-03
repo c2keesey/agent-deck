@@ -6,6 +6,25 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
+// TestCleanBranchDisplay covers convention-prefix stripping plus the bare
+// "MAIA-<number>" Linear ticket prefix.
+func TestCleanBranchDisplay(t *testing.T) {
+	cases := map[string]string{
+		"ck/MAIA-1963-register-layer": "1963-register-layer", // author + ticket prefix
+		"zh/MAIA-1850-foo":            "1850-foo",
+		"MAIA-1963-register-layer":    "1963-register-layer", // bare ticket prefix
+		"feat/MAIA-42-thing":          "42-thing",            // conventional + ticket
+		"MAIA-overhaul":               "MAIA-overhaul",       // non-numeric: untouched
+		"ck/quick-fix":                "quick-fix",
+		"main":                        "main", // no prefix
+	}
+	for in, want := range cases {
+		if got := cleanBranchDisplay(in); got != want {
+			t.Errorf("cleanBranchDisplay(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestPadToCells confirms plain-space padding to the target and the no-op
 // path when content already meets or exceeds it.
 func TestPadToCells(t *testing.T) {

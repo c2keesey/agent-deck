@@ -121,10 +121,29 @@ var branchPrefixesToStrip = []string{
 // so the meaningful suffix is what reads. "ck/MAIA-1863-register-layer"
 // becomes "1863-register-layer" — the ticket number is the actual ID
 // the user cares about scanning for.
+//
+// After the convention prefixes, a bare leading "MAIA-<number>" Linear
+// ticket prefix is also stripped ("MAIA-1963-register-layer" ->
+// "1963-register-layer"), so branches that don't carry a "ck/" author
+// prefix still scan by ticket number.
 func cleanBranchDisplay(branch string) string {
 	for _, p := range branchPrefixesToStrip {
 		if strings.HasPrefix(branch, p) {
-			return strings.TrimPrefix(branch, p)
+			branch = strings.TrimPrefix(branch, p)
+			break
+		}
+	}
+	return stripMaiaTicketPrefix(branch)
+}
+
+// stripMaiaTicketPrefix removes a leading "MAIA-" when it's immediately
+// followed by a digit (a Linear ticket number). "MAIA-1963-foo" ->
+// "1963-foo"; "MAIA-overhaul" (non-numeric) is left untouched.
+func stripMaiaTicketPrefix(branch string) string {
+	const p = "MAIA-"
+	if strings.HasPrefix(branch, p) && len(branch) > len(p) {
+		if c := branch[len(p)]; c >= '0' && c <= '9' {
+			return branch[len(p):]
 		}
 	}
 	return branch
