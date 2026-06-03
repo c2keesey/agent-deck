@@ -54,6 +54,13 @@ type UserConfig struct {
 	// Default: true (nil = true)
 	ManageMCPJson *bool `toml:"manage_mcp_json"`
 
+	// SyncTitle controls whether agent-deck overwrites a session's Title with the
+	// agent's own session-name (e.g. Claude's `--name` / `/rename`, issues #572/#697).
+	// Tool-agnostic, global switch. Set false to keep the title you gave the session.
+	// The per-session TitleLocked flag remains available as a finer-grained override.
+	// Default: true (nil = true)
+	SyncTitle *bool `toml:"sync_title"`
+
 	// MCPs defines available MCP servers for the MCP Manager
 	// These can be attached/detached per-project via the MCP Manager (M key)
 	MCPs map[string]MCPDef `toml:"mcps"`
@@ -636,9 +643,12 @@ func (n NotificationsConfig) GetTransitionEventsEnabled() bool {
 
 // InstanceSettings configures multiple agent-deck instance behavior
 type InstanceSettings struct {
-	// AllowMultiple allows running multiple agent-deck TUI instances for the same profile
-	// When true (default), multiple instances can run, but only the first (primary) manages the notification bar
-	// When false, only one instance can run per profile
+	// AllowMultiple allows running multiple agent-deck TUI instances for the same profile.
+	// When false (default), only one instance can run per profile — a safe default that
+	// prevents concurrent reviver/restart loops from tearing down each other's live
+	// sessions (issue #1246). When true (explicit opt-in), multiple instances can run,
+	// but only the first (primary) manages the notification bar — useful for multi-pane
+	// workflows (e.g. PC + phone-over-SSH).
 	AllowMultiple *bool `toml:"allow_multiple"`
 
 	// FollowCwdOnAttach updates the session's ProjectPath from tmux pane_current_path
@@ -647,10 +657,14 @@ type InstanceSettings struct {
 	FollowCwdOnAttach *bool `toml:"follow_cwd_on_attach"`
 }
 
-// GetAllowMultiple returns whether multiple instances are allowed, defaulting to true
+// GetAllowMultiple returns whether multiple instances are allowed, defaulting to false.
+// Single-instance-per-profile is the safe default: it engages the primary-election gate
+// so a second instance is rejected, preventing concurrent reviver/restart loops from
+// tearing down each other's live sessions (issue #1246). Multi-instance is an explicit
+// opt-in via allow_multiple = true.
 func (i *InstanceSettings) GetAllowMultiple() bool {
 	if i.AllowMultiple == nil {
-		return true // Default: allow multiple instances (better UX for multi-pane workflows)
+		return false // Default: single instance per profile (prevents concurrent tear-down)
 	}
 	return *i.AllowMultiple
 }
@@ -803,6 +817,16 @@ func (c *UserConfig) GetShowAnalytics() bool {
 // GetShowNotes returns whether to show notes section, defaulting to false
 func (c *UserConfig) GetShowNotes() bool {
 	return c.Preview.GetShowNotes()
+}
+
+// GetSyncTitle returns whether agent-deck may overwrite a session Title with the
+// agent's own session-name. Tool-agnostic. Defaults to true (nil = true) so
+// existing installs keep the current behavior; set sync_title = false to opt out.
+func (c *UserConfig) GetSyncTitle() bool {
+	if c.SyncTitle == nil {
+		return true
+	}
+	return *c.SyncTitle
 }
 
 // ClaudeSettings defines Claude Code configuration
@@ -1801,6 +1825,12 @@ type DisplaySettings struct {
 	// Valid statuses: "running", "waiting", "idle", "error", "starting",
 	// "stopped".
 	ActiveFilterExcludes []string `toml:"active_filter_excludes"`
+
+	// IncludeCwdPrefix controls whether the terminal/pane title is prefixed
+	// with "[<cwd-basename>]" (e.g. "[my-project] feature work"). Default true
+	// preserves the historical format; set false to show only the session
+	// title. Consumed by the tmux set-titles-string builder.
+	IncludeCwdPrefix *bool `toml:"include_cwd_prefix"`
 }
 
 // GetActiveFilterExcludes returns the resolved set of statuses the % filter
@@ -1855,6 +1885,15 @@ func (d DisplaySettings) GetFullRepaint() bool {
 		return true
 	}
 	return d.FullRepaint
+}
+
+// GetIncludeCwdPrefix reports whether the "[<cwd-basename>]" title prefix is
+// shown. Defaults to true to preserve the historical title format.
+func (d DisplaySettings) GetIncludeCwdPrefix() bool {
+	if d.IncludeCwdPrefix == nil {
+		return true
+	}
+	return *d.IncludeCwdPrefix
 }
 
 // Default user config (empty maps)
@@ -2084,6 +2123,18 @@ func IsClaudeCompatible(toolName string) bool {
 		return strings.EqualFold(strings.TrimSpace(def.CompatibleWith), "claude") || isClaudeCommand(def.Command)
 	}
 	return false
+}
+
+// UsesClaudeDeliveryVerify reports whether the Claude-tuned post-send delivery
+// verification (issue #876) should be applied for this tool. That verify keys
+// off Claude-specific TUI signals — an "active" status transition, the composer
+// glyph, and unsent-paste markers. Only Claude-compatible tools surface those;
+// every other tool (codex #1205, codewhale/deepseek #1238, gemini #876,
+// opencode, and custom CLIs) would false-negative the verify and be reported as
+// a silent drop despite successful delivery. Those tools therefore skip the
+// Claude-tuned verify. This is the general superset of #1228's codex-only skip.
+func UsesClaudeDeliveryVerify(toolName string) bool {
+	return IsClaudeCompatible(toolName)
 }
 
 // IsCodexCompatible returns true if the tool is "codex" or a custom tool
@@ -2772,8 +2823,14 @@ func CreateExampleConfig() error {
 # detach = "ctrl+d"   # PTY-attach detach key, default ctrl+q (issue #434).
                       # Alias [tmux].detach_key exists; [hotkeys].detach wins.
 
-# Attach-return project path sync (optional)
+# Instance behavior (optional)
 # [instances]
+# allow_multiple = false   # Default: one agent-deck per profile (single-instance gate).
+                           # A second instance is rejected to prevent concurrent
+                           # reviver/restart loops from tearing down each other's live
+                           # sessions (issue #1246). Set true to opt in to multiple
+                           # instances (e.g. PC + phone-over-SSH); the first instance
+                           # (primary) owns the notification bar.
 # follow_cwd_on_attach = true
 
 # Preview settings (optional)

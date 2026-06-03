@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,6 +32,31 @@ type hookPayload struct {
 	SessionID     string          `json:"session_id"`
 	Source        string          `json:"source"`
 	Matcher       json.RawMessage `json:"matcher,omitempty"`
+	// Cwd is the session's working directory (PROJECT_DIR) as reported by
+	// Claude Code on each hook event. Issue #1233: when a running session's
+	// registered worktree is renamed/removed, this points at a path that no
+	// longer exists; we use it to degrade gracefully rather than erroring on
+	// every tool call. Empty when the agent doesn't send a cwd (older Claude
+	// Code) — treated as "present" so behavior is unchanged.
+	Cwd string `json:"cwd"`
+	// StopHookActive is Claude Code's flag: true when this Stop is a
+	// continuation induced by a previous Stop-hook block. Issue #1225 uses it
+	// to bound consecutive inbox-drain blocks so the conductor cannot loop
+	// forever (resets the budget on a genuine user turn boundary).
+	//
+	// Audit B8: a *bool (not bool) so we can distinguish ABSENT from explicit
+	// false. A missing field must NOT be read as "fresh user turn" (which would
+	// reset the loop guard every Stop); resolveStopHookActive fails safe to true.
+	StopHookActive *bool `json:"stop_hook_active"`
+}
+
+// resolveStopHookActive fails safe (audit B8): an absent stop_hook_active is
+// treated as active=true (this Stop counts against the MaxStopHookBlocks budget)
+// rather than false (which would reset the budget). Only an EXPLICIT false — a
+// genuine user turn boundary that Claude Code is asserting — resets the guard.
+// This keeps the loop bounded even if Claude Code ever omits the field.
+func resolveStopHookActive(p hookPayload) bool {
+	return p.StopHookActive == nil || *p.StopHookActive
 }
 
 // hookStatusFile is the JSON written to ~/.agent-deck/hooks/{instance_id}.json
@@ -111,6 +137,17 @@ func handleHookHandler() {
 		return
 	}
 
+	// Issue #1233: gracefully degrade when the session's working directory
+	// (PROJECT_DIR / cwd) has been renamed or removed out from under a running
+	// session — e.g. a git worktree renamed while the session is live. Rather
+	// than emitting a FATAL-class error on every single tool call, log a single
+	// WARN (deduped per instance+path) that points at the moved path and
+	// suggests `agent-deck session move`, then soft-skip this invocation.
+	if projectDirMissing(payload.Cwd) {
+		warnProjectDirMissingOnce(instanceID, payload.Cwd)
+		return
+	}
+
 	// Map event to status
 	status := mapEventToStatus(payload.HookEventName)
 
@@ -166,6 +203,25 @@ func handleHookHandler() {
 	// unchanged.
 	if payload.HookEventName == "PermissionRequest" && parentIsDSP() {
 		fmt.Println(`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"allow"}}`)
+	}
+
+	// Issue #1225: on the Stop edge (the turn boundary), a parent drains its
+	// durable per-parent outbox and injects any pending child completions via
+	// {decision:"block",reason} — so a BUSY conductor still receives every
+	// completion at its very next free turn, with zero forced interrupts and
+	// zero loss. No-op when the inbox is empty (the common case for non-parent
+	// sessions), and bounded by a max-consecutive-block guard so it can't loop.
+	//
+	// NOTE: Claude Code only reads this decision when the Stop hook runs
+	// SYNCHRONOUSLY. The install flips the conductor's Stop hook to sync — see
+	// the maintainer note in the PR. Emitting here is harmless under the legacy
+	// async install (Claude ignores stdout) and activates once sync lands.
+	if payload.HookEventName == "Stop" {
+		if dec, blocked, derr := session.DrainForStopHook(instanceID, resolveStopHookActive(payload)); derr == nil && blocked {
+			if out, mErr := json.Marshal(dec); mErr == nil {
+				fmt.Println(string(out))
+			}
+		}
 	}
 }
 
@@ -275,6 +331,45 @@ func isTerminalHookEvent(event string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// projectDirMissing reports whether cwd is a non-empty path that no longer
+// exists on disk. An empty cwd (older Claude Code, or hook events that omit
+// one) returns false — we can't tell, so behavior stays unchanged. Stat errors
+// other than "not exist" (e.g. permission) also return false: only a confirmed
+// missing directory triggers the degrade path.
+func projectDirMissing(cwd string) bool {
+	if cwd == "" {
+		return false
+	}
+	_, err := os.Stat(cwd)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// warnProjectDirMissingOnce logs a single WARN for a missing project dir and
+// records a marker so subsequent hook invocations for the same instance+path
+// stay silent. Because each hook runs as a fresh process, the "once" guard is
+// an on-disk marker (next to the hook status files) whose contents are the
+// missing path: if the session is later repointed to a different (also-missing)
+// path, the mismatch lets it warn again instead of being silenced by a stale
+// marker.
+func warnProjectDirMissingOnce(instanceID, cwd string) {
+	hooksDir := getHooksDir()
+	markerPath := filepath.Join(hooksDir, filepath.Base(instanceID)+".projectdir-missing")
+
+	if existing, err := os.ReadFile(markerPath); err == nil && strings.TrimSpace(string(existing)) == cwd {
+		return // already warned for this exact missing path
+	}
+
+	hookHandlerLog.Warn("hook_projectdir_missing",
+		slog.String("instance", instanceID),
+		slog.String("project_dir", cwd),
+		slog.String("suggestion", "run `agent-deck session move <id|title> <new-path>` to repoint the session at its moved worktree"),
+	)
+
+	if err := os.MkdirAll(hooksDir, 0o700); err == nil {
+		_ = os.WriteFile(markerPath, []byte(cwd), 0o600)
 	}
 }
 

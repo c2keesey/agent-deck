@@ -292,12 +292,8 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	if config.Claude.ConfigDir != "~/.claude-custom" {
 		t.Errorf("ConfigDir: got %q, want %q", config.Claude.ConfigDir, "~/.claude-custom")
 	}
-	if !config.Claude.UseHappy {
-		t.Error("Claude.UseHappy should be true")
-	}
-	if !config.Codex.UseHappy {
-		t.Error("Codex.UseHappy should be true")
-	}
+	// Personal fork note: the "happy wrapper" toggle was removed from the
+	// settings panel upstream, so GetConfig no longer populates UseHappy.
 	if !config.Codex.YoloMode {
 		t.Error("Codex.YoloMode should be true")
 	}
@@ -670,7 +666,6 @@ func TestSettingsPanel_View_Visible(t *testing.T) {
 		"Gemini",
 		"CLAUDE",
 		"Dangerous mode",
-		"Use happy wrapper",
 		"UPDATES",
 		"LOGS",
 		"GLOBAL SEARCH",
@@ -1033,11 +1028,15 @@ func TestSettingsPanel_ViewUsesConfiguredMCPHotkeyHint(t *testing.T) {
 	setSettingsPanelHotkeyConfigForTest(t, "[hotkeys]\nmcp_manager = \"ctrl+m\"\n")
 
 	panel := NewSettingsPanel()
-	panel.SetSize(100, 80)
+	// Tall viewport so the MCP hint (below many settings rows) is not clipped by scroll windowing.
+	panel.SetSize(120, 200)
 	panel.Show()
+	panel.cursor = int(SettingStatsShowLoad)
 
 	view := panel.View()
-	if !containsString(view, "Press ctrl+m on any Claude/Gemini session to attach MCPs.") {
+	// Hint may wrap across dialog lines; assert on stable fragments rather than one contiguous string.
+	if !containsString(view, "Press ctrl+m on any Claude, Gemini, or Cursor session") ||
+		!containsString(view, "attach MCPs") {
 		t.Fatalf("settings view should show configured MCP key hint, got %q", view)
 	}
 }

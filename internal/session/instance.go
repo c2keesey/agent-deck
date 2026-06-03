@@ -1339,6 +1339,35 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	return envPrefix + command + yoloFlag + modelFlag
 }
 
+// buildPiCommand builds the command for the Pi CLI.
+// Pi sessions are JSONL files, not externally named sessions like Claude/Codex.
+// Scope Pi's session directory to the Agent Deck instance and always launch
+// with --continue so restarts resume that instance without colliding with other
+// Agent Deck Pi sessions in the same project.
+func (i *Instance) buildPiCommand(baseCommand string) string {
+	if i.Tool != "pi" {
+		return baseCommand
+	}
+
+	envPrefix := i.buildEnvSourceCommand()
+	cmd := strings.TrimSpace(baseCommand)
+	if cmd == "" {
+		cmd = "pi"
+	}
+
+	// Use target-side $HOME rather than resolving the Agent Deck process' home
+	// directory. This keeps local, SSH, and sandbox launch paths consistent.
+	sessionDir := "${HOME}/.pi/agent-deck/" + shellescape.Quote(i.ID)
+	quotedInstanceID := shellescape.Quote(i.ID)
+
+	return envPrefix + fmt.Sprintf(
+		"session_dir=%s; mkdir -p \"$session_dir\" && AGENTDECK_INSTANCE_ID=%s %s --continue --session-dir \"$session_dir\"",
+		sessionDir,
+		quotedInstanceID,
+		cmd,
+	)
+}
+
 // buildCursorCommand builds the command for the Cursor CLI (`cursor agent`).
 // continuePrev adds --continue so Restart resumes the previous chat in the workspace.
 // Env files from [shell].env_files are applied via buildEnvSourceCommand.
@@ -2776,6 +2805,8 @@ func (i *Instance) Start() error {
 		command = i.buildCodexCommand(i.Command)
 		// Record start time for session ID detection (Unix millis)
 		i.CodexStartedAt = time.Now().UnixMilli()
+	case i.Tool == "pi":
+		command = i.buildPiCommand(i.Command)
 	case i.Tool == "copilot":
 		command = i.buildCopilotCommand(i.Command)
 	case i.Tool == "cursor":
@@ -2978,6 +3009,8 @@ func (i *Instance) StartWithMessage(message string) error {
 	case IsCodexCompatible(i.Tool):
 		command = i.buildCodexCommand(i.Command)
 		i.CodexStartedAt = time.Now().UnixMilli()
+	case i.Tool == "pi":
+		command = i.buildPiCommand(i.Command)
 	case i.Tool == "copilot":
 		command = i.buildCopilotCommand(i.Command)
 	case i.Tool == "crush":
@@ -3155,6 +3188,15 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 			// Send message atomically (text + Enter in single tmux invocation)
 			if err := i.tmuxSession.SendKeysAndEnter(message); err != nil {
 				return fmt.Errorf("failed to send message: %w", err)
+			}
+
+			// The verify loop below keys off Claude-specific signals (an
+			// "active" transition, composer glyph, unsent-paste markers). Non-
+			// Claude tools never surface those, so the loop false-negatives a
+			// delivered message and Enter-spams the composer; skip it for every
+			// non-Claude tool (#1238 — generalizes #1228's codex-only skip).
+			if !UsesClaudeDeliveryVerify(i.Tool) {
+				return nil
 			}
 
 			// Verify the agent accepted Enter and began processing.
@@ -4396,6 +4438,20 @@ func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
 				return recovered, nil
 			}
 		}
+
+		// Disk scan: the tmux env var is fixed at launch, so after a /clear or
+		// compaction it points at a stale, empty transcript. Find the newest
+		// transcript on disk that carries a real assistant reply. Mirrors the
+		// Gemini syncGeminiSessionFromDisk fallback below.
+		if id, recovered := i.findLatestClaudeTranscriptOnDisk(); recovered != nil {
+			i.ClaudeSessionID = id
+			i.ClaudeDetectedAt = time.Now()
+			// Sync back to tmux so subsequent reads (and restarts) stay current.
+			if i.tmuxSession != nil && i.tmuxSession.Exists() {
+				_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", id)
+			}
+			return recovered, nil
+		}
 	}
 
 	// Gemini-specific recovery path (mirrors Claude recovery above)
@@ -4510,6 +4566,70 @@ func (i *Instance) getClaudeLastResponse() (*ResponseOutput, error) {
 	return parseClaudeLastAssistantMessage(data, filepath.Base(sessionFile))
 }
 
+// findLatestClaudeTranscriptOnDisk scans the instance's Claude project directory
+// for the most recently modified transcript that carries a real (non-sidechain)
+// assistant message, returning its session ID and parsed response.
+//
+// This recovers from a stale CLAUDE_SESSION_ID: when a Claude session rolls over
+// (/clear or compaction starts a NEW transcript), the tmux env var — fixed at
+// launch — still points at the OLD, now-empty transcript. Without this fallback
+// the read path drops to raw tmux-pane parsing, which leaks tool output (e.g. a
+// `list --json` dump) into conductor chat replies. Mirrors the Gemini
+// syncGeminiSessionFromDisk fallback.
+//
+// Returns ("", nil) when no suitable transcript is found.
+func (i *Instance) findLatestClaudeTranscriptOnDisk() (string, *ResponseOutput) {
+	configDir := GetClaudeConfigDir()
+
+	resolvedPath := i.ProjectPath
+	if resolved, err := filepath.EvalSymlinks(i.ProjectPath); err == nil {
+		resolvedPath = resolved
+	}
+	projectDir := filepath.Join(configDir, "projects", ConvertToClaudeDirName(resolvedPath))
+
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return "", nil
+	}
+
+	type candidate struct {
+		id  string
+		mod time.Time
+	}
+	var candidates []candidate
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, candidate{
+			id:  strings.TrimSuffix(e.Name(), ".jsonl"),
+			mod: info.ModTime(),
+		})
+	}
+
+	// Newest first; the current conversation is the most recently written file
+	// that still contains a real assistant reply.
+	sort.Slice(candidates, func(a, b int) bool {
+		return candidates[a].mod.After(candidates[b].mod)
+	})
+
+	for _, c := range candidates {
+		data, err := os.ReadFile(filepath.Join(projectDir, c.id+".jsonl"))
+		if err != nil {
+			continue
+		}
+		resp, err := parseClaudeLastAssistantMessage(data, c.id+".jsonl")
+		if err == nil && resp != nil && strings.TrimSpace(resp.Content) != "" {
+			return c.id, resp
+		}
+	}
+	return "", nil
+}
+
 // parseClaudeLastAssistantMessage parses a Claude JSONL file to extract the last assistant message
 func parseClaudeLastAssistantMessage(data []byte, sessionID string) (*ResponseOutput, error) {
 	// JSONL record structure (same as global_search.go)
@@ -4518,10 +4638,11 @@ func parseClaudeLastAssistantMessage(data []byte, sessionID string) (*ResponseOu
 		Content json.RawMessage `json:"content"`
 	}
 	type claudeRecord struct {
-		SessionID string          `json:"sessionId"`
-		Type      string          `json:"type"`
-		Message   json.RawMessage `json:"message"`
-		Timestamp string          `json:"timestamp"`
+		SessionID   string          `json:"sessionId"`
+		Type        string          `json:"type"`
+		Message     json.RawMessage `json:"message"`
+		Timestamp   string          `json:"timestamp"`
+		IsSidechain bool            `json:"isSidechain"`
 	}
 
 	var lastAssistantContent string
@@ -4542,6 +4663,12 @@ func parseClaudeLastAssistantMessage(data []byte, sessionID string) (*ResponseOu
 		var record claudeRecord
 		if err := json.Unmarshal(line, &record); err != nil {
 			continue // Skip malformed lines
+		}
+
+		// Skip subagent sidechain records: the conversation's "last response"
+		// is the parent agent's reply, not a Task subagent's output.
+		if record.IsSidechain {
+			continue
 		}
 
 		// Capture session ID
@@ -5423,6 +5550,8 @@ func (i *Instance) Restart() error {
 			command = i.buildCodexCommand(i.Command)
 			// Record start time for async session ID detection
 			i.CodexStartedAt = time.Now().UnixMilli()
+		case i.Tool == "pi":
+			command = i.buildPiCommand(i.Command)
 		case i.Tool == "copilot":
 			command = i.buildCopilotCommand(i.Command)
 		case i.Tool == "crush":
@@ -5841,6 +5970,12 @@ func (i *Instance) CanRestart() bool {
 	// Codex sessions without ID can still restart (will start fresh)
 	// This allows restart even before session ID is detected
 	if IsCodexCompatible(i.Tool) {
+		return true
+	}
+
+	// Pi sessions are scoped to an Agent Deck instance-specific session dir and
+	// can always be relaunched with --continue.
+	if i.Tool == "pi" {
 		return true
 	}
 
@@ -6311,13 +6446,15 @@ func (i *Instance) RefreshLiveSessionIDs() {
 }
 
 // GetMCPInfo returns MCP server information for this session
-// Returns nil if not a Claude or Gemini session
+// Returns nil if not a Claude, Gemini, or Cursor session
 func (i *Instance) GetMCPInfo() *MCPInfo {
 	switch {
 	case IsClaudeCompatible(i.Tool):
 		return GetMCPInfo(i.ProjectPath)
 	case i.Tool == "gemini":
 		return GetGeminiMCPInfo(i.ProjectPath)
+	case i.Tool == "cursor":
+		return GetCursorMCPInfo(i.ProjectPath)
 	default:
 		return nil
 	}
@@ -6327,12 +6464,12 @@ func (i *Instance) GetMCPInfo() *MCPInfo {
 // This should be called when a session starts or restarts, so we can track
 // which MCPs are actually loaded in the running Claude session vs just configured
 func (i *Instance) CaptureLoadedMCPs() {
-	if !IsClaudeCompatible(i.Tool) {
+	if !IsClaudeCompatible(i.Tool) && i.Tool != "cursor" {
 		i.LoadedMCPNames = nil
 		return
 	}
 
-	mcpInfo := GetMCPInfo(i.ProjectPath)
+	mcpInfo := i.GetMCPInfo()
 	if mcpInfo == nil {
 		i.LoadedMCPNames = nil
 		return
@@ -6346,6 +6483,38 @@ func (i *Instance) CaptureLoadedMCPs() {
 // Otherwise, MCPs will use stdio configs (npx ...)
 // Returns error if .mcp.json write fails
 func (i *Instance) regenerateMCPConfig() error {
+	if i.Tool == "cursor" {
+		ClearCursorMCPCache(i.ProjectPath)
+		mcpInfo := i.GetMCPInfo()
+		if mcpInfo == nil || !mcpInfo.HasAny() {
+			return nil
+		}
+
+		switch GetMCPDefaultScope() {
+		case "global", "user":
+			globalMCPs := mcpInfo.Global
+			if len(globalMCPs) == 0 {
+				return nil
+			}
+			if err := i.WriteGlobalMCPConfig(globalMCPs); err != nil {
+				mcpLog.Debug("regen_cursor_global_mcp_failed", slog.String("error", err.Error()))
+				return fmt.Errorf("failed to regenerate Cursor global MCP config: %w", err)
+			}
+			mcpLog.Debug("regen_cursor_global_mcp_succeeded", slog.String("title", i.Title), slog.Int("mcp_count", len(globalMCPs)))
+		default:
+			localMCPs := mcpInfo.Local()
+			if len(localMCPs) == 0 {
+				return nil
+			}
+			if err := i.WriteLocalMCPConfig(localMCPs); err != nil {
+				mcpLog.Debug("regen_cursor_project_mcp_failed", slog.String("error", err.Error()))
+				return fmt.Errorf("failed to regenerate .cursor/mcp.json: %w", err)
+			}
+			mcpLog.Debug("regen_cursor_project_mcp_succeeded", slog.String("title", i.Title), slog.Int("mcp_count", len(localMCPs)))
+		}
+		return nil
+	}
+
 	ClearMCPCache(i.ProjectPath) // Force fresh read from disk (not stale 30s cache)
 	mcpInfo := GetMCPInfo(i.ProjectPath)
 	if mcpInfo == nil {

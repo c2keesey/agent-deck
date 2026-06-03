@@ -1230,7 +1230,8 @@ func TestDeleteAndCloseSessionUseDistinctActions(t *testing.T) {
 
 	h.confirmDialog.Hide()
 
-	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	// Personal fork: close-session is remapped from 'D' to Ctrl+X.
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlX})
 	h, ok = model.(*Home)
 	if !ok {
 		t.Fatal("handleMainKey should return *Home")
@@ -1305,7 +1306,8 @@ func TestRemoteDeleteAndCloseUseDistinctActions(t *testing.T) {
 
 	h.confirmDialog.Hide()
 
-	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	// Personal fork: close-session is remapped from 'D' to Ctrl+X.
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlX})
 	h, ok = model.(*Home)
 	if !ok {
 		t.Fatal("handleMainKey should return *Home")
@@ -1330,7 +1332,8 @@ func TestRemoteRestartReturnsRemoteCommand(t *testing.T) {
 	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
 	home.cursor = 0
 
-	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	// Personal fork: restart is remapped from 'R' (Shift+R) to 't'.
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 	h, ok := model.(*Home)
 	if !ok {
 		t.Fatal("handleMainKey should return *Home")
@@ -1398,9 +1401,11 @@ func TestRemoteSelectionQuickCreateStillRunsRemoteCommand(t *testing.T) {
 	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
 	home.cursor = 0
 
-	_, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	// Personal fork: quick-create on a remote selection is 'a' (and 'n');
+	// the old upstream 'N' binding is unused here.
+	_, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	if cmd == nil {
-		t.Fatal("pressing N on remote selection should return remote create command")
+		t.Fatal("pressing 'a' on remote selection should return remote create command")
 	}
 
 	msg := cmd()
@@ -1632,8 +1637,9 @@ func TestRenderHelpBarMinimalWithSession(t *testing.T) {
 	if !strings.Contains(result, "n") {
 		t.Error("Minimal help bar should contain n key")
 	}
-	if !strings.Contains(result, "R") {
-		t.Error("Minimal help bar should contain R key for restart")
+	// Personal fork: restart key is 't', not 'R'.
+	if !strings.Contains(result, "t") {
+		t.Error("Minimal help bar should contain t key for restart")
 	}
 	// Should NOT contain full descriptions
 	if strings.Contains(result, "Attach") {

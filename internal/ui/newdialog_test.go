@@ -601,7 +601,6 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	originalClaude := &session.ClaudeOptions{
 		SessionMode:          "resume",
 		ResumeSessionID:      "abc123",
-		UseHappy:             true,
 		SkipPermissions:      true,
 		AllowSkipPermissions: false,
 		UseChrome:            true,
@@ -649,7 +648,9 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 		t.Fatalf("restored Claude session mode/id = %q/%q, want resume/abc123",
 			restoredClaude.SessionMode, restoredClaude.ResumeSessionID)
 	}
-	if !restoredClaude.UseHappy || !restoredClaude.SkipPermissions || !restoredClaude.UseChrome || !restoredClaude.UseTeammateMode {
+	// Personal fork: the Claude happy-wrapper toggle was removed from the new
+	// dialog upstream, so UseHappy no longer round-trips through the snapshot.
+	if !restoredClaude.SkipPermissions || !restoredClaude.UseChrome || !restoredClaude.UseTeammateMode {
 		t.Fatalf("restored Claude toggles incorrect: %+v", restoredClaude)
 	}
 	if !d.geminiOptions.GetYoloMode() {
@@ -732,17 +733,19 @@ func TestNewDialog_GetValuesWithWorktree_Disabled(t *testing.T) {
 	}
 }
 
-func TestNewDialog_Validate_WorktreeEnabled_EmptyBranch_WithName(t *testing.T) {
+func TestNewDialog_Validate_WorktreeEnabled_EmptyBranch(t *testing.T) {
 	dialog := NewNewDialog()
 	dialog.nameInput.SetValue("test-session")
 	dialog.pathInput.SetValue("/tmp/project")
 	dialog.worktreeEnabled = true
 	dialog.branchInput.SetValue("")
 
-	// With a name set, empty branch is derived from name — validation passes
 	err := dialog.Validate()
-	if err != "" {
-		t.Errorf("Validation should pass when branch is empty but name is set (derives branch), got: %q", err)
+	if err == "" {
+		t.Error("Validation should fail when worktree enabled but branch is empty")
+	}
+	if err != "Branch name required for worktree" {
+		t.Errorf("Unexpected error message: %q", err)
 	}
 }
 
@@ -2154,5 +2157,38 @@ func TestNewDialog_CtrlW_BranchField(t *testing.T) {
 
 	if got, want := d.branchInput.Value(), "feature/"; got != want {
 		t.Errorf("branchInput after ctrl+w = %q, want %q", got, want)
+	}
+}
+
+// Tests the overlay placement math. Dropdowns are placed relative
+// to the associated dialog's top-left corner.
+//
+// Remote-parity: not applicable. NewDialog is the local new-session dialog
+// only; pressing `n` on a remote group/session routes through
+// createRemoteSession (SSH) and never opens this dialog (#743), so this
+// overlay-positioning fix has no remote surface. That routing — and the fact
+// the dialog never opens on a remote selection — is itself covered by
+// TestRegression743_NOnRemoteSession_QuickCreatesNoDialog and
+// TestRegression743_NOnRemoteGroup_QuickCreatesNoDialog in home_test.go.
+func TestDialogOrigin(t *testing.T) {
+	tests := []struct {
+		name                           string
+		termW, termH, dialogW, dialogH int
+		wantRow, wantCol               int
+	}{
+		{"fits centered", 120, 50, 80, 30, 10, 20},
+		{"taller than terminal clamps row", 120, 25, 80, 30, 0, 20},
+		{"wider than terminal clamps col", 60, 50, 80, 30, 10, 0},
+		{"larger than terminal both clamp", 60, 25, 80, 30, 0, 0},
+		{"exact fit", 80, 30, 80, 30, 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			row, col := dialogOrigin(tt.termW, tt.termH, tt.dialogW, tt.dialogH)
+			if row != tt.wantRow || col != tt.wantCol {
+				t.Errorf("dialogOrigin(%d,%d,%d,%d) = (row %d, col %d), want (row %d, col %d)",
+					tt.termW, tt.termH, tt.dialogW, tt.dialogH, row, col, tt.wantRow, tt.wantCol)
+			}
+		})
 	}
 }

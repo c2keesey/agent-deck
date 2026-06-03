@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.46] - 2026-06-02
+
+### Added
+
+- **`include_cwd_prefix` display toggle** ([#1221](https://github.com/asheshgoplani/agent-deck/issues/1221) / [#1229](https://github.com/asheshgoplani/agent-deck/pull/1229)). A configurable toggle controls whether the working-directory prefix is shown in session display, letting users opt out of the cwd prefix where it adds noise.
+- **Claude Opus 4.8 in the model catalog** ([#1241](https://github.com/asheshgoplani/agent-deck/issues/1241) / [#1242](https://github.com/asheshgoplani/agent-deck/pull/1242)). `claude-opus-4-8` is added to `MODEL_ID_CATALOG` so the latest Opus model is selectable and resolves correctly throughout the UI.
+- **SLSA build-provenance attestation with fail-closed verification** ([#1159](https://github.com/asheshgoplani/agent-deck/issues/1159) / [#1250](https://github.com/asheshgoplani/agent-deck/pull/1250)). Release artifacts now carry SLSA build provenance, and artifact verification is fail-closed — an unattested or tampered artifact is rejected rather than silently accepted.
+- **Tier-1 WARM performance suite** ([#1234](https://github.com/asheshgoplani/agent-deck/issues/1234) / [#1251](https://github.com/asheshgoplani/agent-deck/pull/1251)). A warm-path performance test suite with corrected warm measurement, guarding the hot code paths against regression.
+
+### Changed
+
+- **Single-instance per profile is now the default** ([#1246](https://github.com/asheshgoplani/agent-deck/issues/1246) / [#1247](https://github.com/asheshgoplani/agent-deck/pull/1247)). `allow_multiple` now defaults to `false`, so a profile runs a single instance by default. This stops concurrent instances from tearing each other down.
+- **Bumped all deprecated GitHub Actions** ([#991](https://github.com/asheshgoplani/agent-deck/issues/991) / [#1249](https://github.com/asheshgoplani/agent-deck/pull/1249)). Every deprecated Action across the CI workflows (including perf-smoke and lighthouse-ci) is upgraded to a supported version, keeping the pipelines from breaking on runner deprecations.
+- **Stabilized the Playwright e2e suite** ([#1236](https://github.com/asheshgoplani/agent-deck/pull/1236) / [#1248](https://github.com/asheshgoplani/agent-deck/pull/1248)). Broken Playwright specs on main are repaired and desktop-coupled specs gain phone-viewport applicability guards, so the e2e suite runs green across viewports.
+
+### Fixed
+
+- **Durable, subscription-safe credentials (clean-symlink + keep-warm daemon)** ([#1222](https://github.com/asheshgoplani/agent-deck/issues/1222) / [#1253](https://github.com/asheshgoplani/agent-deck/pull/1253)). Credentials are managed via a clean symlink (dropping the fragile mtime-promote step) and a keep-warm refresh daemon, making multi-session use subscription-safe without an API key and eliminating the credential loss that drove the work-profile re-login loop.
+- **Tool-aware post-send verification** ([#1238](https://github.com/asheshgoplani/agent-deck/issues/1238) / [#1205](https://github.com/asheshgoplani/agent-deck/issues/1205) / [#876](https://github.com/asheshgoplani/agent-deck/issues/876) / [#1245](https://github.com/asheshgoplani/agent-deck/pull/1245)). Post-send verification is now tool-aware, so sends to non-Claude tools are no longer reported as false-negative drops.
+- **Hook-handler graceful degradation on missing `PROJECT_DIR`** ([#1233](https://github.com/asheshgoplani/agent-deck/issues/1233) / [#1243](https://github.com/asheshgoplani/agent-deck/pull/1243)). A missing `PROJECT_DIR` now degrades gracefully instead of emitting a FATAL on every call.
+- **iTerm2 ghost-lines** ([#1240](https://github.com/asheshgoplani/agent-deck/issues/1240) / [#1252](https://github.com/asheshgoplani/agent-deck/pull/1252)). Ghost-lines under iTerm2 are prevented without regressing panel width-measurement.
+
+## [1.9.45] - 2026-05-30
+
+### Added
+
+- **Near-instant idle-conductor completion delivery (wake-nudge wired)** ([#1225](https://github.com/asheshgoplani/agent-deck/issues/1225) / [#1226](https://github.com/asheshgoplani/agent-deck/pull/1226)). The durable outbox shipped in v1.9.44 is correct (no loss, exactly-once) but an **idle** conductor only drained on its next heartbeat — up to ~14 min of latency. The `WakeNudger` (built but previously unwired) is now triggered from the single producer commit chokepoint (`commitEventToInbox`), which both producers funnel through: the interactive `running→waiting` path and the one-shot `run-task` kernel-exit path. The moment a completion durably lands in a parent's inbox, an **idle** conductor is woken to drain it — collapsing the idle worst case from ~14 min to **sub-second**. The nudge is event-driven (fired on commit, not polled), conductor-scoped, idle-gated (never sends into a busy pane — a send-keys there only queues, the exact failure the pull model avoids), debounced per-parent (~500ms, coalesces a burst of simultaneous completions into one wake without delaying the first), and **best-effort/fire-and-forget**: a dropped or failed nudge is harmless because the same durable record is still drained on the parent's next Stop/heartbeat (wake ≠ deliver). A busy parent is intentionally left to drain at its next turn boundary — the physical floor for a busy Claude pane — so the nudge adds no noise there. Zero billed inference.
+
+## [1.9.44] - 2026-05-29
+
+### Added
+
+- **Durable per-parent outbox for inter-agent completions** ([#1225](https://github.com/asheshgoplani/agent-deck/issues/1225) / [#1226](https://github.com/asheshgoplani/agent-deck/pull/1226)). Child completions are committed to a durable, per-parent outbox (`~/.agent-deck/inboxes/<parent>.jsonl`) and drained by the parent on its own schedule, replacing the push-into-tmux model that silently lost completions to an always-busy conductor. At-least-once delivery with exactly-once effects (last-wins per child, consumed-turn dedup ledger); survives parent busy-ness, restart, and compaction.
+
+### Changed
+
+- **Activated the durable-outbox comms engine** ([#1225](https://github.com/asheshgoplani/agent-deck/issues/1225) / [#1226](https://github.com/asheshgoplani/agent-deck/pull/1226)). The conductor Stop hook is now **synchronous** so Claude Code reads the `{decision:"block"}` the hook emits and injects busy-parent completions at the next turn boundary, and `agent-deck inbox drain self` is the first step of every conductor heartbeat (the idle-conductor fallback). The Stop-sync flip is **conductor-scoped at runtime**, not globally: a session with an empty inbox (every leaf/non-conductor session) fast-returns with no block and zero ledger writes, so the flip is inert for them. The loop guard is crash-safe and fails safe on an absent `stop_hook_active` flag. Roll out canary-first to one conductor. Zero billed inference — the hook is a Go handler, no `claude -p`.
+
+### Fixed
+
+- **Work-profile 401 `/login` loop on session spawn/restart** ([#1222](https://github.com/asheshgoplani/agent-deck/issues/1222) / [#1224](https://github.com/asheshgoplani/agent-deck/pull/1224)). The scratch `.credentials.json` symlink is re-asserted on spawn and on start/restart, stopping the work-profile credential loss that forced a re-login loop.
+
 ## [1.9.43] - 2026-05-28
 
 ### Added
