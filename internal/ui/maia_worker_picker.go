@@ -4,122 +4,127 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-
-	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
 // maiaReposDir is the parent directory scanned for MAIA worktrees.
-// Each entry matching the MAIA. prefix (plus the bare "MAIA" root) is
-// listed in the simple new-session picker. Personal fork customization.
+// Personal fork customization.
 const maiaReposDir = "/Users/c2k/MAIA/Repos"
 
-// MaiaWorkerPicker is the minimal new-session picker that replaces the
-// full NewDialog flow for MAIA work: pick a worktree directory, everything
-// else (tool=claude, group=maia/active, auto name) is defaulted.
+// Groups the picker pins new sessions to, per the user's workflow:
+// workers land in maia/active, read-only dev sessions in maia/read-only-dev.
+const (
+	maiaWorkerGroup = "maia/active"
+	maiaRoDevGroup  = "maia/read-only-dev"
+)
+
+// MaiaWorkerPicker is the two-column new-session picker for MAIA work.
 //
-// A textinput sits above the list. When empty, Enter creates a session in
-// the highlighted MAIA worktree (group=maia/active). When non-empty, Enter
-// creates a session in the typed path with whatever group quickCreateSessionAt
-// derives — the escape hatch for non-MAIA dirs.
+//   - Left column: worker worktrees (MAIA.worker-*). The cursor defaults to
+//     the next OPEN worker — the lowest-numbered worktree with no agent-deck
+//     session in it (occupied = any session, regardless of status).
+//   - Right column: ro-dev worktrees (MAIA.ro-dev*) for read-only dev
+//     sessions. Enter just starts another session in the shared ro-dev
+//     worktree (no branch/worktree creation).
+//
+// ←/→ (or h/l) switch columns, ↑/↓ (or j/k) move within a column, Enter
+// creates a Claude session in the selected worktree with the column's group.
 type MaiaWorkerPicker struct {
-	visible   bool
-	pathInput textinput.Model
-	worktrees []string
-	cursor    int
-	width     int
-	height    int
-	scanErr   string
+	visible      bool
+	workers      []string        // worker worktree paths
+	roDevs       []string        // ro-dev worktree paths
+	occupied     map[string]bool // worktree path -> already hosts a session
+	focusCol     int             // 0 = workers, 1 = ro-dev
+	workerCursor int
+	roDevCursor  int
+	width        int
+	height       int
+	scanErr      string
 }
 
-// NewMaiaWorkerPicker constructs a picker. Worktrees are scanned on each
-// Show() so newly-created worktrees show up without restarting agent-deck.
-func NewMaiaWorkerPicker() *MaiaWorkerPicker {
-	ti := textinput.New()
-	ti.Placeholder = "(or type a custom path — for non-MAIA dirs)"
-	ti.CharLimit = 1024
-	ti.Width = 50
-	return &MaiaWorkerPicker{pathInput: ti}
-}
+// NewMaiaWorkerPicker constructs an empty picker; worktrees are scanned on
+// each Show() so freshly-created worktrees appear without a restart.
+func NewMaiaWorkerPicker() *MaiaWorkerPicker { return &MaiaWorkerPicker{} }
 
-// Show opens the picker and refreshes the worktree list.
-func (m *MaiaWorkerPicker) Show() {
+// Show opens the picker. occupied maps worktree paths that already host an
+// agent-deck session (any status); the worker cursor parks on the first
+// worktree not in that set.
+func (m *MaiaWorkerPicker) Show(occupied map[string]bool) {
 	m.visible = true
-	m.cursor = 0
-	m.pathInput.SetValue("")
-	m.pathInput.CursorEnd()
-	m.pathInput.Focus()
+	m.occupied = occupied
+	m.focusCol = 0
+	m.roDevCursor = 0
 	m.refreshWorktrees()
+	m.workerCursor = m.nextOpenWorker()
 }
 
 // Hide closes the picker.
-func (m *MaiaWorkerPicker) Hide() {
-	m.visible = false
-	m.pathInput.Blur()
-}
+func (m *MaiaWorkerPicker) Hide() { m.visible = false }
 
-// IsVisible reports whether the picker is currently shown. Nil-safe: a Home
-// built without a worker picker (some test seams) treats it as not visible
-// rather than panicking on the key-routing / View overlay checks.
+// IsVisible reports whether the picker is shown. Nil-safe so the key-router
+// and View overlay checks don't panic on a Home built without a picker.
 func (m *MaiaWorkerPicker) IsVisible() bool { return m != nil && m.visible }
 
-// SelectedPath returns the path that Enter should act on:
-//   - if the textinput is non-empty, that typed path (custom dir mode)
-//   - otherwise the highlighted MAIA worktree
-//   - empty if neither is selectable
-func (m *MaiaWorkerPicker) SelectedPath() string {
-	if typed := strings.TrimSpace(m.pathInput.Value()); typed != "" {
-		return session.ExpandPath(typed)
-	}
-	if m.cursor < 0 || m.cursor >= len(m.worktrees) {
-		return ""
-	}
-	return m.worktrees[m.cursor]
-}
-
-// IsCustomPath reports whether the user typed a custom path (vs. picked
-// from the MAIA list). Callers use this to decide on the default group:
-// MAIA pick → maia/active, custom path → derive from path.
-func (m *MaiaWorkerPicker) IsCustomPath() bool {
-	return strings.TrimSpace(m.pathInput.Value()) != ""
-}
-
-// SetSize updates the dialog viewport for centering.
+// SetSize updates the viewport for centering.
 func (m *MaiaWorkerPicker) SetSize(width, height int) {
 	m.width = width
 	m.height = height
 }
 
-// Update processes a key event. Arrow keys navigate the MAIA list even
-// while the textinput has focus, so the user can type a path AND still
-// scroll the list without an explicit focus switch.
-func (m *MaiaWorkerPicker) Update(msg tea.KeyMsg) (*MaiaWorkerPicker, tea.Cmd) {
-	switch msg.String() {
-	case "up", "ctrl+p":
-		if m.cursor > 0 {
-			m.cursor--
+// Selected returns the worktree path under the cursor in the focused column
+// and the group its session should join. Empty path means nothing to create.
+func (m *MaiaWorkerPicker) Selected() (path, group string) {
+	if m.focusCol == 1 {
+		if m.roDevCursor >= 0 && m.roDevCursor < len(m.roDevs) {
+			return m.roDevs[m.roDevCursor], maiaRoDevGroup
 		}
-		return m, nil
-	case "down", "ctrl+n":
-		if m.cursor < len(m.worktrees)-1 {
-			m.cursor++
-		}
-		return m, nil
+		return "", ""
 	}
-	var cmd tea.Cmd
-	m.pathInput, cmd = m.pathInput.Update(msg)
-	return m, cmd
+	if m.workerCursor >= 0 && m.workerCursor < len(m.workers) {
+		return m.workers[m.workerCursor], maiaWorkerGroup
+	}
+	return "", ""
 }
 
-// refreshWorktrees scans maiaReposDir for directories named "MAIA" or
-// "MAIA.*". Entries are sorted alphabetically; the bare "MAIA" root sorts
-// to the top of the .* group naturally.
+// Update handles navigation keys (Enter/Esc are handled by the caller).
+func (m *MaiaWorkerPicker) Update(msg tea.KeyMsg) (*MaiaWorkerPicker, tea.Cmd) {
+	switch msg.String() {
+	case "up", "ctrl+p", "k":
+		if m.focusCol == 0 {
+			if m.workerCursor > 0 {
+				m.workerCursor--
+			}
+		} else if m.roDevCursor > 0 {
+			m.roDevCursor--
+		}
+	case "down", "ctrl+n", "j":
+		if m.focusCol == 0 {
+			if m.workerCursor < len(m.workers)-1 {
+				m.workerCursor++
+			}
+		} else if m.roDevCursor < len(m.roDevs)-1 {
+			m.roDevCursor++
+		}
+	case "right", "l", "tab":
+		if len(m.roDevs) > 0 {
+			m.focusCol = 1
+		}
+	case "left", "h", "shift+tab":
+		m.focusCol = 0
+	}
+	return m, nil
+}
+
+// refreshWorktrees scans maiaReposDir, splitting MAIA.worker-* into the left
+// column and MAIA.ro-dev* into the right. Workers sort numerically
+// (worker-2 < worker-10); non-numeric suffixes (worker-retry) sort last.
 func (m *MaiaWorkerPicker) refreshWorktrees() {
-	m.worktrees = nil
+	m.workers = nil
+	m.roDevs = nil
 	m.scanErr = ""
 	entries, err := os.ReadDir(maiaReposDir)
 	if err != nil {
@@ -131,18 +136,48 @@ func (m *MaiaWorkerPicker) refreshWorktrees() {
 			continue
 		}
 		name := e.Name()
-		if name != "MAIA" && !strings.HasPrefix(name, "MAIA.") {
-			continue
+		path := filepath.Join(maiaReposDir, name)
+		switch {
+		case strings.HasPrefix(name, "MAIA.worker-"):
+			m.workers = append(m.workers, path)
+		case name == "MAIA.ro-dev" || strings.HasPrefix(name, "MAIA.ro-dev"):
+			m.roDevs = append(m.roDevs, path)
 		}
-		m.worktrees = append(m.worktrees, filepath.Join(maiaReposDir, name))
 	}
-	sort.Strings(m.worktrees)
-	if m.cursor >= len(m.worktrees) {
-		m.cursor = 0
+	sort.SliceStable(m.workers, func(i, j int) bool {
+		return workerSortKey(m.workers[i]) < workerSortKey(m.workers[j])
+	})
+	sort.Strings(m.roDevs)
+	if m.workerCursor >= len(m.workers) {
+		m.workerCursor = 0
+	}
+	if m.roDevCursor >= len(m.roDevs) {
+		m.roDevCursor = 0
 	}
 }
 
-// View renders the overlay, centered.
+// workerSortKey extracts the numeric worker index for ordering; non-numeric
+// suffixes (e.g. "worker-retry") sort last.
+func workerSortKey(path string) int {
+	suffix := strings.TrimPrefix(filepath.Base(path), "MAIA.worker-")
+	if n, err := strconv.Atoi(suffix); err == nil {
+		return n
+	}
+	return 1 << 30
+}
+
+// nextOpenWorker returns the index of the first worker worktree with no
+// session. Falls back to 0 when all are occupied (or there are none).
+func (m *MaiaWorkerPicker) nextOpenWorker() int {
+	for i, p := range m.workers {
+		if !m.occupied[p] {
+			return i
+		}
+	}
+	return 0
+}
+
+// View renders the two columns side by side, centered.
 func (m *MaiaWorkerPicker) View() string {
 	if !m.visible {
 		return ""
@@ -150,82 +185,71 @@ func (m *MaiaWorkerPicker) View() string {
 
 	title := DialogTitleStyle.Render("New MAIA Session")
 
-	var listBlock string
-	switch {
-	case m.scanErr != "":
-		listBlock = lipgloss.NewStyle().
-			Foreground(ColorRed).
-			Render("⚠ " + m.scanErr)
-	case len(m.worktrees) == 0:
-		listBlock = lipgloss.NewStyle().
-			Foreground(ColorTextDim).
-			Render("(no MAIA worktrees found in " + maiaReposDir + ")")
-	default:
-		listBlock = m.renderWorktrees()
+	var body string
+	if m.scanErr != "" {
+		body = lipgloss.NewStyle().Foreground(ColorRed).Render("⚠ " + m.scanErr)
+	} else {
+		left := m.renderColumn("Workers", m.workers, m.workerCursor, m.focusCol == 0, true)
+		right := m.renderColumn("ro-dev", m.roDevs, m.roDevCursor, m.focusCol == 1, false)
+		body = lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
 	}
 
-	hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
-	hint := hintStyle.Render("↑/↓ pick worktree │ Enter create │ Esc cancel")
+	hint := lipgloss.NewStyle().Foreground(ColorComment).
+		Render("↑/↓ pick · ←/→ column · Enter create · Esc cancel")
 
-	content := lipgloss.JoinVertical(
-		lipgloss.Left,
-		title,
-		"",
-		listBlock,
-		"",
-		m.pathInput.View(),
-		"",
-		hint,
-	)
-
-	dialog := DialogBoxStyle.
-		Width(m.dialogWidth()).
-		Render(content)
-
-	return lipgloss.Place(
-		m.width,
-		m.height,
-		lipgloss.Center,
-		lipgloss.Center,
-		dialog,
-	)
+	content := lipgloss.JoinVertical(lipgloss.Left, title, "", body, "", hint)
+	dialog := DialogBoxStyle.Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 }
 
-func (m *MaiaWorkerPicker) renderWorktrees() string {
-	rowStyle := lipgloss.NewStyle().Foreground(ColorText).Padding(0, 1)
-	selStyle := lipgloss.NewStyle().
-		Foreground(ColorBg).
-		Background(ColorAccent).
-		Bold(true).
+// renderColumn renders one bordered column. The focused column gets an
+// accent border and a highlighted cursor row; markOpen tags worker rows
+// with an open (●) / busy (·) dot.
+func (m *MaiaWorkerPicker) renderColumn(title string, items []string, cursor int, focused, markOpen bool) string {
+	const colWidth = 22
+
+	headerStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Bold(true)
+	rowStyle := lipgloss.NewStyle().Foreground(ColorText)
+	selStyle := lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent).Bold(true)
+	openStyle := lipgloss.NewStyle().Foreground(ColorGreen)
+	busyStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+
+	var b strings.Builder
+	b.WriteString(headerStyle.Render(title))
+	b.WriteString("\n")
+
+	if len(items) == 0 {
+		b.WriteString(busyStyle.Render("(none found)"))
+	}
+	for i, p := range items {
+		label := strings.TrimPrefix(filepath.Base(p), "MAIA.")
+		marker := ""
+		if markOpen {
+			if m.occupied[p] {
+				marker = busyStyle.Render(" ·")
+			} else {
+				marker = openStyle.Render(" ●")
+			}
+		}
+		if focused && i == cursor {
+			b.WriteString(selStyle.Render(" " + label + " "))
+		} else {
+			b.WriteString(rowStyle.Render("  " + label))
+		}
+		b.WriteString(marker)
+		if i < len(items)-1 {
+			b.WriteString("\n")
+		}
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		Width(colWidth).
 		Padding(0, 1)
-	dimStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Padding(0, 1)
-
-	customMode := m.IsCustomPath()
-	rows := make([]string, 0, len(m.worktrees))
-	for i, p := range m.worktrees {
-		// Show the basename (e.g. "MAIA.worker-2") — full path is in maiaReposDir.
-		display := filepath.Base(p)
-		switch {
-		case customMode:
-			// Typed path overrides selection; dim the list to signal that.
-			rows = append(rows, dimStyle.Render(display))
-		case i == m.cursor:
-			rows = append(rows, selStyle.Render(display))
-		default:
-			rows = append(rows, rowStyle.Render(display))
-		}
+	if focused {
+		box = box.BorderForeground(ColorAccent)
+	} else {
+		box = box.BorderForeground(ColorBorder)
 	}
-	return strings.Join(rows, "\n")
-}
-
-func (m *MaiaWorkerPicker) dialogWidth() int {
-	const preferred = 60
-	if m.width > 0 && m.width < preferred+10 {
-		w := m.width - 10
-		if w < 40 {
-			w = 40
-		}
-		return w
-	}
-	return preferred
+	return box.Render(b.String())
 }

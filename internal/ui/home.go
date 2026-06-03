@@ -7084,8 +7084,19 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return h, h.createRemoteSession(item.RemoteName)
 			}
 		}
+		// Mark which worktrees already host a session so the picker can park
+		// on the next open worker. Occupied = any session, regardless of
+		// status, keyed by absolute worktree path.
+		occupied := make(map[string]bool)
+		h.instancesMu.RLock()
+		for _, inst := range h.instances {
+			if inst != nil && inst.ProjectPath != "" {
+				occupied[session.ExpandPath(inst.ProjectPath)] = true
+			}
+		}
+		h.instancesMu.RUnlock()
 		h.maiaWorkerPicker.SetSize(h.width, h.height)
-		h.maiaWorkerPicker.Show()
+		h.maiaWorkerPicker.Show(occupied)
 		return h, nil
 
 	case "a":
@@ -9265,18 +9276,12 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.maiaWorkerPicker.Hide()
 		return h, nil
 	case "enter":
-		selected := h.maiaWorkerPicker.SelectedPath()
-		custom := h.maiaWorkerPicker.IsCustomPath()
+		selected, group := h.maiaWorkerPicker.Selected()
 		h.maiaWorkerPicker.Hide()
 		if selected == "" {
 			return h, nil
 		}
-		if custom {
-			// Custom path: derive group from path via the standard quickCreate flow.
-			return h, h.quickCreateSessionAt(selected)
-		}
-		// MAIA worktree pick: pin to maia/active per the user's defaults.
-		return h, h.createMaiaWorkerSession(selected)
+		return h, h.createMaiaWorkerSession(selected, group)
 	default:
 		h.maiaWorkerPicker, _ = h.maiaWorkerPicker.Update(msg)
 		return h, nil
@@ -9284,25 +9289,38 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // createMaiaWorkerSession creates a Claude session rooted at the given MAIA
-// worktree path with group=maia/active and an auto-generated name. Wraps
-// createSessionInGroupWithWorktreeAndOptions with the user's preferred
-// defaults for the simple new-session flow.
-func (h *Home) createMaiaWorkerSession(projectPath string) tea.Cmd {
+// worktree path in the given group, with the user's preferred defaults for
+// the simple new-session flow.
+//
+// Naming differs by worktree kind: workers get a path-derived name
+// (worker-N, which is unique per worktree), while ro-dev sessions get an
+// auto-generated adjective-noun name — every ro-dev session shares the same
+// "MAIA.ro-dev" folder, so a path-derived name would make them all identical
+// (and the label engine intentionally prefers the name/broadcast for ro-dev,
+// per nameFirstWorktreePrefixes).
+func (h *Home) createMaiaWorkerSession(projectPath, group string) tea.Cmd {
 	tool := session.GetDefaultTool()
 	if tool == "" {
 		tool = "claude"
 	}
 	command := tool
 
-	preferred := deriveSessionNameFromPath(projectPath)
+	if group == "" {
+		group = maiaWorkerGroup
+	}
 	h.instancesMu.RLock()
-	name := ensureUniqueSessionTitle(preferred, h.instances)
+	var name string
+	if group == maiaRoDevGroup {
+		name = session.GenerateUniqueSessionName(h.instances, group)
+	} else {
+		name = ensureUniqueSessionTitle(deriveSessionNameFromPath(projectPath), h.instances)
+	}
 	h.instancesMu.RUnlock()
 
 	return h.createSessionInGroupWithWorktreeAndOptions(
 		name, projectPath, command,
-		"maia/active", // pinned group per user's workflow
-		"", "", "",    // no worktree (path is already a pre-created worktree)
+		group,
+		"", "", "", // no worktree (path is already a pre-created worktree)
 		false, false, nil,
 		nil, // no extra claude args
 		"",  // no claude startup query
