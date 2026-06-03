@@ -56,6 +56,13 @@ func TestPrimaryLabelFor_Precedence(t *testing.T) {
 			wantKind: primaryName,
 		},
 		{
+			name:     "MAIA-ticket title strips the MAIA- prefix",
+			inst:     &session.Instance{Title: "MAIA-2213 migrate user-fields", ProjectPath: "/x/MAIA.worker-6"},
+			st:       sessionRenderState{branch: "ck/MAIA-2213-migrate"},
+			wantText: "2213 migrate user-fields",
+			wantKind: primaryName,
+		},
+		{
 			name:        "worker: unique branch wins over auto name, convention stripped",
 			inst:        &session.Instance{Title: "prairie-condor", ProjectPath: "/x/MAIA.worker-3"},
 			st:          sessionRenderState{branch: "ck/MAIA-1963-register-layer"},
