@@ -1,10 +1,30 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+func TestMaiaWorkerPicker_ShellHint(t *testing.T) {
+	p := &MaiaWorkerPicker{
+		visible: true,
+		workers: []string{"/r/MAIA.worker-1"},
+		width:   80,
+		height:  24,
+	}
+	view := p.View()
+	if !strings.Contains(view, "s shell") {
+		t.Errorf("picker hint should advertise the raw-shell option; got:\n%s", view)
+	}
+	if !strings.Contains(view, "c codex") {
+		t.Errorf("picker hint should advertise the codex option; got:\n%s", view)
+	}
+	if !strings.Contains(view, "~ home") {
+		t.Errorf("picker hint should advertise the home-root option; got:\n%s", view)
+	}
+}
 
 func TestMaiaWorkerPicker_NextOpenWorker(t *testing.T) {
 	w := []string{"/r/MAIA.worker-1", "/r/MAIA.worker-2", "/r/MAIA.worker-3"}

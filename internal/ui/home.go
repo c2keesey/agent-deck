@@ -9276,21 +9276,55 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.maiaWorkerPicker.Hide()
 		return h, nil
 	case "enter":
+		// Default tool (claude unless overridden in config.toml).
+		tool := session.GetDefaultTool()
+		if tool == "" {
+			tool = "claude"
+		}
 		selected, group := h.maiaWorkerPicker.Selected()
 		h.maiaWorkerPicker.Hide()
 		if selected == "" {
 			return h, nil
 		}
-		return h, h.createMaiaWorkerSession(selected, group)
+		return h, h.createMaiaWorkerSession(selected, group, tool)
+	case "s":
+		// Raw shell: spawn a plain shell (empty command) in the highlighted
+		// worktree instead of the default tool. Mirrors the empty-command
+		// escape hatch the full NewDialog offered before this picker replaced it.
+		selected, group := h.maiaWorkerPicker.Selected()
+		h.maiaWorkerPicker.Hide()
+		if selected == "" {
+			return h, nil
+		}
+		return h, h.createMaiaWorkerSession(selected, group, "")
+	case "c":
+		// Codex, always in YOLO mode (see createMaiaWorkerSession).
+		selected, group := h.maiaWorkerPicker.Selected()
+		h.maiaWorkerPicker.Hide()
+		if selected == "" {
+			return h, nil
+		}
+		return h, h.createMaiaWorkerSession(selected, group, "codex")
+	case "~":
+		// Spawn the default tool (claude) rooted at the home dir — a quick
+		// scratch session outside the MAIA worktrees. Group is derived from
+		// the path by quickCreateSessionAt.
+		h.maiaWorkerPicker.Hide()
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return h, nil
+		}
+		return h, h.quickCreateSessionAt(home)
 	default:
 		h.maiaWorkerPicker, _ = h.maiaWorkerPicker.Update(msg)
 		return h, nil
 	}
 }
 
-// createMaiaWorkerSession creates a Claude session rooted at the given MAIA
-// worktree path in the given group, with the user's preferred defaults for
-// the simple new-session flow.
+// createMaiaWorkerSession creates a session rooted at the given MAIA worktree
+// path in the given group, running the given command. An empty command yields
+// a plain shell session; "codex" always launches in YOLO mode (the MAIA flow
+// trusts these worktrees, so codex skips approvals + sandbox).
 //
 // Naming differs by worktree kind: workers get a path-derived name
 // (worker-N, which is unique per worktree), while ro-dev sessions get an
@@ -9298,16 +9332,18 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // "MAIA.ro-dev" folder, so a path-derived name would make them all identical
 // (and the label engine intentionally prefers the name/broadcast for ro-dev,
 // per nameFirstWorktreePrefixes).
-func (h *Home) createMaiaWorkerSession(projectPath, group string) tea.Cmd {
-	tool := session.GetDefaultTool()
-	if tool == "" {
-		tool = "claude"
-	}
-	command := tool
-
+func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.Cmd {
 	if group == "" {
 		group = maiaWorkerGroup
 	}
+
+	// Codex always runs YOLO in the MAIA flow.
+	var toolOptionsJSON json.RawMessage
+	if command == "codex" {
+		yolo := true
+		toolOptionsJSON, _ = session.MarshalToolOptions(&session.CodexOptions{YoloMode: &yolo})
+	}
+
 	h.instancesMu.RLock()
 	var name string
 	if group == maiaRoDevGroup {
@@ -9321,7 +9357,7 @@ func (h *Home) createMaiaWorkerSession(projectPath, group string) tea.Cmd {
 		name, projectPath, command,
 		group,
 		"", "", "", // no worktree (path is already a pre-created worktree)
-		false, false, nil,
+		false, false, toolOptionsJSON,
 		nil, // no extra claude args
 		"",  // no claude startup query
 		"",  // no explicit model override

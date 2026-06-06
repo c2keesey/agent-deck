@@ -195,7 +195,7 @@ func (m *MaiaWorkerPicker) View() string {
 	}
 
 	hint := lipgloss.NewStyle().Foreground(ColorComment).
-		Render("↑/↓ pick · ←/→ column · Enter create · Esc cancel")
+		Render("↑/↓ pick · ←/→ column · Enter create · c codex · s shell · ~ home · Esc cancel")
 
 	content := lipgloss.JoinVertical(lipgloss.Left, title, "", body, "", hint)
 	dialog := DialogBoxStyle.Render(content)
