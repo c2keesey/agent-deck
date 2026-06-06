@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +37,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.46" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.47" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -339,6 +338,9 @@ func main() {
 			return
 		case "gemini-hooks":
 			handleGeminiHooks(args[1:])
+			return
+		case "hermes-hooks":
+			handleHermesHooks(args[1:])
 			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
@@ -2959,6 +2961,7 @@ func printHelp() {
 	fmt.Println("  skill            Manage project skills")
 	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
 	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
+	fmt.Println("  hermes-hooks     Manage Hermes Agent hook integration")
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
@@ -2976,7 +2979,7 @@ func printHelp() {
 	fmt.Println("  session start <id>        Start a session's tmux process")
 	fmt.Println("  session stop <id>         Stop session process")
 	fmt.Println("  session restart <id>      Restart session (reload MCPs)")
-	fmt.Println("  session fork <id>         Fork Claude session with context")
+	fmt.Println("  session fork <id>         Fork Claude or Pi session with context")
 	fmt.Println("  session attach <id>       Attach to session interactively")
 	fmt.Println("  session show [id]         Show session details")
 	fmt.Println()
@@ -3000,6 +3003,9 @@ func printHelp() {
 	fmt.Println("  gemini-hooks install      Install Gemini hooks")
 	fmt.Println("  gemini-hooks uninstall    Remove Gemini hooks")
 	fmt.Println("  gemini-hooks status       Show Gemini hooks install status")
+	fmt.Println("  hermes-hooks install      Install Hermes Agent hooks")
+	fmt.Println("  hermes-hooks uninstall    Remove Hermes Agent hooks")
+	fmt.Println("  hermes-hooks status       Show Hermes hooks install status")
 	fmt.Println()
 	fmt.Println("Group Commands:")
 	fmt.Println("  group list                List all groups")
@@ -3091,44 +3097,15 @@ func truncate(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
-// detectTool determines the tool type from command
+// detectTool determines the tool type from a command string.
+//
+// Thin wrapper over the unified tool registry (issue #1258). The detection
+// heuristics that used to live in the switch below — including the "open-code"
+// alias for opencode and the whitespace-token match for short names like "pi" —
+// now live as per-entry data in internal/session/builtins.go and are applied by
+// Registry.Match(). Kept as a one-liner so existing callers don't churn.
 func detectTool(cmd string) string {
-	// Check custom tools first (exact match on original case)
-	if session.GetToolDef(cmd) != nil {
-		return cmd
-	}
-
-	cmd = strings.ToLower(cmd)
-	switch {
-	case strings.Contains(cmd, "claude"):
-		return "claude"
-	case strings.Contains(cmd, "opencode") || strings.Contains(cmd, "open-code"):
-		return "opencode"
-	case strings.Contains(cmd, "gemini"):
-		return "gemini"
-	case strings.Contains(cmd, "codex"):
-		return "codex"
-	case hasCommandToken(cmd, "pi"):
-		return "pi"
-	case strings.Contains(cmd, "copilot"):
-		return "copilot"
-	case strings.Contains(cmd, "crush"):
-		return "crush"
-	case strings.Contains(cmd, "cursor"):
-		return "cursor"
-	case strings.Contains(cmd, "hermes"):
-		return "hermes"
-	default:
-		return "shell"
-	}
-}
-
-// hasCommandToken reports whether `want` appears as a whitespace-delimited
-// token in `cmd` (case-insensitive). Used for short, ambiguous tool names
-// like "pi" where strings.Contains would falsely match "epic", "tapioca",
-// etc. Longer names like "copilot" or "claude" don't need this.
-func hasCommandToken(cmd, want string) bool {
-	return slices.Contains(strings.Fields(strings.ToLower(cmd)), want)
+	return session.MatchTool(cmd)
 }
 
 // handleUninstall removes agent-deck from the system

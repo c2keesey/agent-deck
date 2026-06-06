@@ -162,6 +162,7 @@ type NewDialog struct {
 	claudeOptions         *ClaudeOptionsPanel // Claude-specific options (concrete for value extraction).
 	geminiOptions         *YoloOptionsPanel   // Gemini YOLO panel (concrete for value extraction).
 	codexOptions          *YoloOptionsPanel   // Codex YOLO panel (concrete for value extraction).
+	hermesOptions         *YoloOptionsPanel   // Hermes YOLO panel (concrete for value extraction).
 	toolOptions           OptionsPanel        // Currently active tool options panel (nil if none).
 	focusTargets          []focusTarget       // Ordered list of active focusable elements.
 	focusIndex            int                 // Index into focusTargets.
@@ -231,6 +232,7 @@ type dialogSnapshot struct {
 	geminiYolo       bool
 	codexYolo        bool
 	codexHappy       bool
+	hermesYolo       bool
 	multiRepoEnabled bool
 	multiRepoPaths   []string
 	conductorCursor  int
@@ -248,12 +250,17 @@ func displayCommandPreset(cmd string) string {
 
 // buildPresetCommands returns the list of commands for the picker,
 // including any custom tools from config.toml.
+//
+// When show_only_installed_tools is on (issue #1259) the list is filtered down
+// to tools whose command resolves on PATH; "" (shell) is always kept. With the
+// flag off FilterVisibleToolNames is a no-op, so the list is byte-identical to
+// before.
 func buildPresetCommands() []string {
 	presets := []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes"}
 	if customTools := session.GetCustomToolNames(); len(customTools) > 0 {
 		presets = append(presets, customTools...)
 	}
-	return presets
+	return session.FilterVisibleToolNames(presets)
 }
 
 // buildInheritedSettings returns display pairs for non-default Docker config values.
@@ -331,6 +338,7 @@ func NewNewDialog() *NewDialog {
 		claudeOptions:   NewClaudeOptionsPanel(),
 		geminiOptions:   NewYoloOptionsPanel("Gemini", "YOLO mode - auto-approve all", false),
 		codexOptions:    NewYoloOptionsPanel("Codex", "YOLO mode - bypass approvals and sandbox", false),
+		hermesOptions:   NewYoloOptionsPanel("Hermes", "YOLO mode - auto-approve all tool calls", false),
 		focusIndex:      0,
 		visible:         false,
 		presetCommands:  buildPresetCommands(),
@@ -419,9 +427,11 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 	// Initialize tool options from global config.
 	d.geminiOptions.SetDefaults(false)
 	d.codexOptions.SetDefaults(false)
+	d.hermesOptions.SetDefaults(false)
 	if userConfig, err := session.LoadUserConfig(); err == nil && userConfig != nil {
 		d.geminiOptions.SetDefaults(userConfig.Gemini.YoloMode)
 		d.codexOptions.SetDefaults(userConfig.Codex.YoloMode)
+		d.hermesOptions.SetDefaults(userConfig.Hermes.YoloMode)
 		d.claudeOptions.SetDefaults(userConfig)
 		d.sandboxEnabled = userConfig.Docker.DefaultEnabled
 		d.worktreeEnabled = userConfig.Worktree.DefaultEnabled
@@ -639,6 +649,7 @@ func (d *NewDialog) saveSnapshot() *dialogSnapshot {
 		geminiYolo:       d.geminiOptions.GetYoloMode(),
 		codexYolo:        d.codexOptions.GetYoloMode(),
 		codexHappy:       d.codexOptions.GetUseHappy(),
+		hermesYolo:       d.hermesOptions.GetYoloMode(),
 		multiRepoEnabled: d.multiRepoEnabled,
 		multiRepoPaths:   append([]string{}, d.multiRepoPaths...),
 		conductorCursor:  d.conductorCursor,
@@ -662,6 +673,7 @@ func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
 	}
 	d.geminiOptions.SetDefaults(s.geminiYolo)
 	d.codexOptions.SetDefaults(s.codexYolo, s.codexHappy)
+	d.hermesOptions.SetDefaults(s.hermesYolo)
 	d.multiRepoEnabled = s.multiRepoEnabled
 	d.multiRepoPaths = append([]string{}, s.multiRepoPaths...)
 	d.multiRepoPathCursor = 0
@@ -994,6 +1006,11 @@ func (d *NewDialog) GetCodexYoloMode() bool {
 	return d.codexOptions.GetYoloMode()
 }
 
+// GetHermesYoloMode returns the Hermes YOLO mode state
+func (d *NewDialog) GetHermesYoloMode() bool {
+	return d.hermesOptions.GetYoloMode()
+}
+
 // IsSandboxEnabled returns whether Docker sandbox mode is enabled.
 func (d *NewDialog) IsSandboxEnabled() bool {
 	return d.sandboxEnabled
@@ -1282,6 +1299,8 @@ func (d *NewDialog) updateToolOptions() {
 		d.toolOptions = d.geminiOptions
 	case cmd == "codex":
 		d.toolOptions = d.codexOptions
+	case cmd == "hermes":
+		d.toolOptions = d.hermesOptions
 	default:
 		d.toolOptions = nil
 	}
@@ -1297,6 +1316,7 @@ func (d *NewDialog) updateFocus() {
 	d.claudeOptions.Blur()
 	d.geminiOptions.Blur()
 	d.codexOptions.Blur()
+	d.hermesOptions.Blur()
 
 	// Reset dropdown and soft-select state when focus changes.
 	d.pathSoftSelected = false
@@ -1973,7 +1993,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 		case "y":
 			if !d.isTextInputFocused() {
 				selectedCmd := d.GetSelectedCommand()
-				if cur == focusCommand && (selectedCmd == "gemini" || selectedCmd == "codex") && d.toolOptions != nil {
+				if cur == focusCommand && (selectedCmd == "gemini" || selectedCmd == "codex" || selectedCmd == "hermes") && d.toolOptions != nil {
 					d.toolOptions.Update(msg)
 					return d, nil
 				}
@@ -2335,7 +2355,18 @@ func (d *NewDialog) View() string {
 		cmdButtons = append(cmdButtons, btnStyle.Render(displayName))
 	}
 	content.WriteString(lipgloss.JoinHorizontal(lipgloss.Left, cmdButtons...))
-	content.WriteString("\n\n")
+	content.WriteString("\n")
+
+	// show_only_installed_tools empty-fallback hint (issue #1259): when the
+	// filter is on but nothing other than shell resolved on PATH we show the full
+	// list instead of trapping the user, and explain why here.
+	if session.ToolFilterFallbackActive() {
+		hintStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true)
+		content.WriteString("  ")
+		content.WriteString(hintStyle.Render("No tools matched PATH; showing all. Set show_only_installed_tools = false to silence."))
+		content.WriteString("\n")
+	}
+	content.WriteString("\n")
 
 	// Custom command input (only if shell is selected)
 	if d.commandCursor == 0 {
@@ -2530,7 +2561,7 @@ func (d *NewDialog) View() string {
 		}
 	} else if cur == focusCommand {
 		selectedCmd := d.GetSelectedCommand()
-		if selectedCmd == "gemini" || selectedCmd == "codex" {
+		if selectedCmd == "gemini" || selectedCmd == "codex" || selectedCmd == "hermes" {
 			helpText = "←→ command │ w worktree │ s sandbox │ y yolo │ Tab next │ Enter create │ Esc cancel"
 		} else {
 			helpText = "←→ command │ w worktree │ s sandbox │ Tab next │ Enter create │ Esc cancel"

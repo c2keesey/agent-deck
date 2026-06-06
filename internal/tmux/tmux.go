@@ -679,6 +679,8 @@ type StateTracker struct {
 	activityCheckStart  time.Time // When we started tracking for sustained activity
 	activityChangeCount int       // How many timestamp changes seen in current window
 
+	realActivityConfirmed bool // true once a real busy spike has been observed (not just tracker init)
+
 	// Spinner activity tracking: grace period between tool calls
 	spinnerTracker *SpinnerActivityTracker
 }
@@ -823,6 +825,20 @@ type Session struct {
 	// process instead of sending it via SendKeysAndEnter after session creation.
 	// Sandbox sessions enable this so pane-dead detection can restart exited tools.
 	RunCommandAsInitialProcess bool
+
+	// VimMode guarantees the inner agent's input composer is in insert mode
+	// before any text/Enter is delivered. When the inner tool (Claude Code with
+	// `"editorMode": "vim"`) leaves its prompt in vim NORMAL mode — the default
+	// state after a turn finishes — a bracketed paste still lands in the input
+	// widget, but the trailing Enter is interpreted as a navigation keystroke
+	// instead of submit, so the message is typed but never sent (issue #1264).
+	// When true, SendEnter and SendKeysAndEnter prepend an Escape + `i` sequence
+	// so the prompt is guaranteed to be in insert mode. The sequence is
+	// idempotent: Escape always lands in normal mode and `i` always enters
+	// insert, so it is safe even when the prompt is already in insert mode.
+	// Off by default (zero value) — non-vim sessions and other tools are
+	// unaffected. Populated at session-creation time from [claude].vim_mode.
+	VimMode bool
 
 	// LaunchInUserScope starts the tmux server through systemd-run --user --scope
 	// so the server is owned by the user's systemd manager instead of the current
@@ -2893,6 +2909,7 @@ func (s *Session) GetStatus() (string, error) {
 			s.mu.Lock()
 			s.ensureStateTrackerLocked()
 			s.stateTracker.lastChangeTime = time.Now()
+			s.stateTracker.realActivityConfirmed = true
 			s.stateTracker.acknowledged = false
 			s.resetPromptNoBusyHoldLocked()
 			s.stateTracker.spinnerTracker.MarkBusy()
@@ -2989,6 +3006,7 @@ func (s *Session) GetStatus() (string, error) {
 			// false "waiting" detection during tool transitions.
 			if isExplicitlyBusy {
 				s.stateTracker.lastChangeTime = time.Now()
+				s.stateTracker.realActivityConfirmed = true
 				s.stateTracker.acknowledged = false
 				s.resetPromptNoBusyHoldLocked()
 				s.stateTracker.lastActivityTimestamp = currentTS
@@ -3135,6 +3153,7 @@ func (s *Session) GetStatus() (string, error) {
 					// terminal redraws, and status bar updates can cause hash changes
 					if isExplicitlyBusy {
 						s.stateTracker.lastChangeTime = now
+						s.stateTracker.realActivityConfirmed = true
 						s.stateTracker.acknowledged = false
 						s.resetPromptNoBusyHoldLocked()
 						s.stateTracker.activityCheckStart = time.Time{} // Reset window
@@ -3336,6 +3355,7 @@ func (s *Session) getStatusFallback() (string, error) {
 		defer s.mu.Unlock()
 		s.ensureStateTrackerLocked()
 		s.stateTracker.lastChangeTime = time.Now()
+		s.stateTracker.realActivityConfirmed = true
 		s.stateTracker.acknowledged = false
 		s.resetPromptNoBusyHoldLocked()
 		s.lastStableStatus = "active"
@@ -3525,6 +3545,21 @@ func (s *Session) GetLastActivityTime() time.Time {
 		return time.Time{}
 	}
 	return s.stateTracker.lastChangeTime
+}
+
+// LastObservedActivity returns the last time a real busy spike was
+// observed for this tracker, plus a bool reporting whether such a spike
+// has ever happened in this tracker's lifetime. When the bool is false
+// the time is the zero value, so callers that miss the bool check still
+// get a sentinel they can detect.
+func (s *Session) LastObservedActivity() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.stateTracker == nil || !s.stateTracker.realActivityConfirmed {
+		return time.Time{}, false
+	}
+	return s.stateTracker.lastChangeTime, true
 }
 
 // GetWaitingSince returns when the session transitioned to waiting status
@@ -3987,6 +4022,13 @@ func (s *Session) hashContent(content string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// keySenderExec is a swappable seam for the tmux subprocesses spawned by the
+// SendKeys / SendEnter / SendNamedKey key-delivery primitives. It defaults to
+// tmuxExec (the real `tmux` binary) in production; tests override it to record
+// the exact key sequence emitted without standing up a real tmux server. See
+// the vim-mode regression test in tmux_vim_mode_test.go (issue #1264).
+var keySenderExec = tmuxExec
+
 // SendKeys sends keys to the tmux session
 // Uses -l flag to treat keys as literal text, preventing tmux special key interpretation
 func (s *Session) SendKeys(keys string) error {
@@ -3994,15 +4036,44 @@ func (s *Session) SendKeys(keys string) error {
 	// The -l flag makes tmux treat the string as literal text, not key names
 	// This prevents issues like "Enter" being interpreted as the Enter key
 	// and provides a layer of safety against tmux special sequences
-	cmd := s.tmuxCmd("send-keys", "-l", "-t", s.Name, "--", keys)
+	cmd := keySenderExec(s.SocketName, "send-keys", "-l", "-t", s.Name, "--", keys)
 	return cmd.Run()
 }
 
-// SendEnter sends an Enter key to the tmux session
-func (s *Session) SendEnter() error {
+// ensureInsertMode prepends an Escape + `i` sequence so a vim-mode composer
+// (Claude Code with "editorMode": "vim") is guaranteed to be in insert mode
+// before text or Enter is delivered. No-op unless VimMode is set. The sequence
+// is idempotent — Escape lands in normal mode, `i` enters insert — so it is
+// safe to call when the prompt is already in insert mode. See issue #1264.
+func (s *Session) ensureInsertMode() {
+	if !s.VimMode {
+		return
+	}
+	// Escape: guarantee normal mode regardless of current state.
+	_ = keySenderExec(s.SocketName, "send-keys", "-t", s.Name, "Escape").Run()
+	// i: enter insert mode so the following paste/Enter are taken literally.
+	_ = keySenderExec(s.SocketName, "send-keys", "-t", s.Name, "i").Run()
+}
+
+// sendEnterRaw emits a single Enter keystroke without the vim-mode insert
+// guard. Used internally by SendKeysAndEnter, which has already guaranteed
+// insert mode before the paste — re-escaping before the trailing Enter would
+// drop the prompt back to normal mode and swallow the submit.
+func (s *Session) sendEnterRaw() error {
 	s.invalidateCache()
-	cmd := s.tmuxCmd("send-keys", "-t", s.Name, "Enter")
+	cmd := keySenderExec(s.SocketName, "send-keys", "-t", s.Name, "Enter")
 	return cmd.Run()
+}
+
+// SendEnter sends an Enter key to the tmux session. When VimMode is set it
+// first guarantees the composer is in insert mode (issue #1264) so the Enter
+// submits the message instead of being consumed as a vim normal-mode motion.
+// This covers the bare-Enter nudges the send-verify retry loop fires against a
+// detected unsent prompt (cmd/agent-deck/session_cmd.go), which would
+// otherwise all no-op in normal mode.
+func (s *Session) SendEnter() error {
+	s.ensureInsertMode()
+	return s.sendEnterRaw()
 }
 
 // OpenKeySender opens a persistent tmux control-mode client bound to this
@@ -4021,7 +4092,7 @@ func (s *Session) OpenKeySender() (KeySender, error) {
 // Backspace, arrow keys, Tab, and Ctrl-{C,D} from the TUI to the focused pane.
 func (s *Session) SendNamedKey(key string) error {
 	s.invalidateCache()
-	cmd := s.tmuxCmd("send-keys", "-t", s.Name, key)
+	cmd := keySenderExec(s.SocketName, "send-keys", "-t", s.Name, key)
 	return cmd.Run()
 }
 
@@ -4032,6 +4103,10 @@ func (s *Session) SendNamedKey(key string) error {
 // marker and gets swallowed by async TUI frameworks (Ink/Node.js, curses).
 func (s *Session) SendKeysAndEnter(keys string) error {
 	s.invalidateCache()
+	// Guarantee the composer is in insert mode BEFORE the paste so a vim
+	// normal-mode prompt doesn't interpret the message body as motion/command
+	// keystrokes (issue #1264). No-op unless VimMode is set.
+	s.ensureInsertMode()
 	// Use chunked sending for large messages to avoid tmux buffer limits
 	if err := s.SendKeysChunked(keys); err != nil {
 		return err
@@ -4040,7 +4115,10 @@ func (s *Session) SendKeysAndEnter(keys string) error {
 	// before Enter arrives. Without this, tmux 3.2+ paste sequences cause
 	// the immediately-following Enter to be swallowed by the paste handler.
 	time.Sleep(100 * time.Millisecond)
-	return s.SendEnter()
+	// sendEnterRaw (not SendEnter): we already guaranteed insert mode above and
+	// the paste keeps us in insert; re-escaping here would drop back to normal
+	// mode and swallow the submit.
+	return s.sendEnterRaw()
 }
 
 // SendKeysChunked sends large content to the tmux session in chunks to avoid

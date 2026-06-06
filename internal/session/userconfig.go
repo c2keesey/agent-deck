@@ -26,6 +26,19 @@ import (
 // UserConfigFileName is the TOML config file for user preferences
 const UserConfigFileName = "config.toml"
 
+// ErrRefusingConfigSectionDrop is returned by SaveUserConfig when the config it
+// is asked to write would empty an entire top-level section ([mcps] or [groups])
+// that currently has entries on disk. These are the exact sections lost in the
+// 2026-06-04 data-loss incident: a partially-constructed config saved over the
+// live file silently dropped the whole MCP catalog and group overrides.
+//
+// S3 data-loss safeguard: a save that zeroes a populated section is almost
+// always a bug in the caller (it built a config without loading the existing
+// one), not a deliberate "clear everything". Refuse it. A caller that genuinely
+// means to clear all MCPs/groups must go through SaveUserConfigWithIntent with
+// allowSectionDrop=true so the destructive intent is explicit and greppable.
+var ErrRefusingConfigSectionDrop = fmt.Errorf("session: refusing to save config.toml that would drop a populated [mcps] or [groups] section to empty (use SaveUserConfigWithIntent to intentionally clear)")
+
 // UserConfig represents user-facing configuration in TOML format
 type UserConfig struct {
 	// DefaultTool is the pre-selected AI tool when creating new sessions
@@ -220,6 +233,15 @@ type UISettings struct {
 	// cadence that reconciles the list. Valid range: 5-300. Default: 15s,
 	// tightening the visibility latency reported on v1.9.30.
 	RemoteSessionRefreshSecs int `toml:"remote_session_refresh_secs"`
+
+	// ShowOnlyInstalledTools, when true, hides tools from the new-session
+	// dialogs (TUI + web) whose command does not resolve on the host PATH
+	// (issue #1259). Default false: no PATH probing happens and the dialogs are
+	// byte-identical to before. shell is always shown; if nothing else resolves
+	// the dialog falls back to showing all tools plus a one-line hint. This is a
+	// display filter only — `agent-deck launch -c <tool>` still spawns a hidden
+	// tool.
+	ShowOnlyInstalledTools bool `toml:"show_only_installed_tools"`
 }
 
 // DefaultPreviewPct is the default preview-pane width percentage.
@@ -405,6 +427,8 @@ type ProfileCodexSettings struct {
 type GroupSettings struct {
 	// Claude defines Claude Code overrides for a specific group.
 	Claude GroupClaudeSettings `toml:"claude"`
+	// Hermes defines Hermes overrides for a specific group.
+	Hermes GroupHermesSettings `toml:"hermes"`
 }
 
 // GroupClaudeSettings defines group-specific Claude overrides.
@@ -414,6 +438,16 @@ type GroupClaudeSettings struct {
 
 	// EnvFile overrides [claude].env_file for sessions in this group.
 	EnvFile string `toml:"env_file"`
+}
+
+// GroupHermesSettings defines group-specific Hermes overrides.
+type GroupHermesSettings struct {
+	Command      string `toml:"command"`
+	EnvFile      string `toml:"env_file"`
+	YoloMode     bool   `toml:"yolo_mode"`
+	GatewayURL   string `toml:"gateway_url"`
+	DashboardURL string `toml:"dashboard_url"`
+	APITokenEnv  string `toml:"api_token_env"`
 }
 
 // ConductorOverrides defines per-conductor configuration overrides.
@@ -428,6 +462,8 @@ type GroupClaudeSettings struct {
 type ConductorOverrides struct {
 	// Claude defines Claude Code overrides for a specific conductor.
 	Claude ConductorClaudeSettings `toml:"claude"`
+	// Hermes defines Hermes overrides for a specific conductor.
+	Hermes ConductorHermesSettings `toml:"hermes"`
 }
 
 // ConductorClaudeSettings defines conductor-specific Claude overrides.
@@ -441,6 +477,16 @@ type ConductorClaudeSettings struct {
 	// EnvFile is sourced before claude exec for this conductor.
 	// Matches CFG-03 semantics — missing file logs a warning, does not block.
 	EnvFile string `toml:"env_file"`
+}
+
+// ConductorHermesSettings defines conductor-specific Hermes overrides.
+type ConductorHermesSettings struct {
+	Command      string `toml:"command"`
+	EnvFile      string `toml:"env_file"`
+	YoloMode     bool   `toml:"yolo_mode"`
+	GatewayURL   string `toml:"gateway_url"`
+	DashboardURL string `toml:"dashboard_url"`
+	APITokenEnv  string `toml:"api_token_env"`
 }
 
 // MCPPoolSettings defines HTTP MCP pool configuration
@@ -702,6 +748,15 @@ type ShellSettings struct {
 	// Default: false (opt-in). Issue #1161, design doc
 	// docs/decisions/1161-exit-to-shell-then-resume.md.
 	ExitToShell *bool `toml:"exit_to_shell"`
+
+	// LaunchShell, when true, wraps agent spawn commands with an interactive
+	// shell invocation so that environment variables from ~/.zshrc, ~/.bashrc
+	// etc. are available to the agent process. This solves the issue where
+	// OpenCode MCP configs with {env:VAR} references fail when launched from
+	// the TUI because the agent doesn't inherit the interactive shell's
+	// environment.
+	// Default: false (opt-in). Issue #1218.
+	LaunchShell *bool `toml:"launch_shell"`
 }
 
 // GetIgnoreMissingEnvFiles returns whether to ignore missing env files, defaulting to true
@@ -719,6 +774,16 @@ func (s *ShellSettings) GetExitToShell() bool {
 		return false // Default: OFF (preserve current exit/resume behavior)
 	}
 	return *s.ExitToShell
+}
+
+// GetLaunchShell returns whether agent commands should be wrapped with a shell
+// invocation that loads startup files before launch, defaulting to false
+// (opt-in). Issue #1218.
+func (s *ShellSettings) GetLaunchShell() bool {
+	if s.LaunchShell == nil {
+		return false // Default: OFF (preserve current direct spawn behavior)
+	}
+	return *s.LaunchShell
 }
 
 // GetShowAnalytics returns whether to show analytics, defaulting to false
@@ -897,6 +962,24 @@ type ClaudeSettings struct {
 	// otherwise sit frozen on the picker forever (closes #67).
 	// Default: true (nil = use default true, set false to disable).
 	AutoResumeSummary *bool `toml:"auto_resume_summary"`
+
+	// VimMode tells agent-deck the inner Claude Code prompt uses vim keybindings
+	// ("editorMode": "vim"). When true, every message send guarantees the
+	// composer is in insert mode (Escape + `i`) before delivering text/Enter, so
+	// a message sent while the prompt sits in vim NORMAL mode (the default state
+	// after a turn finishes) actually submits instead of being typed-but-unsent
+	// (issue #1264). Off by default — only enable for sessions running Claude
+	// Code with vim editor mode. Other tools and non-vim Claude are unaffected.
+	VimMode bool `toml:"vim_mode"`
+}
+
+// GetVimMode reports whether vim-mode insert-guard sends are enabled. Off by
+// default (issue #1264).
+func (c *ClaudeSettings) GetVimMode() bool {
+	if c == nil {
+		return false
+	}
+	return c.VimMode
 }
 
 // GetProfileClaudeConfigDir returns the profile-specific Claude config directory, if configured.
@@ -944,6 +1027,21 @@ func (c *UserConfig) GetGroupClaudeEnvFile(groupPath string) string {
 	return ""
 }
 
+// GetGroupHermesEnvFile returns the group-specific Hermes env file, walking
+// ancestor groups when the exact path has no override. Mirrors
+// GetGroupClaudeEnvFile's inheritance semantics.
+func (c *UserConfig) GetGroupHermesEnvFile(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.Hermes.EnvFile != "" {
+			return groupCfg.Hermes.EnvFile
+		}
+	}
+	return ""
+}
+
 // GetConductorClaudeConfigDir returns the conductor-specific Claude config
 // directory, if configured. Keyed by conductor name (Instance.Title minus
 // "conductor-" prefix — single source of truth is conductorNameFromInstance
@@ -973,6 +1071,19 @@ func (c *UserConfig) GetConductorClaudeEnvFile(name string) string {
 		return ""
 	}
 	return conductorCfg.Claude.EnvFile
+}
+
+// GetConductorHermesEnvFile returns the conductor-specific Hermes env_file,
+// if configured. Mirrors GetConductorClaudeEnvFile.
+func (c *UserConfig) GetConductorHermesEnvFile(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok || conductorCfg.Hermes.EnvFile == "" {
+		return ""
+	}
+	return conductorCfg.Hermes.EnvFile
 }
 
 // GetDangerousMode returns whether dangerous mode is enabled, defaulting to true
@@ -1117,6 +1228,18 @@ type HermesSettings struct {
 	// YoloMode enables --yolo flag for Hermes sessions (auto-approve all tool calls).
 	// Default: false
 	YoloMode bool `toml:"yolo_mode"`
+	// GatewayURL is the WebSocket URL of the Hermes gateway for health checks.
+	// Default: "" (no gateway health check)
+	GatewayURL string `toml:"gateway_url"`
+	// DashboardURL is the Hermes dashboard API endpoint.
+	// Default: "" (dashboard integration disabled)
+	DashboardURL string `toml:"dashboard_url"`
+	// APITokenEnv is the environment variable name containing the Hermes API token.
+	// Default: "" (uses HERMES_API_TOKEN if set)
+	APITokenEnv string `toml:"api_token_env"`
+	// WorkspaceDir is the base directory for Hermes shared workspace sessions.
+	// Default: "" (uses os.TempDir()/hermes-workspaces)
+	WorkspaceDir string `toml:"workspace_dir"`
 }
 
 // CrushSettings defines charmbracelet/crush CLI configuration (Issue #940).
@@ -1831,6 +1954,11 @@ type DisplaySettings struct {
 	// preserves the historical format; set false to show only the session
 	// title. Consumed by the tmux set-titles-string builder.
 	IncludeCwdPrefix *bool `toml:"include_cwd_prefix"`
+
+	// ShowSessionTimestamps appends a dim "Nm ago" badge to every session row.
+	// Default: false — opt-in to avoid crowding existing badges. See
+	// renderSessionItem for the timestamp source.
+	ShowSessionTimestamps bool `toml:"show_session_timestamps"`
 }
 
 // GetActiveFilterExcludes returns the resolved set of statuses the % filter
@@ -2025,9 +2153,28 @@ func ReloadUserConfig() (*UserConfig, error) {
 	return LoadUserConfig()
 }
 
-// SaveUserConfig writes the config to config.toml using atomic write pattern
-// This clears the cache so next LoadUserConfig() reads fresh values
+// SaveUserConfig writes the config to config.toml using atomic write pattern.
+// This clears the cache so next LoadUserConfig() reads fresh values.
+//
+// Guarded path: it backs up the existing config.toml to config.toml.bak before
+// overwriting (S2) and REFUSES a save that would drop a populated [mcps] or
+// [groups] section to empty (S3, ErrRefusingConfigSectionDrop). Both are
+// data-loss safeguards from the 2026-06-04 incident. Callers that genuinely
+// intend to clear all MCPs/groups must use SaveUserConfigWithIntent.
 func SaveUserConfig(config *UserConfig) error {
+	return SaveUserConfigWithIntent(config, false)
+}
+
+// SaveUserConfigWithIntent is SaveUserConfig with an explicit opt-out of the S3
+// section-drop guard. Pass allowSectionDrop=true only when the user genuinely
+// wants to clear all [mcps] or [groups] entries; the default false path refuses
+// such a save (ErrRefusingConfigSectionDrop) because zeroing a populated section
+// is almost always a partially-built-config bug, not deliberate intent.
+//
+// The S2 config.toml.bak backup is taken on BOTH paths: the atomic rename
+// prevents torn writes but not semantic clobbering, so the .bak is the recovery
+// net regardless of intent.
+func SaveUserConfigWithIntent(config *UserConfig, allowSectionDrop bool) error {
 	configPath, err := GetUserConfigPath()
 	if err != nil {
 		return fmt.Errorf("failed to get config path: %w", err)
@@ -2054,6 +2201,33 @@ func SaveUserConfig(config *UserConfig) error {
 	encoder := toml.NewEncoder(&buf)
 	if err := encoder.Encode(config); err != nil {
 		return fmt.Errorf("failed to encode config: %w", err)
+	}
+
+	// ═══════════════════════════════════════════════════════════════════
+	// S3 data-loss safeguard (2026-06-04 incident): refuse a save that would
+	// drop a populated [mcps] or [groups] section to empty. We round-trip the
+	// content we are ABOUT to write (decode buf) and compare its section counts
+	// against what is currently on disk. The guard fires ONLY when disk had
+	// entries and the new content has zero — a normal edit that loads the
+	// config, removes ONE group, and saves still carries the rest of the map,
+	// so its count stays > 0 and is unaffected. allowSectionDrop=true (the
+	// explicit-intent path) skips the refusal but still backs up.
+	// ═══════════════════════════════════════════════════════════════════
+	if !allowSectionDrop {
+		if err := guardConfigSectionDrop(configPath, buf.Bytes()); err != nil {
+			return err
+		}
+	}
+
+	// S2 data-loss safeguard: copy the existing config.toml to config.toml.bak
+	// BEFORE the atomic rename. Atomic rename prevents torn writes but NOT
+	// semantic clobbering (e.g. saving a config missing whole sections); the
+	// .bak is the recovery net. Best-effort: a failed backup is logged, never
+	// fatal — the caller asked to save, and the insurance copy must not become
+	// a new failure mode. No-op when config.toml does not exist yet.
+	if err := backupConfigFile(configPath); err != nil {
+		slog.Warn("session: pre-save config backup failed (continuing with save)",
+			"path", configPath, "err", err)
 	}
 
 	// ═══════════════════════════════════════════════════════════════════
@@ -2087,6 +2261,64 @@ func SaveUserConfig(config *UserConfig) error {
 	// Clear cache so next load picks up changes
 	ClearUserConfigCache()
 
+	return nil
+}
+
+// guardConfigSectionDrop implements the S3 refusal: it decodes the on-disk
+// config and the about-to-be-written content, and returns
+// ErrRefusingConfigSectionDrop if either [mcps] or [groups] had entries on disk
+// but would become empty. A missing/unparseable on-disk file means there is
+// nothing populated to protect, so the guard passes (first write, or a file the
+// loader would have replaced with defaults anyway).
+func guardConfigSectionDrop(configPath string, newContent []byte) error {
+	// Nothing on disk yet → nothing to lose.
+	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
+		return nil
+	}
+
+	var onDisk UserConfig
+	if _, err := toml.DecodeFile(configPath, &onDisk); err != nil {
+		// Can't read the old file to know what's populated; don't block the
+		// save (the loader treats an unparseable file as defaults anyway).
+		return nil
+	}
+
+	var next UserConfig
+	if _, err := toml.Decode(string(newContent), &next); err != nil {
+		// We just encoded this from a *UserConfig, so a decode failure is
+		// unexpected — surface it rather than silently writing.
+		return fmt.Errorf("session: failed to round-trip new config for section-drop guard: %w", err)
+	}
+
+	if len(onDisk.MCPs) > 0 && len(next.MCPs) == 0 {
+		return fmt.Errorf("%w: [mcps] had %d entries on disk, new config has none", ErrRefusingConfigSectionDrop, len(onDisk.MCPs))
+	}
+	if len(onDisk.Groups) > 0 && len(next.Groups) == 0 {
+		return fmt.Errorf("%w: [groups] had %d entries on disk, new config has none", ErrRefusingConfigSectionDrop, len(onDisk.Groups))
+	}
+	return nil
+}
+
+// backupConfigFile copies config.toml to config.toml.bak (write-temp + rename
+// so the .bak is never torn). No-op when the source does not exist yet (first
+// save). Part of the S2 data-loss safeguard.
+func backupConfigFile(configPath string) error {
+	src, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing to back up yet
+		}
+		return err
+	}
+	bak := configPath + ".bak"
+	tmp := bak + ".tmp"
+	if err := os.WriteFile(tmp, src, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, bak); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	return nil
 }
 
@@ -2219,37 +2451,18 @@ func isShellEnvAssignment(token string) bool {
 // GetToolDef returns a tool definition from user config
 // Returns nil if tool is not defined
 func GetToolDef(toolName string) *ToolDef {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil {
-		return nil
-	}
-
-	if def, ok := config.Tools[toolName]; ok {
-		return &def
-	}
-	return nil
+	// Delegates to the registry's custom-tool lookup. GetCustom returns nil for
+	// built-in names (their shadowing custom entries are rejected at registry
+	// init), preserving this function's long-standing "nil for built-ins"
+	// contract that callers branch on. See Registry.GetCustom / Registry.Get.
+	return currentRegistry().GetCustom(toolName)
 }
 
 // GetCustomToolNames returns sorted custom tool names from config.toml,
 // excluding names that shadow built-in tools (claude, gemini, opencode, codex, pi, shell, cursor, aider).
 // Returns nil if no custom tools are configured.
 func GetCustomToolNames() []string {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil || len(config.Tools) == 0 {
-		return nil
-	}
-
-	var names []string
-	for name := range config.Tools {
-		if !isBuiltinToolName(name) {
-			names = append(names, name)
-		}
-	}
-	if len(names) == 0 {
-		return nil
-	}
-	sort.Strings(names)
-	return names
+	return currentRegistry().CustomNames()
 }
 
 // GetToolCommand returns the configured command override for a builtin tool,
@@ -2289,12 +2502,7 @@ func GetToolCommand(toolName string) string {
 }
 
 func isBuiltinToolName(toolName string) bool {
-	switch toolName {
-	case "claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "pi", "shell", "aider":
-		return true
-	default:
-		return false
-	}
+	return currentRegistry().IsBuiltin(toolName)
 }
 
 // GetToolIcon returns the icon for a tool (custom or built-in)
