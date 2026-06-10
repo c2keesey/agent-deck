@@ -38,7 +38,8 @@ func TestPadToCells(t *testing.T) {
 
 // TestPrimaryLabelFor_Precedence locks the dynamic-precedence identity
 // engine the user approved: custom name > distinguishing branch >
-// folder/worktree > Claude broadcast > auto name.
+// Claude broadcast > folder/worktree > auto name. (Broadcast now outranks
+// the folder so an active worker shows its live activity, not "worker-N".)
 func TestPrimaryLabelFor_Precedence(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -99,6 +100,32 @@ func TestPrimaryLabelFor_Precedence(t *testing.T) {
 			st:       sessionRenderState{branch: "main"},
 			wantText: "worker-8",
 			wantKind: primaryFolder,
+		},
+		{
+			// The MAIA-worker fix: an active worker shows what it's doing (live
+			// pane title) instead of its interchangeable "worker-N" folder. The
+			// folder still appears as the color chip; the broadcast wins the label.
+			name:     "worker: active pane title beats the worktree folder",
+			inst:     &session.Instance{Title: "light-thorn", ProjectPath: "/x/MAIA.worker-3"},
+			st:       sessionRenderState{branch: "main", paneTitle: "Exploring messaging"},
+			wantText: "Exploring messaging",
+			wantKind: primaryBroadcast,
+		},
+		{
+			name:     "worker: idle (no pane title) falls back to the worktree folder",
+			inst:     &session.Instance{Title: "light-thorn", ProjectPath: "/x/MAIA.worker-3"},
+			st:       sessionRenderState{branch: "main"},
+			wantText: "worker-3",
+			wantKind: primaryFolder,
+		},
+		{
+			// A distinguishing branch still outranks the broadcast.
+			name:        "worker: unique branch still beats pane title",
+			inst:        &session.Instance{Title: "light-thorn", ProjectPath: "/x/MAIA.worker-3"},
+			st:          sessionRenderState{branch: "ck/MAIA-1963-register-layer", paneTitle: "Exploring messaging"},
+			branchCount: map[string]int{"ck/MAIA-1963-register-layer": 1},
+			wantText:    "1963-register-layer",
+			wantKind:    primaryBranch,
 		},
 		{
 			name:     "no branch, no folder -> broadcast",

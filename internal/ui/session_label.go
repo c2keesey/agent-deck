@@ -73,8 +73,8 @@ func isNameFirstWorktree(key string) bool {
 //  1. Custom name      — title that isn't an auto adjective-noun.
 //  2. Distinguishing    — git branch that's unique among visible sessions
 //     branch              and not a base/trunk branch (→ workers).
-//  3. Folder/worktree   — worker-N, ro-dev-2, repo basename.
-//  4. Claude broadcast  — the live pane title.
+//  3. Claude broadcast  — the live pane title (what the agent is doing now).
+//  4. Folder/worktree   — worker-N, ro-dev-2, repo basename.
 //  5. Auto name         — adjective-noun, absolute last resort.
 //
 // branchCount is the per-render tally of how many visible sessions sit on
@@ -116,14 +116,17 @@ func primaryLabelFor(inst *session.Instance, st sessionRenderState, branchCount 
 		return primaryLabel{text: cleanBranchDisplay(b), kind: primaryBranch}
 	}
 
-	// 3. The worktree / folder it lives in.
-	if key != "" {
-		return primaryLabel{text: key, kind: primaryFolder}
-	}
-
-	// 4. Whatever Claude is broadcasting right now.
+	// 3. Whatever Claude is broadcasting right now. Live activity beats the
+	// static folder name — for a worker the user wants to see what it's doing,
+	// not which interchangeable worktree it happens to occupy. The folder is
+	// still surfaced as the color-coded worktree chip alongside this label.
 	if st.paneTitle != "" {
 		return primaryLabel{text: st.paneTitle, kind: primaryBroadcast}
+	}
+
+	// 4. The worktree / folder it lives in (fallback when nothing is live).
+	if key != "" {
+		return primaryLabel{text: key, kind: primaryFolder}
 	}
 
 	// 5. Fall back to the auto name so the row is never nameless.

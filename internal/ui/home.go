@@ -6097,6 +6097,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			parentSessionID,
 			parentProjectPath,
 			tempID,
+			false, // never lock auto/derived titles on the standard create path
 		)
 
 	case msg.String() == "esc":
@@ -7803,6 +7804,7 @@ func (h *Home) confirmCreateDirectory() tea.Cmd {
 		parentSessionID,
 		parentProjectPath,
 		"", // no placeholder — non-worktree sessions are fast
+		false,
 	)
 }
 
@@ -9012,6 +9014,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	additionalPaths []string,
 	parentSessionID, parentProjectPath string,
 	tempID string,
+	titleLocked bool,
 ) tea.Cmd {
 	return func() tea.Msg {
 		// Check tmux availability before creating session
@@ -9054,6 +9057,11 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			inst = session.NewInstanceWithTool(name, path, tool)
 		}
 		inst.Command = command
+		// titleLocked pins an auto-generated/untitled name so Claude's
+		// session-name sync can't overwrite it (#697). MAIA workers use this so
+		// the row keeps showing the live pane title / worktree rather than
+		// Claude's conversation summary.
+		inst.TitleLocked = titleLocked
 
 		// Set worktree fields if provided
 		if worktreePath != "" {
@@ -9517,6 +9525,7 @@ func (h *Home) quickCreateSession() tea.Cmd {
 		false, nil, // no multi-repo
 		"", "", // no parent
 		"", // no placeholder
+		false,
 	)
 }
 
@@ -9629,12 +9638,15 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // a plain shell session; "codex" always launches in YOLO mode (the MAIA flow
 // trusts these worktrees, so codex skips approvals + sandbox).
 //
-// Naming differs by worktree kind: workers get a path-derived name
-// (worker-N, which is unique per worktree), while ro-dev sessions get an
-// auto-generated adjective-noun name — every ro-dev session shares the same
-// "MAIA.ro-dev" folder, so a path-derived name would make them all identical
-// (and the label engine intentionally prefers the name/broadcast for ro-dev,
-// per nameFirstWorktreePrefixes).
+// Naming: both workers and ro-dev get an auto-generated adjective-noun name so
+// the label engine treats them as untitled and shows the dynamic chain
+// (branch → Claude pane title → worktree folder) instead of a sticky title. A
+// path-derived name like "MAIA.worker-3" would otherwise win as a "user-chosen"
+// title and pin itself, hiding the live activity. Workers additionally lock the
+// title so Claude's conversation-name sync can't replace the auto name and pin
+// the conversation summary as the primary label — the user wants live activity,
+// not the summary. ro-dev stays unlocked (it's name-first via
+// nameFirstWorktreePrefixes and already routes to the broadcast).
 func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.Cmd {
 	if group == "" {
 		group = maiaWorkerGroup
@@ -9648,13 +9660,10 @@ func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.C
 	}
 
 	h.instancesMu.RLock()
-	var name string
-	if group == maiaRoDevGroup {
-		name = session.GenerateUniqueSessionName(h.instances, group)
-	} else {
-		name = ensureUniqueSessionTitle(deriveSessionNameFromPath(projectPath), h.instances)
-	}
+	name := session.GenerateUniqueSessionName(h.instances, group)
 	h.instancesMu.RUnlock()
+
+	lockTitle := group != maiaRoDevGroup
 
 	return h.createSessionInGroupWithWorktreeAndOptions(
 		name, projectPath, command,
@@ -9667,6 +9676,7 @@ func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.C
 		false, nil,
 		"", "",
 		"",
+		lockTitle,
 	)
 }
 
@@ -9700,6 +9710,7 @@ func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
 		false, nil,
 		"", "",
 		"",
+		false,
 	)
 }
 
@@ -13839,8 +13850,12 @@ func (h *Home) renderSessionItem(
 	// then disagrees with terminal cells and mouseY→item indexing breaks
 	// until scroll settles. cellWidth/cellTruncate (not lipgloss.Width)
 	// because pane titles can carry keycap/emoji glyphs uniseg under-reports.
+	//
+	// De-dup: when the pane title already won the primary label (primaryBroadcast,
+	// e.g. an active worker), repeating it here would read "Exploring X · Exploring
+	// X". Fall back to the status word so the slot stays informative without echoing.
 	trailingText := instState.paneTitle
-	if trailingText == "" {
+	if trailingText == "" || trailingText == lbl.text {
 		trailingText = string(instState.status)
 	}
 	if trailingText != "" {

@@ -71,6 +71,34 @@ func TestPaneTitle_AlwaysOnEvenWhenToggleOff(t *testing.T) {
 	}
 }
 
+// TestPaneTitle_NoEchoWhenBroadcastIsPrimary pins the de-dup for the MAIA-worker
+// fix: when the live pane title wins the PRIMARY label (an active worker with an
+// auto title and no distinguishing branch), the always-on trailing slot must not
+// repeat it — the row should read "<task> · running", not "<task> · <task>".
+func TestPaneTitle_NoEchoWhenBroadcastIsPrimary(t *testing.T) {
+	forceTrueColorProfile()
+	const task = "Exploring messaging support"
+
+	h := &Home{width: 140}
+	inst := &session.Instance{
+		ID:          "worker-sess",
+		Title:       "light-thorn", // auto-generated → not a sticky title
+		ProjectPath: "/x/MAIA.worker-3",
+	}
+	item := session.Item{Type: session.ItemTypeSession, Session: inst, Level: 1, Path: "test", IsLastInGroup: true}
+	snapshot := map[string]sessionRenderState{
+		inst.ID: {status: session.StatusRunning, tool: "claude", paneTitle: task},
+	}
+
+	var b strings.Builder
+	h.renderSessionItem(&b, item, false, snapshot, h.width)
+	row := b.String()
+
+	if n := strings.Count(row, task); n != 1 {
+		t.Fatalf("active worker should show the pane title exactly once (primary, not echoed in the trailing slot), got %d occurrences.\nRow: %q", n, row)
+	}
+}
+
 // TestPaneTitle_StatusFallbackWhenEmpty pins the other half of the personal-fork
 // override: when the pane title is empty the slot falls back to the session
 // status word so it is never blank. Upstream renders nothing in this case.
