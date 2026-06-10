@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -184,6 +185,10 @@ func (d *ForkDialog) GetParentProjectPath() string {
 
 // Show displays the dialog with pre-filled values
 func (d *ForkDialog) Show(originalName, projectPath, groupPath string, conductors []*session.Instance, suggestedParentID string) {
+	d.ShowWithParentSandboxed(originalName, projectPath, groupPath, conductors, suggestedParentID, false)
+}
+
+func (d *ForkDialog) ShowWithParentSandboxed(originalName, projectPath, groupPath string, conductors []*session.Instance, suggestedParentID string, parentSandboxed bool) {
 	d.visible = true
 	d.validationErr = ""
 	d.projectPath = projectPath
@@ -197,6 +202,11 @@ func (d *ForkDialog) Show(originalName, projectPath, groupPath string, conductor
 		d.branchPicker.Hide()
 	}
 	d.optionsPanel.Blur()
+	config, _ := session.LoadUserConfig()
+	forkSettings := session.ForkSettings{}
+	if config != nil {
+		forkSettings = config.Fork
+	}
 
 	// Reset worktree fields from global config defaults.
 	d.worktreeEnabled = false
@@ -204,7 +214,11 @@ func (d *ForkDialog) Show(originalName, projectPath, groupPath string, conductor
 	d.withStateEnabled = false
 	d.withStateAndGitignored = false
 	d.sandboxEnabled = false
-	d.worktreeCapable = git.IsGitRepoOrBareProjectRoot(projectPath)
+	// jj repos are worktree- and (since #1305) state-capable too. Detect jj
+	// explicitly rather than relying on git's findNestedBareRepo coincidentally
+	// finding .jj/repo/store/git, so a native-backend jj repo (no nested git
+	// store) still presents the worktree + with-state options.
+	d.worktreeCapable = git.IsGitRepoOrBareProjectRoot(projectPath) || jujutsu.IsJJRepo(projectPath)
 
 	// Conductor parent selector
 	d.conductorSessions = conductors
@@ -216,16 +230,20 @@ func (d *ForkDialog) Show(originalName, projectPath, groupPath string, conductor
 		}
 	}
 
-	// Auto-suggest branch name based on fork title
-	sanitized := strings.ToLower(originalName)
-	sanitized = strings.ReplaceAll(sanitized, " ", "-")
-	d.branchInput.SetValue("fork/" + sanitized)
+	// Auto-suggest branch name based on fork title. Use the git sanitizer (same
+	// as quick fork's quickForkInputs) so titles with ':' '?' etc. don't produce
+	// an invalid branch like "fork/fix:-bug".
+	d.branchInput.SetValue(forkSettings.GetBranchPrefix() + git.SanitizeBranchName(strings.ToLower(originalName)))
 
-	// Initialize options with defaults from config.
-	if config, err := session.LoadUserConfig(); err == nil {
+	// Initialize options + structural toggles from [fork] defaults so the dialog
+	// opens "comprehensive, tweak down" — matching quick fork (f).
+	if config != nil {
 		d.optionsPanel.SetDefaults(config)
-		d.sandboxEnabled = config.Docker.DefaultEnabled
-		d.worktreeEnabled = d.worktreeCapable && config.Worktree.DefaultEnabled
+		plan := config.Fork.Resolve(parentSandboxed)
+		d.worktreeEnabled = d.worktreeCapable && plan.Worktree
+		d.withStateEnabled = d.worktreeEnabled && plan.WithState
+		d.withStateAndGitignored = d.withStateEnabled && plan.WithIgnored
+		d.sandboxEnabled = plan.Sandbox
 	}
 }
 
@@ -668,7 +686,7 @@ func (d *ForkDialog) View() string {
 		conductorSection += "\n"
 	}
 
-	// Worktree checkbox and branch input (only for git repos)
+	// Worktree/workspace checkbox and branch input (git and jujutsu repos)
 	worktreeSection := ""
 	if d.worktreeCapable {
 		checkboxStyle := lipgloss.NewStyle().Foreground(ColorText)

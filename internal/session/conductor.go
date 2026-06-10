@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -360,11 +361,7 @@ func normalizeConductorProfile(profile string) string {
 
 // ConductorDir returns the base conductor directory (~/.agent-deck/conductor)
 func ConductorDir() (string, error) {
-	dir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "conductor"), nil
+	return dataPath("conductor", "conductor")
 }
 
 // ConductorNameDir returns the directory for a named conductor (~/.agent-deck/conductor/<name>)
@@ -702,11 +699,26 @@ func renderConductorHeartbeatScript(name, profile string) string {
 	script := strings.ReplaceAll(conductorHeartbeatScript, "{NAME}", name)
 	script = strings.ReplaceAll(script, "{PROFILE}", profile)
 	script = strings.ReplaceAll(script, "{HEARTBEAT_PREFIX}", ConductorBridgeHeartbeatPrefix)
+	conductorRoot := "$HOME/.agent-deck/conductor"
+	if dir, err := ConductorDir(); err == nil {
+		conductorRoot = shellDoubleQuotedValue(dir)
+	}
+	script = strings.ReplaceAll(script, "{CONDUCTOR_ROOT}", conductorRoot)
 	if profile == DefaultProfile {
 		// For default profile, omit -p flag entirely
 		script = strings.ReplaceAll(script, `-p "$PROFILE" `, "")
 	}
 	return script
+}
+
+func shellDoubleQuotedValue(value string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		`$`, `\$`,
+		"`", "\\`",
+	)
+	return replacer.Replace(value)
 }
 
 // HeartbeatPlistLabel returns the launchd label for a conductor's heartbeat
@@ -857,7 +869,12 @@ func isExecutablePath(path string) bool {
 // processes (launchd, systemd) that don't inherit the user's shell PATH can
 // still find the agent-deck binary.
 func buildDaemonPath(agentDeckPath string) string {
-	baseEntries := []string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	baseEntries := []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	if runtime.GOOS == "darwin" {
+		// Homebrew on Apple Silicon installs to /opt/homebrew/bin; that path
+		// does not exist on Linux, so only include it on macOS.
+		baseEntries = []string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	}
 	ordered := make([]string, 0, len(baseEntries)+1)
 	seen := map[string]struct{}{}
 
@@ -905,8 +922,12 @@ STATUS=$(agent-deck -p "$PROFILE" session show "$SESSION" --json 2>/dev/null | a
 
 # Resolve HEARTBEAT_RULES.md (per-conductor, then per-profile, then global fallback).
 # Mirrors the lookup order used by conductor/bridge.py since PR #218.
+CONDUCTOR_ROOT="{CONDUCTOR_ROOT}"
 RULES_FILE=""
 for candidate in \
+    "$CONDUCTOR_ROOT/{NAME}/HEARTBEAT_RULES.md" \
+    "$CONDUCTOR_ROOT/{PROFILE}/HEARTBEAT_RULES.md" \
+    "$CONDUCTOR_ROOT/HEARTBEAT_RULES.md" \
     "$HOME/.agent-deck/conductor/{NAME}/HEARTBEAT_RULES.md" \
     "$HOME/.agent-deck/conductor/{PROFILE}/HEARTBEAT_RULES.md" \
     "$HOME/.agent-deck/conductor/HEARTBEAT_RULES.md"; do
@@ -1071,6 +1092,9 @@ func InstallPolicyMD(customPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
 	targetPath := filepath.Join(dir, "POLICY.md")
 
 	if customPath != "" {
@@ -1079,9 +1103,6 @@ func InstallPolicyMD(customPath string) error {
 	}
 
 	// No custom path - write default template (but preserve existing symlink)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
 	if info, err := os.Lstat(targetPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil
 	}
@@ -1451,8 +1472,8 @@ func LaunchdPlistPath() (string, error) {
 // PATH (so pyenv/asdf-selected interpreters win), then common absolute paths.
 func findPython3() string {
 	// Prefer the conductor venv python which has bridge dependencies installed.
-	if homeDir, err := os.UserHomeDir(); err == nil {
-		venvPython := filepath.Join(homeDir, ".agent-deck", "conductor", "venv", "bin", "python3")
+	if conductorDir, err := ConductorDir(); err == nil {
+		venvPython := filepath.Join(conductorDir, "venv", "bin", "python3")
 		if _, err := os.Stat(venvPython); err == nil {
 			return venvPython
 		}
@@ -1575,6 +1596,7 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStartPre=-/bin/mkdir -p __LOG_DIR__
 ExecStart=__PYTHON3__ __BRIDGE_PATH__
 Restart=always
 RestartSec=10
@@ -1600,6 +1622,7 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStartPre=-/bin/mkdir -p __LOG_DIR__
 ExecStart=__AGENT_DECK__ notify-daemon
 Restart=always
 RestartSec=5
@@ -1718,6 +1741,7 @@ func GenerateSystemdBridgeService() (string, error) {
 	unit := strings.ReplaceAll(systemdBridgeServiceTemplate, "__PYTHON3__", python3Path)
 	unit = strings.ReplaceAll(unit, "__BRIDGE_PATH__", bridgePath)
 	unit = strings.ReplaceAll(unit, "__LOG_PATH__", logPath)
+	unit = strings.ReplaceAll(unit, "__LOG_DIR__", filepath.Dir(logPath))
 	unit = strings.ReplaceAll(unit, "__HOME__", homeDir)
 	agentDeckPath := FindAgentDeck()
 	unit = strings.ReplaceAll(unit, "__PATH__", buildDaemonPath(agentDeckPath))
@@ -1730,16 +1754,15 @@ func GenerateTransitionNotifierLaunchdPlist() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	agentDeckDir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
 	agentDeckPath := FindAgentDeck()
 	execPath := "agent-deck"
 	if agentDeckPath != "" {
 		execPath = agentDeckPath
 	}
-	logPath := filepath.Join(agentDeckDir, "logs", "transition-notifier.log")
+	logPath, err := logDataPath("transition-notifier.log")
+	if err != nil {
+		return "", fmt.Errorf("transition notifier log path: %w", err)
+	}
 
 	plist := strings.ReplaceAll(transitionNotifierPlistTemplate, "__AGENT_DECK__", execPath)
 	plist = strings.ReplaceAll(plist, "__LOG_PATH__", logPath)
@@ -1763,19 +1786,19 @@ func GenerateSystemdTransitionNotifierService() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	agentDeckDir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
 	agentDeckPath := FindAgentDeck()
 	execPath := "agent-deck"
 	if agentDeckPath != "" {
 		execPath = agentDeckPath
 	}
-	logPath := filepath.Join(agentDeckDir, "logs", "transition-notifier.log")
+	logPath, err := logDataPath("transition-notifier.log")
+	if err != nil {
+		return "", fmt.Errorf("transition notifier log path: %w", err)
+	}
 
 	unit := strings.ReplaceAll(systemdTransitionNotifierServiceTemplate, "__AGENT_DECK__", execPath)
 	unit = strings.ReplaceAll(unit, "__LOG_PATH__", logPath)
+	unit = strings.ReplaceAll(unit, "__LOG_DIR__", filepath.Dir(logPath))
 	unit = strings.ReplaceAll(unit, "__HOME__", homeDir)
 	unit = strings.ReplaceAll(unit, "__PATH__", buildDaemonPath(agentDeckPath))
 	return unit, nil

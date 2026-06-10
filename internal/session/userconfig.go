@@ -18,6 +18,8 @@ import (
 
 	dark "github.com/thiagokokada/dark-mode-go"
 
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/atomicfile"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/platform"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -45,6 +47,10 @@ type UserConfig struct {
 	// Valid values: "claude", "gemini", "opencode", "codex", "pi", or any custom tool name
 	// If empty or invalid, defaults to "shell" (no pre-selection)
 	DefaultTool string `toml:"default_tool"`
+
+	// DefaultPath is the global fallback project directory for `agent-deck add`
+	// when no explicit path or group default_path is provided.
+	DefaultPath string `toml:"default_path"`
 
 	// Hotkeys overrides default keyboard shortcuts in the TUI.
 	// Keys are action names, values are key bindings (e.g., "delete" = "backspace").
@@ -173,6 +179,9 @@ type UserConfig struct {
 	// Docker defines Docker sandbox settings for containerized sessions
 	Docker DockerSettings `toml:"docker"`
 
+	// Fork defines quick-fork (f) and fork-dialog (Shift+F) default behavior.
+	Fork ForkSettings `toml:"fork"`
+
 	// Remotes defines named SSH remote agent-deck instances
 	Remotes map[string]RemoteConfig `toml:"remotes"`
 
@@ -242,6 +251,76 @@ type UISettings struct {
 	// display filter only — `agent-deck launch -c <tool>` still spawns a hidden
 	// tool.
 	ShowOnlyInstalledTools bool `toml:"show_only_installed_tools"`
+
+	// HiddenTools lists tool names to hide from the new-session picker (TUI + web).
+	// Denylist: absent or empty shows every tool (subject to show_only_installed_tools).
+	// shell is always shown and cannot be hidden.
+	HiddenTools []string `toml:"hidden_tools"`
+
+	// Footer controls the style of the bottom hint bar. Valid values:
+	//   "full" (default)    — the historic verbose bar: filled key chips,
+	//                         width-adaptive, advertising every action. This is
+	//                         today's behavior and stays the default so the look
+	//                         never changes without an explicit opt-in.
+	//   "curated"           — lighter, dim inline text advertising only the
+	//                         actions relevant to the selected row, with the
+	//                         settings and help keys always last (opt-in).
+	//   "compact"           — force the abbreviated chip tier regardless of width.
+	//   "minimal"           — force the keys-only tier regardless of width.
+	// Empty or unknown values fall back to "full". This is purely a
+	// rendering preference (TUI UX initiative, item 1): no keybinding is
+	// added, removed, or changed — only what the footer advertises. Every
+	// action remains reachable by its key and is fully listed under help (?).
+	Footer string `toml:"footer"`
+
+	// NewSessionEnterAdvances controls what Enter does on the free-text
+	// Name/Branch fields of the new-session dialog (PR #1295). Default false
+	// preserves today's behavior: Enter from Name/Branch submits the form. When
+	// true, Enter advances focus to the next field instead (so typing a name and
+	// pressing Enter no longer silently creates a session with all defaults), and
+	// Ctrl+S becomes the explicit submit shortcut. Ctrl+S submits in BOTH modes —
+	// it is strictly additive and always available regardless of this toggle.
+	NewSessionEnterAdvances bool `toml:"new_session_enter_advances"`
+}
+
+// normalizeUIHiddenTools lowercases, dedupes, and drops unknown entries from
+// [ui].hidden_tools. shell cannot be hidden. Unknown names log a warning.
+func normalizeUIHiddenTools(ui *UISettings, customTools map[string]ToolDef) {
+	if ui == nil || len(ui.HiddenTools) == 0 {
+		return
+	}
+	known := make(map[string]bool, len(builtinTools())+len(customTools))
+	for _, bt := range builtinTools() {
+		known[strings.ToLower(strings.TrimSpace(bt.Name))] = true
+	}
+	for name := range customTools {
+		n := strings.ToLower(strings.TrimSpace(name))
+		if n != "" {
+			known[n] = true
+		}
+	}
+
+	seen := make(map[string]bool, len(ui.HiddenTools))
+	out := make([]string, 0, len(ui.HiddenTools))
+	for _, raw := range ui.HiddenTools {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" || name == "shell" {
+			continue
+		}
+		if !known[name] {
+			registryLog.Warn("ignored unknown hidden_tools entry",
+				"name", raw,
+				"hint", "use a built-in or custom tool name from config.toml")
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	ui.HiddenTools = out
 }
 
 // DefaultPreviewPct is the default preview-pane width percentage.
@@ -261,6 +340,36 @@ const (
 	ITermOpenAsWindow  = "window"
 	DefaultITermOpenAs = ITermOpenAsTab
 )
+
+// Footer hint-bar styles. See UISettings.Footer.
+const (
+	FooterCurated = "curated"
+	FooterFull    = "full"
+	FooterCompact = "compact"
+	FooterMinimal = "minimal"
+	// DefaultFooter is the historic verbose bar ("full"). Keeping it as the
+	// default preserves today's look; curated/compact/minimal are opt-in via
+	// config.toml [ui] footer.
+	DefaultFooter = FooterFull
+)
+
+// GetFooter returns the configured footer style, normalized to one of the
+// known values. Empty or unknown input falls back to DefaultFooter
+// ("full"). Matching is case-insensitive so users may write "Full" or
+// "MINIMAL" in TOML.
+func (u UISettings) GetFooter() string {
+	switch strings.ToLower(strings.TrimSpace(u.Footer)) {
+	case FooterFull:
+		return FooterFull
+	case FooterCompact:
+		return FooterCompact
+	case FooterMinimal:
+		return FooterMinimal
+	case FooterCurated:
+		return FooterCurated
+	}
+	return DefaultFooter
+}
 
 // GetPreviewPct returns the configured preview percentage, clamped to
 // [MinPreviewPct, MaxPreviewPct]. Falls back to DefaultPreviewPct when
@@ -316,6 +425,14 @@ func (u UISettings) GetRemoteSessionRefreshSecs() int {
 		return MaxRemoteSessionRefreshSecs
 	}
 	return val
+}
+
+// GetNewSessionEnterAdvances reports whether Enter on the new-session dialog's
+// free-text Name/Branch fields should advance focus (true) instead of
+// submitting the form (false). Default false preserves today's behavior
+// (Enter submits). Ctrl+S submits in both modes. See PR #1295.
+func (u UISettings) GetNewSessionEnterAdvances() bool {
+	return u.NewSessionEnterAdvances
 }
 
 // GetRemoteLatencyRefreshSecs returns the remote latency refresh interval
@@ -1907,6 +2024,101 @@ func (d DockerSettings) GetAutoCleanup() bool {
 	return *d.AutoCleanup
 }
 
+// ForkSettings controls quick-fork (f) and fork-dialog (Shift+F) defaults.
+// Unset structural toggles default to the comprehensive built-in (ON); these
+// defaults are independent of [worktree]/[docker] default_enabled, which govern
+// non-fork session creation. *bool is required so "absent" reads as ON.
+type ForkSettings struct {
+	// InheritFromParent, when true, makes the fork mirror the parent session and
+	// ignores the structural keys below. See Resolve.
+	InheritFromParent bool `toml:"inherit_from_parent"`
+
+	// Worktree creates a new worktree + branch. nil => true.
+	Worktree *bool `toml:"worktree"`
+	// WithState carries the parent's tracked uncommitted changes. nil => true.
+	WithState *bool `toml:"with_state"`
+	// WithIgnored also copies gitignored files (implies WithState). nil => false:
+	// the gitignored tree is unbounded (data sets, virtual envs, node_modules)
+	// and may carry secrets (.env), so copying it is opt-in. See GetWithIgnored.
+	WithIgnored *bool `toml:"with_ignored"`
+	// Docker selects sandbox behavior: "auto" (match parent) | "on" | "off".
+	// nil/unknown => "auto". Mirrors the [tmux].launch_as string-enum convention.
+	Docker *string `toml:"docker"`
+	// BranchPrefix is the auto branch-name prefix. "" => "fork/".
+	BranchPrefix string `toml:"branch_prefix"`
+}
+
+// GetWorktree reports whether forks create a worktree (default ON).
+func (f ForkSettings) GetWorktree() bool { return f.Worktree == nil || *f.Worktree }
+
+// GetWithState reports whether forks carry tracked state (default ON).
+func (f ForkSettings) GetWithState() bool { return f.WithState == nil || *f.WithState }
+
+// GetWithIgnored reports whether forks copy gitignored files (default OFF).
+// Off by default because the gitignored tree is unbounded (data sets, virtual
+// envs, node_modules) and can carry secrets (.env); copying it silently blocks
+// the fork with no size cap or progress. Opt in per fork via the Shift+F
+// dialog, globally via [fork].with_ignored = true, or wholesale via
+// inherit_from_parent.
+func (f ForkSettings) GetWithIgnored() bool { return f.WithIgnored != nil && *f.WithIgnored }
+
+// GetDocker returns the canonical docker mode: "auto" | "on" | "off".
+// Mirrors GetLaunchAs: lowercase/trim, unknown/nil -> "auto".
+func (f ForkSettings) GetDocker() string {
+	if f.Docker == nil {
+		return "auto"
+	}
+	switch v := strings.ToLower(strings.TrimSpace(*f.Docker)); v {
+	case "auto", "on", "off":
+		return v
+	default:
+		return "auto"
+	}
+}
+
+// GetBranchPrefix returns the auto branch-name prefix (default "fork/").
+func (f ForkSettings) GetBranchPrefix() string {
+	prefix := strings.TrimSpace(f.BranchPrefix)
+	if prefix == "" {
+		return "fork/"
+	}
+	return prefix
+}
+
+// ResolvedForkPlan is the effective set of structural fork toggles after
+// applying [fork] config + parent context.
+type ResolvedForkPlan struct {
+	Worktree    bool
+	WithState   bool
+	WithIgnored bool
+	Sandbox     bool
+}
+
+// Resolve turns ForkSettings + the parent's Docker state into a concrete plan.
+// parentSandboxed is source.IsSandboxed(). When InheritFromParent is set, the
+// fork mirrors the parent: worktree+state+gitignored ON (the parent is a real
+// working tree) and Sandbox matches the parent, ignoring the structural keys.
+func (f ForkSettings) Resolve(parentSandboxed bool) ResolvedForkPlan {
+	if f.InheritFromParent {
+		return ResolvedForkPlan{Worktree: true, WithState: true, WithIgnored: true, Sandbox: parentSandboxed}
+	}
+	sandbox := parentSandboxed
+	switch f.GetDocker() {
+	case "on":
+		sandbox = true
+	case "off":
+		sandbox = false
+	}
+	withIgnored := f.GetWithIgnored()
+	withState := f.GetWithState() || withIgnored
+	return ResolvedForkPlan{
+		Worktree:    f.GetWorktree(),
+		WithState:   withState,
+		WithIgnored: withIgnored,
+		Sandbox:     sandbox,
+	}
+}
+
 type StatusSettings struct {
 	// Reserved for future status detection settings.
 	// Control mode pipes are always enabled (no longer configurable).
@@ -1959,6 +2171,11 @@ type DisplaySettings struct {
 	// Default: false — opt-in to avoid crowding existing badges. See
 	// renderSessionItem for the timestamp source.
 	ShowSessionTimestamps bool `toml:"show_session_timestamps"`
+
+	// ShowPaneTitles shows the dim tmux pane-title (task description) suffix on
+	// every session row, not just the selected one. Default: false — opt-in to
+	// avoid crowding narrow sidebars. See renderSessionItem for the source.
+	ShowPaneTitles bool `toml:"show_pane_titles"`
 }
 
 // GetActiveFilterExcludes returns the resolved set of statuses the % filter
@@ -2065,11 +2282,7 @@ var (
 
 // GetUserConfigPath returns the path to the user config file
 func GetUserConfigPath() (string, error) {
-	dir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, UserConfigFileName), nil
+	return agentpaths.EffectiveConfigPath(UserConfigFileName)
 }
 
 // LoadUserConfig loads the user configuration from TOML file.
@@ -2139,6 +2352,8 @@ func LoadUserConfig() (*UserConfig, error) {
 	if config.Plugins == nil {
 		config.Plugins = make(map[string]PluginDef)
 	}
+
+	normalizeUIHiddenTools(&config.UI, config.Tools)
 
 	userConfigCache = &config
 	userConfigCacheMtime = currentMtime
@@ -2231,30 +2446,14 @@ func SaveUserConfigWithIntent(config *UserConfig, allowSectionDrop bool) error {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════
-	// ATOMIC WRITE PATTERN: Prevents data corruption on crash/power loss
-	// 1. Write to temporary file with 0600 permissions
-	// 2. fsync the temp file (ensures data reaches disk)
-	// 3. Atomic rename temp to final
+	// ATOMIC + DURABLE WRITE: Prevents data corruption on crash/power loss
+	// and preserves a dotfiles-managed config.toml symlink. The temp file is
+	// fsync'd before the rename and the parent dir is fsync'd after (see
+	// internal/atomicfile.WriteFileDurable). A symlinked config.toml is written
+	// through to its real target rather than replaced with a regular file.
 	// ═══════════════════════════════════════════════════════════════════
 
-	tmpPath := configPath + ".tmp"
-
-	// Step 1: Write to temporary file (0600 = owner read/write only for security)
-	if err := os.WriteFile(tmpPath, buf.Bytes(), 0o600); err != nil {
-		return fmt.Errorf("failed to write temp file: %w", err)
-	}
-
-	// Step 2: fsync the temp file to ensure data reaches disk before rename
-	if err := syncConfigFile(tmpPath); err != nil {
-		// Log but don't fail - atomic rename still provides some safety
-		// Note: We don't have access to log package here, so we just continue
-		_ = err
-	}
-
-	// Step 3: Atomic rename (this is atomic on POSIX systems)
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		// Clean up temp file on failure
-		os.Remove(tmpPath)
+	if err := atomicfile.WriteFileDurable(configPath, buf.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("failed to finalize config save: %w", err)
 	}
 
@@ -2320,16 +2519,6 @@ func backupConfigFile(configPath string) error {
 		return err
 	}
 	return nil
-}
-
-// syncConfigFile calls fsync on a file to ensure data is written to disk
-func syncConfigFile(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
 }
 
 // ClearUserConfigCache clears the cached user config, allowing tests to reset state.
