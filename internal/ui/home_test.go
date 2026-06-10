@@ -502,6 +502,51 @@ func TestHomeRenameSessionComplete(t *testing.T) {
 	}
 }
 
+// TestHomeRenameSessionSetsTitleLocked pins the fix for the shared-worktree
+// naming leak: a user-chosen name must lock the title so Claude's session-name
+// sync (ReconcileTitleFromClaude — turn-boundary hook + on-attach) cannot
+// overwrite it. Without TitleLocked, two sessions in one worktree that share a
+// collided ClaudeSessionID reconcile to the same Claude name and the rename
+// appears to jump between rows.
+func TestHomeRenameSessionSetsTitleLocked(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := session.NewInstance("original-name", "/tmp/project")
+	if inst.TitleLocked {
+		t.Fatal("precondition: fresh session must not be title-locked")
+	}
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instanceByID[inst.ID] = inst
+	home.instancesMu.Unlock()
+	home.groupTree = session.NewGroupTree(home.instances)
+	home.rebuildFlatItems()
+
+	sessionIdx := -1
+	for i, item := range home.flatItems {
+		if item.Type == session.ItemTypeSession {
+			sessionIdx = i
+			break
+		}
+	}
+	home.cursor = sessionIdx
+
+	// Open rename dialog, type a name, confirm.
+	home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	home.groupDialog.nameInput.SetValue("my-session")
+	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	h := model.(*Home)
+	if h.instances[0].Title != "my-session" {
+		t.Fatalf("Title = %q, want my-session", h.instances[0].Title)
+	}
+	if !h.instances[0].TitleLocked {
+		t.Error("TitleLocked = false after manual rename; a user-chosen name must lock the title so Claude's sync cannot overwrite it")
+	}
+}
+
 func TestHomeMoveSessionWithDuplicateGroupNamesUsesSelectedPath(t *testing.T) {
 	home := NewHome()
 	home.width = 100

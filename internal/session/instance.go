@@ -2711,6 +2711,27 @@ func (i *Instance) buildTmuxOptionOverrides() map[string]string {
 // two grep-stable lines for a Phase 5 discovery start, distinguishable
 // by the `reason=` attr.
 func (i *Instance) ensureClaudeSessionIDFromDisk() {
+	// Issue #1147 (Start-path twin): an explicit `--session-id <uuid>` in
+	// i.Command is the user's authoritative declaration of WHICH conversation
+	// this session owns, and supersedes any disk-discovery candidate. The
+	// Restart-path variant (ensureClaudeSessionIDFromDiskForRestart) already
+	// honors it; the cold-boot Start path must too, or N sessions recovering
+	// in one shared cwd — each with its own --session-id — all disk-discover
+	// the newest sibling JSONL by mtime and converge onto a single id. That
+	// shared id then leaks across the title-sync path (a name set on one
+	// session reappears on its siblings) and trips the duplicate-session
+	// sweeper. Adopt the explicit id BEFORE the non-empty short-circuit so it
+	// also corrects an id hijacked by an earlier buggy run.
+	if explicit, ok := extractExplicitClaudeSessionID(i.Command); ok {
+		if i.ClaudeSessionID != explicit {
+			i.ClaudeSessionID = explicit
+			sessionLog.Info("resume: id="+explicit+" reason=session_id_flag_explicit_start",
+				slog.String("instance_id", i.ID),
+				slog.String("claude_session_id", explicit),
+				slog.String("reason", "session_id_flag_explicit_start"))
+		}
+		return
+	}
 	if i.ClaudeSessionID != "" {
 		return
 	}

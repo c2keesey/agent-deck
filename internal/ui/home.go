@@ -8554,6 +8554,15 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					// Find and rename the session (O(1) lookup)
 					if inst := h.getInstanceByID(sessionID); inst != nil {
 						inst.Title = newName
+						// A user explicitly naming a session is the strongest
+						// signal that Claude's session-name sync must stop
+						// touching it. Without this, ReconcileTitleFromClaude
+						// (turn-boundary hook + on-attach) overwrites the chosen
+						// name — and when sessions share a worktree it can pull a
+						// sibling's name via a collided ClaudeSessionID, so the
+						// name appears to leak across rows. TitleLocked (#697)
+						// makes the rename authoritative and persists to SQLite.
+						inst.TitleLocked = true
 						inst.SyncTmuxDisplayName()
 					}
 					// Store pending title change so it survives reload races.
