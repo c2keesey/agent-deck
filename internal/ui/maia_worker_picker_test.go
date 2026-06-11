@@ -73,22 +73,23 @@ func TestMaiaWorkerPicker_Navigation(t *testing.T) {
 		roDevs:  []string{"/r/MAIA.ro-dev"},
 	}
 	key := func(t tea.KeyType) tea.KeyMsg { return tea.KeyMsg{Type: t} }
+	runeKey := func(r rune) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}} }
 
-	// Right switches to the ro-dev column.
-	p, _ = p.Update(key(tea.KeyRight))
+	// 'r' switches to the ro-dev column.
+	p, _ = p.Update(runeKey('r'))
 	if p.focusCol != 1 {
-		t.Fatalf("after right, focusCol = %d, want 1", p.focusCol)
+		t.Fatalf("after r, focusCol = %d, want 1", p.focusCol)
 	}
 	// Down is clamped (only one ro-dev).
 	p, _ = p.Update(key(tea.KeyDown))
 	if p.roDevCursor != 0 {
 		t.Fatalf("roDevCursor = %d, want 0 (clamped)", p.roDevCursor)
 	}
-	// Left returns to workers; down advances within range.
-	p, _ = p.Update(key(tea.KeyLeft))
+	// 'r' toggles back to workers; down advances within range.
+	p, _ = p.Update(runeKey('r'))
 	p, _ = p.Update(key(tea.KeyDown))
 	if p.focusCol != 0 || p.workerCursor != 1 {
-		t.Fatalf("after left+down: focusCol=%d workerCursor=%d, want 0,1", p.focusCol, p.workerCursor)
+		t.Fatalf("after r+down: focusCol=%d workerCursor=%d, want 0,1", p.focusCol, p.workerCursor)
 	}
 }
 

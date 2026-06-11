@@ -31,8 +31,9 @@ const (
 //     sessions. Enter just starts another session in the shared ro-dev
 //     worktree (no branch/worktree creation).
 //
-// ←/→ (or h/l) switch columns, ↑/↓ (or j/k) move within a column, Enter
-// creates a Claude session in the selected worktree with the column's group.
+// r toggles between the worker and ro-dev columns, ↑/↓ (or j/k) move within a
+// column, Enter creates a Claude session in the selected worktree with the
+// column's group.
 type MaiaWorkerPicker struct {
 	visible      bool
 	workers      []string        // worker worktree paths
@@ -109,12 +110,17 @@ func (m *MaiaWorkerPicker) Update(msg tea.KeyMsg) (*MaiaWorkerPicker, tea.Cmd) {
 		} else if m.roDevCursor < len(m.roDevs)-1 {
 			m.roDevCursor++
 		}
-	case "right", "l", "tab":
-		if len(m.roDevs) > 0 {
-			m.focusCol = 1
+	case "r":
+		// Toggle between the worker column and the ro-dev column. Replaces the
+		// old ←/→ column switch with a single hotkey (only jumps to ro-dev when
+		// ro-dev worktrees exist).
+		if m.focusCol == 0 {
+			if len(m.roDevs) > 0 {
+				m.focusCol = 1
+			}
+		} else {
+			m.focusCol = 0
 		}
-	case "left", "h", "shift+tab":
-		m.focusCol = 0
 	}
 	return m, nil
 }
@@ -195,7 +201,7 @@ func (m *MaiaWorkerPicker) View() string {
 	}
 
 	hint := lipgloss.NewStyle().Foreground(ColorComment).
-		Render("↑/↓ pick · ←/→ column · Enter create · c codex · s shell · ~ home · Esc cancel")
+		Render("↑/↓ pick · r ro-dev · Enter create · c codex · s shell · ~ home · Esc cancel")
 
 	content := lipgloss.JoinVertical(lipgloss.Left, title, "", body, "", hint)
 	dialog := DialogBoxStyle.Render(content)
