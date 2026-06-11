@@ -50,7 +50,7 @@ func TestMaiaWorkerPicker_NextOpenWorker(t *testing.T) {
 	}
 }
 
-func TestMaiaWorkerPicker_SelectedPerColumn(t *testing.T) {
+func TestMaiaWorkerPicker_Selected(t *testing.T) {
 	p := &MaiaWorkerPicker{
 		workers:      []string{"/r/MAIA.worker-1", "/r/MAIA.worker-2"},
 		roDevs:       []string{"/r/MAIA.ro-dev"},
@@ -61,9 +61,16 @@ func TestMaiaWorkerPicker_SelectedPerColumn(t *testing.T) {
 		t.Errorf("worker Selected = (%q, %q), want (worker-2, %q)", path, group, maiaWorkerGroup)
 	}
 
-	p.focusCol = 1
-	if path, group := p.Selected(); path != "/r/MAIA.ro-dev" || group != maiaRoDevGroup {
-		t.Errorf("ro-dev Selected = (%q, %q), want (ro-dev, %q)", path, group, maiaRoDevGroup)
+	// RoDevSelected returns the shared ro-dev worktree regardless of the worker
+	// cursor — it's reached by the 'r' hotkey, not by browsing.
+	if path, group := p.RoDevSelected(); path != "/r/MAIA.ro-dev" || group != maiaRoDevGroup {
+		t.Errorf("RoDevSelected = (%q, %q), want (ro-dev, %q)", path, group, maiaRoDevGroup)
+	}
+
+	// No ro-dev worktree -> empty.
+	p.roDevs = nil
+	if path, _ := p.RoDevSelected(); path != "" {
+		t.Errorf("RoDevSelected with no ro-dev = %q, want empty", path)
 	}
 }
 
@@ -73,23 +80,21 @@ func TestMaiaWorkerPicker_Navigation(t *testing.T) {
 		roDevs:  []string{"/r/MAIA.ro-dev"},
 	}
 	key := func(t tea.KeyType) tea.KeyMsg { return tea.KeyMsg{Type: t} }
-	runeKey := func(r rune) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}} }
 
-	// 'r' switches to the ro-dev column.
-	p, _ = p.Update(runeKey('r'))
-	if p.focusCol != 1 {
-		t.Fatalf("after r, focusCol = %d, want 1", p.focusCol)
-	}
-	// Down is clamped (only one ro-dev).
+	// Down advances the worker cursor within range.
 	p, _ = p.Update(key(tea.KeyDown))
-	if p.roDevCursor != 0 {
-		t.Fatalf("roDevCursor = %d, want 0 (clamped)", p.roDevCursor)
+	if p.workerCursor != 1 {
+		t.Fatalf("after down, workerCursor = %d, want 1", p.workerCursor)
 	}
-	// 'r' toggles back to workers; down advances within range.
-	p, _ = p.Update(runeKey('r'))
+	// Down is clamped at the last worker.
 	p, _ = p.Update(key(tea.KeyDown))
-	if p.focusCol != 0 || p.workerCursor != 1 {
-		t.Fatalf("after r+down: focusCol=%d workerCursor=%d, want 0,1", p.focusCol, p.workerCursor)
+	if p.workerCursor != 1 {
+		t.Fatalf("workerCursor = %d, want 1 (clamped)", p.workerCursor)
+	}
+	// Up moves back.
+	p, _ = p.Update(key(tea.KeyUp))
+	if p.workerCursor != 0 {
+		t.Fatalf("after up, workerCursor = %d, want 0", p.workerCursor)
 	}
 }
 

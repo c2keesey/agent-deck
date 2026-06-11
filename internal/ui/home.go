@@ -9617,6 +9617,19 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return h, nil
 		}
 		return h, h.createMaiaWorkerSession(selected, group, "codex")
+	case "r":
+		// Read-only dev: create a session in the shared MAIA.ro-dev worktree
+		// directly, bypassing the worker column.
+		tool := session.GetDefaultTool()
+		if tool == "" {
+			tool = "claude"
+		}
+		selected, group := h.maiaWorkerPicker.RoDevSelected()
+		h.maiaWorkerPicker.Hide()
+		if selected == "" {
+			return h, nil
+		}
+		return h, h.createMaiaWorkerSession(selected, group, tool)
 	case "~":
 		// Spawn the default tool (claude) rooted at the home dir — a quick
 		// scratch session outside the MAIA worktrees. Group is derived from

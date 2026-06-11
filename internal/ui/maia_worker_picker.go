@@ -22,27 +22,21 @@ const (
 	maiaRoDevGroup  = "maia/read-only-dev"
 )
 
-// MaiaWorkerPicker is the new-session picker for MAIA work. Only one column is
-// shown at a time:
+// MaiaWorkerPicker is the new-session picker for MAIA work. It shows a single
+// Workers column: worker worktrees (MAIA.worker-*), with the cursor defaulting
+// to the next OPEN worker — the lowest-numbered worktree with no agent-deck
+// session in it (occupied = any session, regardless of status).
 //
-//   - Workers (default): worker worktrees (MAIA.worker-*). The cursor defaults
-//     to the next OPEN worker — the lowest-numbered worktree with no agent-deck
-//     session in it (occupied = any session, regardless of status).
-//   - ro-dev (revealed by pressing 'r'): ro-dev worktrees (MAIA.ro-dev*) for
-//     read-only dev sessions. Enter just starts another session in the shared
-//     ro-dev worktree (no branch/worktree creation).
-//
-// r toggles between the worker and ro-dev columns, ↑/↓ (or j/k) move within a
-// column, Enter creates a Claude session in the selected worktree with the
-// column's group.
+// ↑/↓ (or j/k) move the worker cursor, Enter creates a Claude session in the
+// selected worker. 'r' is a separate hotkey (handled by the caller) that
+// creates a read-only dev session in the shared MAIA.ro-dev worktree directly,
+// without browsing — there is no ro-dev column.
 type MaiaWorkerPicker struct {
 	visible      bool
 	workers      []string        // worker worktree paths
 	roDevs       []string        // ro-dev worktree paths
 	occupied     map[string]bool // worktree path -> already hosts a session
-	focusCol     int             // 0 = workers, 1 = ro-dev
 	workerCursor int
-	roDevCursor  int
 	width        int
 	height       int
 	scanErr      string
@@ -58,8 +52,6 @@ func NewMaiaWorkerPicker() *MaiaWorkerPicker { return &MaiaWorkerPicker{} }
 func (m *MaiaWorkerPicker) Show(occupied map[string]bool) {
 	m.visible = true
 	m.occupied = occupied
-	m.focusCol = 0
-	m.roDevCursor = 0
 	m.refreshWorktrees()
 	m.workerCursor = m.nextOpenWorker()
 }
@@ -77,17 +69,21 @@ func (m *MaiaWorkerPicker) SetSize(width, height int) {
 	m.height = height
 }
 
-// Selected returns the worktree path under the cursor in the focused column
-// and the group its session should join. Empty path means nothing to create.
+// Selected returns the worker worktree path under the cursor and the group its
+// session should join. Empty path means nothing to create.
 func (m *MaiaWorkerPicker) Selected() (path, group string) {
-	if m.focusCol == 1 {
-		if m.roDevCursor >= 0 && m.roDevCursor < len(m.roDevs) {
-			return m.roDevs[m.roDevCursor], maiaRoDevGroup
-		}
-		return "", ""
-	}
 	if m.workerCursor >= 0 && m.workerCursor < len(m.workers) {
 		return m.workers[m.workerCursor], maiaWorkerGroup
+	}
+	return "", ""
+}
+
+// RoDevSelected returns the shared ro-dev worktree path and group, used by the
+// 'r' hotkey to create a read-only dev session directly (no column to browse).
+// Empty path means no ro-dev worktree exists.
+func (m *MaiaWorkerPicker) RoDevSelected() (path, group string) {
+	if len(m.roDevs) > 0 {
+		return m.roDevs[0], maiaRoDevGroup
 	}
 	return "", ""
 }
@@ -96,31 +92,12 @@ func (m *MaiaWorkerPicker) Selected() (path, group string) {
 func (m *MaiaWorkerPicker) Update(msg tea.KeyMsg) (*MaiaWorkerPicker, tea.Cmd) {
 	switch msg.String() {
 	case "up", "ctrl+p", "k":
-		if m.focusCol == 0 {
-			if m.workerCursor > 0 {
-				m.workerCursor--
-			}
-		} else if m.roDevCursor > 0 {
-			m.roDevCursor--
+		if m.workerCursor > 0 {
+			m.workerCursor--
 		}
 	case "down", "ctrl+n", "j":
-		if m.focusCol == 0 {
-			if m.workerCursor < len(m.workers)-1 {
-				m.workerCursor++
-			}
-		} else if m.roDevCursor < len(m.roDevs)-1 {
-			m.roDevCursor++
-		}
-	case "r":
-		// Toggle between the worker column and the ro-dev column. Replaces the
-		// old ←/→ column switch with a single hotkey (only jumps to ro-dev when
-		// ro-dev worktrees exist).
-		if m.focusCol == 0 {
-			if len(m.roDevs) > 0 {
-				m.focusCol = 1
-			}
-		} else {
-			m.focusCol = 0
+		if m.workerCursor < len(m.workers)-1 {
+			m.workerCursor++
 		}
 	}
 	return m, nil
@@ -158,9 +135,6 @@ func (m *MaiaWorkerPicker) refreshWorktrees() {
 	if m.workerCursor >= len(m.workers) {
 		m.workerCursor = 0
 	}
-	if m.roDevCursor >= len(m.roDevs) {
-		m.roDevCursor = 0
-	}
 }
 
 // workerSortKey extracts the numeric worker index for ordering; non-numeric
@@ -184,7 +158,8 @@ func (m *MaiaWorkerPicker) nextOpenWorker() int {
 	return 0
 }
 
-// View renders the two columns side by side, centered.
+// View renders the Workers column, centered. The ro-dev worktree has no column
+// of its own — 'r' creates a ro-dev session directly.
 func (m *MaiaWorkerPicker) View() string {
 	if !m.visible {
 		return ""
@@ -196,13 +171,7 @@ func (m *MaiaWorkerPicker) View() string {
 	if m.scanErr != "" {
 		body = lipgloss.NewStyle().Foreground(ColorRed).Render("⚠ " + m.scanErr)
 	} else {
-		// Only one column is shown at a time: Workers by default, ro-dev once
-		// the user presses 'r'. The ro-dev column is otherwise hidden.
-		if m.focusCol == 1 {
-			body = m.renderColumn("ro-dev", m.roDevs, m.roDevCursor, true, false)
-		} else {
-			body = m.renderColumn("Workers", m.workers, m.workerCursor, true, true)
-		}
+		body = m.renderColumn("Workers", m.workers, m.workerCursor, true, true)
 	}
 
 	hint := lipgloss.NewStyle().Foreground(ColorComment).
