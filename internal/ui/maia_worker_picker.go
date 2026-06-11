@@ -22,14 +22,15 @@ const (
 	maiaRoDevGroup  = "maia/read-only-dev"
 )
 
-// MaiaWorkerPicker is the two-column new-session picker for MAIA work.
+// MaiaWorkerPicker is the new-session picker for MAIA work. Only one column is
+// shown at a time:
 //
-//   - Left column: worker worktrees (MAIA.worker-*). The cursor defaults to
-//     the next OPEN worker — the lowest-numbered worktree with no agent-deck
+//   - Workers (default): worker worktrees (MAIA.worker-*). The cursor defaults
+//     to the next OPEN worker — the lowest-numbered worktree with no agent-deck
 //     session in it (occupied = any session, regardless of status).
-//   - Right column: ro-dev worktrees (MAIA.ro-dev*) for read-only dev
-//     sessions. Enter just starts another session in the shared ro-dev
-//     worktree (no branch/worktree creation).
+//   - ro-dev (revealed by pressing 'r'): ro-dev worktrees (MAIA.ro-dev*) for
+//     read-only dev sessions. Enter just starts another session in the shared
+//     ro-dev worktree (no branch/worktree creation).
 //
 // r toggles between the worker and ro-dev columns, ↑/↓ (or j/k) move within a
 // column, Enter creates a Claude session in the selected worktree with the
@@ -195,9 +196,13 @@ func (m *MaiaWorkerPicker) View() string {
 	if m.scanErr != "" {
 		body = lipgloss.NewStyle().Foreground(ColorRed).Render("⚠ " + m.scanErr)
 	} else {
-		left := m.renderColumn("Workers", m.workers, m.workerCursor, m.focusCol == 0, true)
-		right := m.renderColumn("ro-dev", m.roDevs, m.roDevCursor, m.focusCol == 1, false)
-		body = lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
+		// Only one column is shown at a time: Workers by default, ro-dev once
+		// the user presses 'r'. The ro-dev column is otherwise hidden.
+		if m.focusCol == 1 {
+			body = m.renderColumn("ro-dev", m.roDevs, m.roDevCursor, true, false)
+		} else {
+			body = m.renderColumn("Workers", m.workers, m.workerCursor, true, true)
+		}
 	}
 
 	hint := lipgloss.NewStyle().Foreground(ColorComment).
