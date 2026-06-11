@@ -860,23 +860,12 @@ type sendOutputResultMsg struct {
 	err         error
 }
 
-// teardownResultMsg is sent when async teardown send completes
+// teardownResultMsg is sent when the async teardown send sequence completes.
+// On success inst is non-nil so the handler can delete the session.
 type teardownResultMsg struct {
 	title string
+	inst  *session.Instance
 	err   error
-}
-
-// teardownMoveGroupMsg fires after the rename has settled and asks the UI to
-// move the session to maia/standby. Splitting the y-key flow into staged
-// messages prevents the tmux rename and the group-move from racing each other.
-type teardownMoveGroupMsg struct {
-	inst *session.Instance
-}
-
-// teardownStartMsg fires after the group move has settled and kicks off the
-// async make-down/restart/!gr//clear sequence.
-type teardownStartMsg struct {
-	inst *session.Instance
 }
 
 // remoteSessionsFetchedMsg is sent when async remote sessions fetch completes.
@@ -5263,37 +5252,17 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case teardownMoveGroupMsg:
-		// Stage 2 of the y-key flow: move into maia/standby after the rename
-		// has had ~800ms to propagate through tmux + persist.
-		if msg.inst != nil {
-			h.groupTree.MoveSessionToGroup(msg.inst, "maia/standby")
-			h.instancesMu.Lock()
-			h.instances = h.groupTree.GetAllInstances()
-			h.instancesMu.Unlock()
-			h.rebuildFlatItems()
-			h.saveInstances()
-			h.resumingSessions[msg.inst.ID] = time.Now()
+	case teardownResultMsg:
+		// The `!gr` + `!make down` sequence finished; delete the session.
+		if msg.err != nil {
+			h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
+			return h, nil
 		}
-		inst := msg.inst
-		return h, tea.Tick(800*time.Millisecond, func(_ time.Time) tea.Msg {
-			return teardownStartMsg{inst: inst}
-		})
-
-	case teardownStartMsg:
-		// Stage 3: kick off the async make-down/restart/!gr//clear sequence.
 		if msg.inst == nil {
 			return h, nil
 		}
-		return h, h.teardownSession(msg.inst)
-
-	case teardownResultMsg:
-		if msg.err != nil {
-			h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
-		} else {
-			h.setError(fmt.Errorf("Teardown sent to '%s' (!gr + /clear)", msg.title))
-		}
-		return h, nil
+		h.setError(fmt.Errorf("Teardown done for '%s' — deleting", msg.title))
+		return h, h.deleteSession(msg.inst)
 
 	case watcherEventMsg:
 		// One-shot log per engine instance to confirm the listener path is alive.
@@ -7361,23 +7330,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "y":
-		// Teardown: rename session to "o", move to "maia/standby", restart,
-		// then send `!gr` + `/clear`. Mirrors the MAIA `/teardown` skill end-state.
-		// Each agent-deck step is staged via tea.Tick so the rename can settle
-		// before the group move, and the group move can settle before the
-		// async make-down/restart sequence kicks in.
+		// Teardown: send `!gr` then `!make down` into the session, wait for each
+		// to finish responding, then delete the session.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
-				inst := item.Session
-				inst.Title = "o"
-				inst.SyncTmuxDisplayName()
-				h.pendingTitleChanges[inst.ID] = "o"
-				h.invalidatePreviewCache(inst.ID)
-				h.saveInstances()
-				return h, tea.Tick(800*time.Millisecond, func(_ time.Time) tea.Msg {
-					return teardownMoveGroupMsg{inst: inst}
-				})
+				h.setError(fmt.Errorf("Tearing down '%s' (!gr + !make down)…", item.Session.Title))
+				return h, h.teardownSession(item.Session)
 			}
 		}
 		return h, nil
@@ -16216,39 +16175,55 @@ func (h *Home) sendOutputToSession(source, target *session.Instance) tea.Cmd {
 	}
 }
 
-// teardownSession restarts the session, waits for Claude to come up, then sends
-// `!gr` and `/clear` into the fresh pane. The post-restart sleep lets Claude
-// finish booting; the gap after `!gr` lets the worktree reset complete.
+// teardownSession sends `!gr` (reset the worktree) then `!make down` (stop the
+// docker stack) into the live session, waiting for each command to finish
+// responding before moving on, then signals the UI to delete the session. The
+// waits are best-effort: each command has a settle window plus a poll-until-idle
+// loop with a timeout, with a fixed gap between commands.
 func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
 	return func() tea.Msg {
-		time.Sleep(3 * time.Second)
-		// Stop the worker's docker stack via `make down` in the worktree.
-		// Non-fatal: log and continue if no Makefile or down target fails.
-		if wd := s.EffectiveWorkingDir(); wd != "" {
-			cmd := exec.Command("make", "down")
-			cmd.Dir = wd
-			if out, err := cmd.CombinedOutput(); err != nil {
-				uiLog.Info("teardown_make_down_failed", "session", s.Title, "dir", wd, "err", err, "output", string(out))
-			}
-		}
-		time.Sleep(2 * time.Second)
-		if err := s.Restart(); err != nil {
-			return teardownResultMsg{title: s.Title, err: fmt.Errorf("restart: %w", err)}
-		}
-		time.Sleep(5 * time.Second)
 		tmuxSession := s.GetTmuxSession()
 		if tmuxSession == nil {
-			return teardownResultMsg{title: s.Title, err: fmt.Errorf("no tmux pane after restart")}
+			return teardownResultMsg{title: s.Title, err: fmt.Errorf("no tmux pane")}
 		}
+
+		// 1. Reset the worktree.
 		if err := tmuxSession.SendKeysAndEnter("!gr"); err != nil {
 			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send !gr: %w", err)}
 		}
-		time.Sleep(5 * time.Second)
-		if err := tmuxSession.SendKeysAndEnter("/clear"); err != nil {
-			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send /clear: %w", err)}
-		}
+		waitForResponse(s, 4*time.Second, 60*time.Second)
 		time.Sleep(2 * time.Second)
-		return teardownResultMsg{title: s.Title}
+
+		// 2. Bring the docker stack down.
+		if err := tmuxSession.SendKeysAndEnter("!make down"); err != nil {
+			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send !make down: %w", err)}
+		}
+		waitForResponse(s, 4*time.Second, 180*time.Second)
+		time.Sleep(2 * time.Second)
+
+		return teardownResultMsg{title: s.Title, inst: s}
+	}
+}
+
+// waitForResponse blocks until the session has finished responding to the input
+// just sent. It first waits up to settle for the status to flip to running (so
+// we don't read a stale idle), then polls up to timeout for it to return to a
+// terminal state. Best-effort — a timeout simply lets teardown proceed.
+func waitForResponse(s *session.Instance, settle, timeout time.Duration) {
+	start := time.Now()
+	for time.Since(start) < settle {
+		if s.GetStatusThreadSafe() == session.StatusRunning {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		switch s.GetStatusThreadSafe() {
+		case session.StatusWaiting, session.StatusIdle, session.StatusError, session.StatusStopped:
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
