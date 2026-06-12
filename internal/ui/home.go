@@ -861,10 +861,12 @@ type sendOutputResultMsg struct {
 }
 
 // teardownResultMsg is sent when the async teardown send sequence completes.
-// On success inst is non-nil so the handler can delete the session.
+// On success id is the session to delete; the handler re-resolves it by ID so a
+// storage reload during the (minutes-long) teardown can't make us delete a
+// stale pointer.
 type teardownResultMsg struct {
 	title string
-	inst  *session.Instance
+	id    string
 	err   error
 }
 
@@ -5258,11 +5260,17 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
 			return h, nil
 		}
-		if msg.inst == nil {
+		// Re-resolve by ID: the pointer captured at key-press may have been
+		// replaced by a storage reload during the long-running teardown.
+		h.instancesMu.RLock()
+		inst := h.instanceByID[msg.id]
+		h.instancesMu.RUnlock()
+		if inst == nil {
+			h.setError(fmt.Errorf("teardown '%s': session no longer exists", msg.title))
 			return h, nil
 		}
 		h.setError(fmt.Errorf("Teardown done for '%s' — deleting", msg.title))
-		return h, h.deleteSession(msg.inst)
+		return h, h.deleteSession(inst)
 
 	case watcherEventMsg:
 		// One-shot log per engine instance to confirm the listener path is alive.
@@ -16181,27 +16189,45 @@ func (h *Home) sendOutputToSession(source, target *session.Instance) tea.Cmd {
 // waits are best-effort: each command has a settle window plus a poll-until-idle
 // loop with a timeout, with a fixed gap between commands.
 func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
+	id, title := s.ID, s.Title
 	return func() tea.Msg {
-		tmuxSession := s.GetTmuxSession()
-		if tmuxSession == nil {
-			return teardownResultMsg{title: s.Title, err: fmt.Errorf("no tmux pane")}
+		// Resolve the live instance by ID at execution time so a storage reload
+		// that swapped the captured pointer doesn't leave us sending into / polling
+		// a stale instance (mirrors restartSession).
+		resolve := func() *session.Instance {
+			h.instancesMu.RLock()
+			defer h.instancesMu.RUnlock()
+			if cur := h.instanceByID[id]; cur != nil {
+				return cur
+			}
+			return s
 		}
 
 		// 1. Reset the worktree.
-		if err := tmuxSession.SendKeysAndEnter("!gr"); err != nil {
-			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send !gr: %w", err)}
+		cur := resolve()
+		tmuxSession := cur.GetTmuxSession()
+		if tmuxSession == nil {
+			return teardownResultMsg{title: title, err: fmt.Errorf("no tmux pane")}
 		}
-		waitForResponse(s, 4*time.Second, 60*time.Second)
+		if err := tmuxSession.SendKeysAndEnter("!gr"); err != nil {
+			return teardownResultMsg{title: title, err: fmt.Errorf("send !gr: %w", err)}
+		}
+		waitForResponse(cur, 4*time.Second, 60*time.Second)
 		time.Sleep(2 * time.Second)
 
 		// 2. Bring the docker stack down.
-		if err := tmuxSession.SendKeysAndEnter("!make down"); err != nil {
-			return teardownResultMsg{title: s.Title, err: fmt.Errorf("send !make down: %w", err)}
+		cur = resolve()
+		tmuxSession = cur.GetTmuxSession()
+		if tmuxSession == nil {
+			return teardownResultMsg{title: title, err: fmt.Errorf("no tmux pane")}
 		}
-		waitForResponse(s, 4*time.Second, 180*time.Second)
+		if err := tmuxSession.SendKeysAndEnter("!make down"); err != nil {
+			return teardownResultMsg{title: title, err: fmt.Errorf("send !make down: %w", err)}
+		}
+		waitForResponse(cur, 4*time.Second, 180*time.Second)
 		time.Sleep(2 * time.Second)
 
-		return teardownResultMsg{title: s.Title, inst: s}
+		return teardownResultMsg{title: title, id: id}
 	}
 }
 
