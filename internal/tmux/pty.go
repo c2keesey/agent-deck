@@ -24,6 +24,21 @@ import (
 // instead of the detach key. The caller should switch to the previous session.
 var ErrMRUSwitch = fmt.Errorf("mru switch requested")
 
+// ErrAttentionSwitch is returned by Attach when the user presses the attention
+// switch key (Ctrl+E by default). The caller should switch to the highest
+// priority session that is ready to be picked back up. (local fork)
+var ErrAttentionSwitch = fmt.Errorf("attention switch requested")
+
+// switchKind distinguishes the three ways Attach can hand control back to the
+// TUI: a normal detach, an MRU switch, or an attention switch.
+type switchKind int
+
+const (
+	switchDetach switchKind = iota
+	switchMRU
+	switchAttention
+)
+
 const attachOutputDrainTimeout = 250 * time.Millisecond
 
 // attachReplyQuarantine is how long after attach/detach we filter
@@ -72,8 +87,9 @@ func IndexCtrlQ(data []byte) int {
 
 // AttachOpts configures the Attach call.
 type AttachOpts struct {
-	DetachByte   byte // default 0x11 (Ctrl+Q)
-	MRUSwitchKey byte // if non-zero, this key triggers ErrMRUSwitch instead of detach
+	DetachByte         byte // default 0x11 (Ctrl+Q)
+	MRUSwitchKey       byte // if non-zero, this key triggers ErrMRUSwitch instead of detach
+	AttentionSwitchKey byte // if non-zero, this key triggers ErrAttentionSwitch instead of detach (local fork)
 }
 
 func waitForAttachOutputDrain(outputDone <-chan struct{}, timeout time.Duration) (bool, time.Duration) {
@@ -157,6 +173,7 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 		detach = 17
 	}
 	mruSwitch := opts.MRUSwitchKey
+	attentionSwitch := opts.AttentionSwitchKey
 
 	if !s.Exists() {
 		return fmt.Errorf("session %s does not exist", s.Name)
@@ -269,8 +286,8 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 	sigwinch <- syscall.SIGWINCH
 
 	// Channel to signal detach via configured detach key.
-	// Sends true for MRU switch, false for normal detach.
-	detachCh := make(chan bool, 1)
+	// Carries the switchKind: normal detach, MRU switch, or attention switch.
+	detachCh := make(chan switchKind, 1)
 
 	// Channel for I/O errors (buffered to prevent goroutine leaks)
 	ioErrors := make(chan error, 2)
@@ -344,7 +361,25 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 							return
 						}
 					}
-					detachCh <- true // MRU switch
+					detachCh <- switchMRU
+					cancel()
+					return
+				}
+			}
+
+			// Check for attention switch key (if configured) before detach key. (local fork)
+			if attentionSwitch != 0 {
+				if idx := IndexDetachKey(buf[:n], attentionSwitch); idx >= 0 {
+					if idx > 0 {
+						if _, err := ptmx.Write(buf[:idx]); err != nil {
+							select {
+							case ioErrors <- fmt.Errorf("PTY write error: %w", err):
+							default:
+							}
+							return
+						}
+					}
+					detachCh <- switchAttention
 					cancel()
 					return
 				}
@@ -364,7 +399,7 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 						return
 					}
 				}
-				detachCh <- false // normal detach
+				detachCh <- switchDetach // normal detach
 				cancel()
 				return
 			}
@@ -427,12 +462,15 @@ func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
 	// Wait for either detach or command completion
 	var attachErr error
 	select {
-	case isMRU := <-detachCh:
-		// User pressed the detach key (or MRU switch key), detach gracefully.
+	case kind := <-detachCh:
+		// User pressed the detach key (or a switch key), detach gracefully.
 		didDetach = true
-		if isMRU {
+		switch kind {
+		case switchMRU:
 			attachErr = ErrMRUSwitch
-		} else {
+		case switchAttention:
+			attachErr = ErrAttentionSwitch
+		default:
 			attachErr = nil
 		}
 	case err := <-cmdDone:

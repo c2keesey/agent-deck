@@ -482,6 +482,14 @@ type Home struct {
 	mruCycleOrigin     string              // Session ID where the chain started
 	mruCycleLastSwitch time.Time           // When the last Ctrl+W was pressed
 
+	// Attention (priority) cycling — Ctrl+E. Mirrors the MRU chain machinery
+	// but snapshots sessions that are READY to be picked back up (waiting/idle)
+	// ordered by conductor-assigned priority, then longest-waiting. (local fork)
+	attentionCycleIndex      int
+	attentionCycleSnapshot   []*session.Instance
+	attentionCycleOrigin     string
+	attentionCycleLastSwitch time.Time
+
 	// Undo delete stack (Chrome-style: Ctrl+Z restores in reverse order)
 	undoStack []deletedSessionEntry
 
@@ -647,6 +655,15 @@ func (h *Home) mruSwitchByte() byte {
 	return DetachByteFromBinding(key)
 }
 
+func (h *Home) attentionSwitchByte() byte {
+	bindings := resolveHotkeys(session.GetHotkeyOverrides())
+	key := actionHotkey(bindings, hotkeyAttentionCycle)
+	if key == "" {
+		return 0
+	}
+	return DetachByteFromBinding(key)
+}
+
 func (h *Home) setHotkeys(bindings map[string]string) {
 	if bindings == nil {
 		bindings = resolveHotkeys(nil)
@@ -781,9 +798,10 @@ type sessionForkedMsg struct {
 type refreshMsg struct{}
 
 type statusUpdateMsg struct {
-	attachedSessionID string // Session that just returned from attach (if local attach)
-	attachedWorkDir   string // pane_current_path captured after attach returns
-	mruSwitchFrom     string // If non-empty, MRU switch was requested from this session
+	attachedSessionID   string // Session that just returned from attach (if local attach)
+	attachedWorkDir     string // pane_current_path captured after attach returns
+	mruSwitchFrom       string // If non-empty, MRU switch was requested from this session
+	attentionSwitchFrom string // If non-empty, attention (Ctrl+E) switch was requested from this session (local fork)
 } // Triggers immediate status update without reloading
 
 type attachReturnRefreshMsg struct{}
@@ -1638,6 +1656,108 @@ func (h *Home) mruSortedSessions() []*session.Instance {
 		return false
 	})
 	return result
+}
+
+// attentionReadySince reports when a session became ready to be picked back up.
+// Prefers the waiting transition time (when it started blocking on the user);
+// falls back to last-accessed for idle/finished sessions with no waiting stamp.
+func attentionReadySince(inst *session.Instance) time.Time {
+	if ws := inst.GetWaitingSince(); !ws.IsZero() {
+		return ws
+	}
+	return inst.LastAccessedAt
+}
+
+// attentionSortedSessions returns the sessions that are READY to be picked back
+// up — status waiting (blocked on the user) or idle (finished its turn) — sorted
+// by conductor-assigned priority (1 highest .. 3; unset/0 last), then by
+// longest-waiting first. running sessions are excluded: there's nothing for the
+// user to do on them yet. This is the order Ctrl+E cycles through. (local fork)
+func (h *Home) attentionSortedSessions() []*session.Instance {
+	h.instancesMu.RLock()
+	all := make([]*session.Instance, len(h.instances))
+	copy(all, h.instances)
+	h.instancesMu.RUnlock()
+
+	result := make([]*session.Instance, 0, len(all))
+	for _, inst := range all {
+		if inst == nil {
+			continue
+		}
+		if inst.Status == session.StatusWaiting || inst.Status == session.StatusIdle {
+			result = append(result, inst)
+		}
+	}
+
+	// Rank key for priority: 1..3 keep their value; unset (0) sorts last.
+	rank := func(p int) int {
+		if p <= 0 {
+			return session.MaxPriority + 1
+		}
+		return p
+	}
+
+	sort.SliceStable(result, func(i, j int) bool {
+		ri, rj := rank(result[i].Priority), rank(result[j].Priority)
+		if ri != rj {
+			return ri < rj // higher priority (lower number) first
+		}
+		// Same priority tier: the one ready longest comes first.
+		ti, tj := attentionReadySince(result[i]), attentionReadySince(result[j])
+		if ti.IsZero() != tj.IsZero() {
+			return !ti.IsZero() // a real timestamp beats an unknown one
+		}
+		return ti.Before(tj)
+	})
+	return result
+}
+
+// attentionPriorityRank maps a priority to a sortable rank where lower is more
+// important and unset (0) sorts last. (local fork)
+func attentionPriorityRank(p int) int {
+	if p <= 0 {
+		return session.MaxPriority + 1
+	}
+	return p
+}
+
+// attentionNudgeText returns a one-line status-bar nudge when a session of
+// strictly higher priority than the currently-attached one is ready to be
+// picked back up (waiting/idle). Empty when nothing more important is ready, or
+// when not attached (attachedID == "") — in the list view the board already
+// shows everything, so a bar nudge would be noise. (local fork)
+func (h *Home) attentionNudgeText(attachedID string, instances []*session.Instance) string {
+	if attachedID == "" {
+		return ""
+	}
+	attachedRank := attentionPriorityRank(0)
+	for _, inst := range instances {
+		if inst != nil && inst.ID == attachedID {
+			attachedRank = attentionPriorityRank(inst.Priority)
+			break
+		}
+	}
+
+	var best *session.Instance
+	for _, inst := range instances {
+		if inst == nil || inst.ID == attachedID || inst.Priority <= 0 {
+			continue
+		}
+		st := inst.GetStatusThreadSafe()
+		if st != session.StatusWaiting && st != session.StatusIdle {
+			continue
+		}
+		if attentionPriorityRank(inst.Priority) >= attachedRank {
+			continue // not strictly higher than where the user already is
+		}
+		if best == nil || attentionPriorityRank(inst.Priority) < attentionPriorityRank(best.Priority) {
+			best = inst
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return fmt.Sprintf("⚡ P%d %s ready — ^E", best.Priority, best.Title)
 }
 
 func (h *Home) captureSelectedItemIdentity() selectedItemIdentity {
@@ -3626,6 +3746,18 @@ func (h *Home) syncNotificationsBackground() {
 	// Update tmux status bar directly
 	barText := h.notificationManager.FormatBar()
 
+	// Local fork: when attached, prefix a priority nudge if a strictly
+	// higher-priority session is ready to be picked back up. This is the piece
+	// that pulls the user off lower-priority work the moment the important
+	// thread is ready — Ctrl+E then jumps straight to it.
+	if nudge := h.attentionNudgeText(currentSessionID, instances); nudge != "" {
+		if barText == "" {
+			barText = nudge
+		} else {
+			barText = nudge + "  " + barText
+		}
+	}
+
 	// Only update if changed (avoid unnecessary tmux calls)
 	h.lastBarTextMu.Lock()
 	if barText != h.lastBarText {
@@ -4922,6 +5054,45 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.mruCycleOrigin = ""
 			h.mruCycleIndex = 0
 			h.mruCycleLastSwitch = time.Time{}
+		}
+
+		// Reset attention chain on anything that isn't an attention switch.
+		if msg.attentionSwitchFrom == "" {
+			h.attentionCycleSnapshot = nil
+			h.attentionCycleOrigin = ""
+			h.attentionCycleIndex = 0
+			h.attentionCycleLastSwitch = time.Time{}
+		}
+
+		// Attention switch: user pressed Ctrl+E while attached — jump to the
+		// highest-priority READY session (waiting/idle). Frozen snapshot so
+		// repeated presses cycle through the ready set; the origin session is
+		// excluded so the first hop never lands back where we just were.
+		if msg.attentionSwitchFrom != "" {
+			stale := !h.attentionCycleLastSwitch.IsZero() && time.Since(h.attentionCycleLastSwitch) > 3*time.Second
+			if h.attentionCycleSnapshot == nil || h.attentionCycleOrigin == "" || stale {
+				ready := h.attentionSortedSessions()
+				filtered := ready[:0]
+				for _, inst := range ready {
+					if inst.ID != msg.attentionSwitchFrom {
+						filtered = append(filtered, inst)
+					}
+				}
+				h.attentionCycleSnapshot = filtered
+				h.attentionCycleOrigin = msg.attentionSwitchFrom
+				h.attentionCycleIndex = -1
+			}
+			h.attentionCycleLastSwitch = time.Now()
+			if len(h.attentionCycleSnapshot) > 0 {
+				h.attentionCycleIndex = (h.attentionCycleIndex + 1) % len(h.attentionCycleSnapshot)
+				target := h.attentionCycleSnapshot[h.attentionCycleIndex]
+				if target.Exists() {
+					h.moveCursorToSession(target.ID)
+					return h, tea.Batch(tea.Sequence(tea.DisableMouse, tea.EnableMouseCellMotion), h.attachSession(target))
+				}
+			}
+			// Nothing ready to jump to — land on the list with a hint.
+			h.maintenanceMsg = "No sessions ready to pick up (Ctrl+E)"
 		}
 
 		// MRU switch: user pressed Ctrl+W while attached — attach to next MRU session.
@@ -6452,6 +6623,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.mruCycleLastSwitch = time.Time{}
 	}
 
+	// Reset attention cycle position on any key except its cycle key. (local fork)
+	if key != "ctrl+e" {
+		h.attentionCycleIndex = 0
+		h.attentionCycleSnapshot = nil
+		h.attentionCycleOrigin = ""
+		h.attentionCycleLastSwitch = time.Time{}
+	}
+
 	// v1.7.60: any keypress dismisses the one-shot nav-discoverability hint
 	// (beyond the existing ESC path). The sentinel was already written at
 	// NewHome, so this only has to clear the visible banner.
@@ -7499,8 +7678,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		return h, cmd
 
-	case "ctrl+e":
-		// Open feedback dialog on demand (per D-11: bypasses ShouldShow -- user-initiated)
+	case "F":
+		// Open feedback dialog on demand (per D-11: bypasses ShouldShow -- user-initiated).
+		// Local fork: moved off Ctrl+E (now the priority attention switcher) to
+		// Shift+F. The feedback feature itself is unchanged; only the key differs.
 		if h.feedbackDialog != nil {
 			st := h.feedbackState
 			if st == nil {
@@ -7613,6 +7794,25 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.mruCycleIndex = 1
 		}
 		h.moveCursorToSession(h.mruCycleSnapshot[h.mruCycleIndex].ID)
+		return h, nil
+
+	case "ctrl+e":
+		// Attention cycle (local fork): move the cursor through READY sessions
+		// (waiting/idle) ordered by priority, then longest-waiting. Freeze the
+		// snapshot on first press; reset if stale (>3s). First press lands on
+		// the top-priority ready session; repeats cycle down the list.
+		stale := !h.attentionCycleLastSwitch.IsZero() && time.Since(h.attentionCycleLastSwitch) > 3*time.Second
+		if h.attentionCycleSnapshot == nil || stale {
+			h.attentionCycleSnapshot = h.attentionSortedSessions()
+			h.attentionCycleIndex = -1
+		}
+		h.attentionCycleLastSwitch = time.Now()
+		if len(h.attentionCycleSnapshot) == 0 {
+			h.maintenanceMsg = "No sessions ready to pick up (Ctrl+E)"
+			return h, nil
+		}
+		h.attentionCycleIndex = (h.attentionCycleIndex + 1) % len(h.attentionCycleSnapshot)
+		h.moveCursorToSession(h.attentionCycleSnapshot[h.attentionCycleIndex].ID)
 		return h, nil
 	}
 
@@ -10686,7 +10886,7 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 	// On return, immediately update all session statuses (don't reload from storage
 	// which would lose the tmux session state)
 	h.isAttaching.Store(true) // Prevent View() output only during actual attach transition
-	return tea.Exec(attachCmd{session: tmuxSess, detachByte: h.detachByte(), mruSwitchKey: h.mruSwitchByte()}, func(err error) tea.Msg {
+	return tea.Exec(attachCmd{session: tmuxSess, detachByte: h.detachByte(), mruSwitchKey: h.mruSwitchByte(), attentionSwitchKey: h.attentionSwitchByte()}, func(err error) tea.Msg {
 		// CRITICAL: Set isAttaching to false BEFORE returning the message
 		// This prevents a race condition where View() could be called with
 		// isAttaching=true before Update() processes statusUpdateMsg,
@@ -10713,6 +10913,12 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 		// immediately attach to the previous session
 		if errors.Is(err, tmux.ErrMRUSwitch) {
 			msg.mruSwitchFrom = inst.ID
+		}
+
+		// If the user pressed Ctrl+E (attention switch), signal that we should
+		// immediately attach to the highest-priority ready session. (local fork)
+		if errors.Is(err, tmux.ErrAttentionSwitch) {
+			msg.attentionSwitchFrom = inst.ID
 		}
 
 		return msg
@@ -10773,9 +10979,10 @@ func (h *Home) followAttachReturnCwd(msg statusUpdateMsg) {
 
 // attachCmd implements tea.ExecCommand for custom PTY attach
 type attachCmd struct {
-	session      *tmux.Session
-	detachByte   byte
-	mruSwitchKey byte
+	session            *tmux.Session
+	detachByte         byte
+	mruSwitchKey       byte
+	attentionSwitchKey byte
 }
 
 func (a attachCmd) Run() error {
@@ -10784,8 +10991,9 @@ func (a attachCmd) Run() error {
 
 	ctx := context.Background()
 	return a.session.AttachWithOpts(ctx, tmux.AttachOpts{
-		DetachByte:   a.detachByte,
-		MRUSwitchKey: a.mruSwitchKey,
+		DetachByte:         a.detachByte,
+		MRUSwitchKey:       a.mruSwitchKey,
+		AttentionSwitchKey: a.attentionSwitchKey,
 	})
 }
 

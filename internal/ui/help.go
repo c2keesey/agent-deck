@@ -202,6 +202,7 @@ func (h *HelpOverlay) View() string {
 	groupKey := h.key(hotkeyCreateGroup, "g")
 	undoKey := h.key(hotkeyUndoDelete, "Ctrl+Z")
 	mruKey := h.key(hotkeyMRUCycle, "Ctrl+W")
+	attentionKey := h.key(hotkeyAttentionCycle, "Ctrl+E")
 	teardownKey := h.key(hotkeyTeardown, "y")
 
 	sections := []struct {
@@ -223,6 +224,7 @@ func (h *HelpOverlay) View() string {
 				{"1-9", "Jump to root group"},
 				{"Space", "Jump mode"},
 				{mruKey, "Cycle recent sessions"},
+				{attentionKey, "Cycle ready sessions by priority"},
 				{"Enter", "Attach / toggle"},
 				{"Shift+Enter", "Open session in new iTerm window (macOS)"},
 			},

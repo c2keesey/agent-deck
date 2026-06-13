@@ -34,6 +34,7 @@ const (
 	FieldAutoMode           = "auto-mode"
 	FieldAccount            = "account"      // #924 per-session named account slot
 	FieldIdleTimeout        = "idle-timeout" // #1143 auto-stop dormant sessions
+	FieldPriority           = "priority"     // local fork: Ctrl+E attention cycle tier
 )
 
 var ValidMutableFields = []string{
@@ -57,6 +58,7 @@ var ValidMutableFields = []string{
 	FieldAutoMode,
 	FieldAccount,
 	FieldIdleTimeout,
+	FieldPriority,
 }
 
 type FieldRestartPolicy int
@@ -354,6 +356,16 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 			return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
 		}
 		inst.IdleTimeoutSecs = secs
+
+	case FieldPriority:
+		// Local fork: conductor-assigned importance tier (0 clears, 1..3).
+		// Live — the next Ctrl+E snapshot and status nudge read the new value.
+		oldValue = strconv.Itoa(inst.Priority)
+		prio, perr := ParsePriorityFlag(strings.TrimSpace(value))
+		if perr != nil {
+			return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
+		}
+		inst.Priority = prio
 
 	default:
 		return "", nil, &MutationError{

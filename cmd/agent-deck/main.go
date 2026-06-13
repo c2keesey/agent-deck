@@ -1877,7 +1877,8 @@ func handleList(profile string, args []string) {
 			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
 			Channels      []string  `json:"channels,omitempty"`
 			ExtraArgs     []string  `json:"extra_args,omitempty"`
-			Color         string    `json:"color,omitempty"` // issue #391
+			Color         string    `json:"color,omitempty"`    // issue #391
+			Priority      int       `json:"priority,omitempty"` // local fork: Ctrl+E tier
 		}
 		// Warm tmux pane-title cache + load hook statuses so the CLI
 		// reports the same Status the TUI and /api/menu do (issue #610).
@@ -1900,6 +1901,7 @@ func handleList(profile string, args []string) {
 				Channels:      inst.Channels,
 				ExtraArgs:     inst.ExtraArgs,
 				Color:         inst.Color,
+				Priority:      inst.Priority,
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
@@ -1966,6 +1968,7 @@ func handleListAllProfiles(jsonOutput bool) {
 			CreatedAt     time.Time `json:"created_at"`
 			SSHHost       string    `json:"ssh_host,omitempty"`
 			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
+			Priority      int       `json:"priority,omitempty"` // local fork: Ctrl+E tier
 		}
 		var allSessions []sessionJSON
 
@@ -1990,6 +1993,7 @@ func handleListAllProfiles(jsonOutput bool) {
 					CreatedAt:     inst.CreatedAt,
 					SSHHost:       inst.SSHHost,
 					SSHRemotePath: inst.SSHRemotePath,
+					Priority:      inst.Priority,
 				})
 			}
 		}

@@ -1,0 +1,167 @@
+package ui
+
+import (
+	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+)
+
+func TestAttentionCycleDefaultBinding(t *testing.T) {
+	bindings := resolveHotkeys(nil)
+	if got := bindings[hotkeyAttentionCycle]; got != "ctrl+e" {
+		t.Fatalf("attention_cycle default binding = %q, want ctrl+e", got)
+	}
+}
+
+func TestAttentionCycleOverride(t *testing.T) {
+	bindings := resolveHotkeys(map[string]string{
+		"attention_cycle": "ctrl+p",
+	})
+	if got := bindings[hotkeyAttentionCycle]; got != "ctrl+p" {
+		t.Fatalf("attention_cycle override = %q, want ctrl+p", got)
+	}
+}
+
+func TestAttentionCycleUnbind(t *testing.T) {
+	bindings := resolveHotkeys(map[string]string{
+		"attention_cycle": "",
+	})
+	if _, ok := bindings[hotkeyAttentionCycle]; ok {
+		t.Fatalf("attention_cycle should be unbound")
+	}
+}
+
+func TestAttentionSwitchByte(t *testing.T) {
+	// Ctrl+E = byte 5 (5th letter, ctrl+a = 1).
+	if got := DetachByteFromBinding("ctrl+e"); got != 5 {
+		t.Fatalf("DetachByteFromBinding(ctrl+e) = %d, want 5", got)
+	}
+}
+
+// readyInstance builds an instance in a ready (waiting/idle) state with a
+// priority and a creation time controlling the longest-waiting tiebreak.
+func readyInstance(id string, status session.Status, prio int, created time.Time) *session.Instance {
+	inst := session.NewInstance(id, "/tmp/"+id)
+	inst.ID = id
+	inst.Status = status
+	inst.Priority = prio
+	inst.CreatedAt = created
+	return inst
+}
+
+func TestAttentionSortedSessions_PriorityOrderAndReadyFilter(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	h.instances = []*session.Instance{
+		readyInstance("running-hi", session.StatusRunning, 1, base), // excluded: running
+		readyInstance("idle-unset", session.StatusIdle, 0, base),    // unset → last
+		readyInstance("wait-p2", session.StatusWaiting, 2, base),
+		readyInstance("wait-p1", session.StatusWaiting, 1, base),
+		readyInstance("idle-p1", session.StatusIdle, 1, base.Add(-time.Hour)), // older P1 → first
+	}
+
+	got := h.attentionSortedSessions()
+	gotIDs := make([]string, len(got))
+	for i, inst := range got {
+		gotIDs[i] = inst.ID
+	}
+
+	want := []string{"idle-p1", "wait-p1", "wait-p2", "idle-unset"}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("attentionSortedSessions returned %v, want %v", gotIDs, want)
+	}
+	for i := range want {
+		if gotIDs[i] != want[i] {
+			t.Fatalf("attentionSortedSessions order = %v, want %v", gotIDs, want)
+		}
+	}
+}
+
+func TestAttentionSortedSessions_LongestWaitingTiebreak(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	// Same priority tier; the one ready longest (older CreatedAt) ranks first.
+	h.instances = []*session.Instance{
+		readyInstance("newer", session.StatusWaiting, 1, base),
+		readyInstance("older", session.StatusWaiting, 1, base.Add(-2*time.Hour)),
+	}
+	got := h.attentionSortedSessions()
+	if len(got) != 2 || got[0].ID != "older" {
+		t.Fatalf("expected older P1 first, got %+v", got)
+	}
+}
+
+func TestAttentionNudge_HigherPriorityReadyWhileAttached(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	attached := readyInstance("attached-p2", session.StatusRunning, 2, base)
+	p1ready := readyInstance("urgent-p1", session.StatusWaiting, 1, base)
+	insts := []*session.Instance{attached, p1ready}
+
+	got := h.attentionNudgeText("attached-p2", insts)
+	want := "⚡ P1 urgent-p1 ready — ^E"
+	if got != want {
+		t.Fatalf("nudge = %q, want %q", got, want)
+	}
+}
+
+func TestAttentionNudge_NoNudgeWhenAttachedIsTopPriority(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	insts := []*session.Instance{
+		readyInstance("attached-p1", session.StatusRunning, 1, base),
+		readyInstance("other-p2", session.StatusWaiting, 2, base),
+	}
+	if got := h.attentionNudgeText("attached-p1", insts); got != "" {
+		t.Fatalf("expected no nudge when attached is top priority, got %q", got)
+	}
+}
+
+func TestAttentionNudge_UnsetAttachedNudgedByAnyPrioritized(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	insts := []*session.Instance{
+		readyInstance("attached-unset", session.StatusRunning, 0, base),
+		readyInstance("p3-ready", session.StatusIdle, 3, base),
+	}
+	got := h.attentionNudgeText("attached-unset", insts)
+	if got != "⚡ P3 p3-ready ready — ^E" {
+		t.Fatalf("unset-attached should be nudged by any prioritized ready session, got %q", got)
+	}
+}
+
+func TestAttentionNudge_NoNudgeWhenNotAttached(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	insts := []*session.Instance{
+		readyInstance("p1-ready", session.StatusWaiting, 1, base),
+	}
+	if got := h.attentionNudgeText("", insts); got != "" {
+		t.Fatalf("expected no nudge in list view (attachedID empty), got %q", got)
+	}
+}
+
+func TestAttentionNudge_IgnoresRunningHigherPriority(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	insts := []*session.Instance{
+		readyInstance("attached-p2", session.StatusRunning, 2, base),
+		readyInstance("p1-running", session.StatusRunning, 1, base), // not ready
+	}
+	if got := h.attentionNudgeText("attached-p2", insts); got != "" {
+		t.Fatalf("a running higher-priority session is not ready — no nudge, got %q", got)
+	}
+}
+
+func TestAttentionSortedSessions_EmptyWhenNothingReady(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	h.instances = []*session.Instance{
+		readyInstance("r1", session.StatusRunning, 1, base),
+		readyInstance("r2", session.StatusRunning, 2, base),
+	}
+	if got := h.attentionSortedSessions(); len(got) != 0 {
+		t.Fatalf("expected no ready sessions, got %d", len(got))
+	}
+}

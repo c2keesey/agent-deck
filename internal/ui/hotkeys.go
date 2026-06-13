@@ -44,6 +44,7 @@ const (
 	hotkeyReload          = "reload"
 	hotkeyDetach          = "detach"
 	hotkeyMRUCycle        = "mru_cycle"
+	hotkeyAttentionCycle  = "attention_cycle"
 	hotkeyTeardown        = "teardown"
 )
 
@@ -83,6 +84,7 @@ var hotkeyActionOrder = []string{
 	hotkeyReload,
 	hotkeyDetach,
 	hotkeyMRUCycle,
+	hotkeyAttentionCycle,
 	hotkeyWatcherPanel,
 	hotkeyTeardown,
 }
@@ -123,6 +125,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyReload:          "ctrl+r",
 	hotkeyDetach:          "ctrl+q",
 	hotkeyMRUCycle:        "ctrl+w",
+	hotkeyAttentionCycle:  "ctrl+e",
 	hotkeyWatcherPanel:    "",
 	hotkeyTeardown:        "y",
 }
