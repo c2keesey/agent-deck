@@ -7902,10 +7902,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.maiaWorkerPicker.Show(occupied)
 		return h, nil
 
-	case "N":
-		// Quick create (local fork: moved off "a" to "N" so quick_approve can
-		// own "a"). Check if cursor is on a remote group/session — create on
-		// remote instead.
+	case "a":
+		// Quick create (local fork keeps this on "a"; upstream's quick_approve
+		// is parked on ctrl+a). Check if cursor is on a remote group/session —
+		// create on remote instead.
 		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {

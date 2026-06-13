@@ -107,16 +107,17 @@ var hotkeyActionOrder = []string{
 
 // defaultHotkeyBindings keeps the local fork keymap as the source of truth
 // (the user relies on this muscle memory: teardown=y, attention=ctrl+e,
-// mru=ctrl+w, hard_restart=ctrl+t, restart=t, settings=p, …). Upstream's
-// v1.9.x keybinding overhaul (restart→R, close→D, move→M, settings→S,
-// toggle_yolo→y, etc.) is intentionally NOT adopted. Upstream's genuinely-new
-// actions are grafted onto free keys; the two whose upstream keys collide with
-// a local binding (cycle_group_view→t=restart, worktree_setup→b=exec_shell)
-// stay unbound and can be set via config.
+// mru=ctrl+w, hard_restart=ctrl+t, restart=t, settings=p, quick_create=a, …).
+// Upstream's v1.9.x keybinding overhaul (restart→R, close→D, move→M, settings→S,
+// toggle_yolo→y, quick_create→N, etc.) is intentionally NOT adopted. Upstream's
+// genuinely-new actions are grafted onto free keys when their upstream default
+// collides with a local binding: cycle_group_view→V (upstream t=restart),
+// worktree_setup→B (upstream b=exec_shell), quick_approve→ctrl+a (upstream
+// a=quick_create). toggle_yolo stays unbound (upstream y=teardown).
 var defaultHotkeyBindings = map[string]string{
 	hotkeyQuit:             "q",
 	hotkeyNewSession:       "n",
-	hotkeyQuickCreate:      "N", // was "a" in local, which shadowed quick_approve; freed for approve
+	hotkeyQuickCreate:      "a",
 	hotkeyRename:           "r",
 	hotkeyRestart:          "t",
 	hotkeyHardRestart:      "ctrl+t",
@@ -134,8 +135,8 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyTogglePreview:    "v",
 	hotkeyCycleGroupView:   "V", // upstream "t" collides with local restart; use shift+v (View)
 	hotkeyMarkUnread:       "u",
-	hotkeyQuickApprove:     "a",
-	hotkeyToggleYolo:       "", // upstream "y" collides with local teardown
+	hotkeyQuickApprove:     "ctrl+a", // local: 'a' is quick-create; user runs bypass-permissions so approve is parked off the home row
+	hotkeyToggleYolo:       "",       // upstream "y" collides with local teardown
 	hotkeyQuickFork:        "f",
 	hotkeyForkWithOptions:  "z",
 	hotkeyCopyOutput:       "c",

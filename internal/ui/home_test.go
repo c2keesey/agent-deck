@@ -1475,13 +1475,11 @@ func TestRemoteSelectionQuickCreateStillRunsRemoteCommand(t *testing.T) {
 	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
 	home.cursor = 0
 
-	// Local fork: quick-create is bound to 'N'. It was 'a' previously, but the
-	// v1.9.x sync brought upstream's quick-approve (issue #1369), which defaults
-	// to 'a' — the higher-value action for this workflow. Quick-create moved to
-	// 'N' (upstream's own convention) so both work; 'n' still opens the picker.
-	_, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	// Local fork: quick-create is bound to 'a' (upstream's quick-approve is
+	// parked on ctrl+a since the user runs bypass-permissions).
+	_, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	if cmd == nil {
-		t.Fatal("pressing 'N' on remote selection should return remote create command")
+		t.Fatal("pressing 'a' on remote selection should return remote create command")
 	}
 
 	msg := cmd()
