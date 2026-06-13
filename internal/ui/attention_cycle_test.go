@@ -176,8 +176,8 @@ func TestStyledNudgeBar_EmptyPassesThrough(t *testing.T) {
 
 func TestStyledNudgeBar_TierColorsAndReset(t *testing.T) {
 	cases := []struct {
-		plain   string
-		wantBg  string
+		plain  string
+		wantBg string
 	}{
 		{"⚡ P1 urgent ready — ^E", "bg=#f7768e"}, // red
 		{"⚡ P2 soon ready — ^E", "bg=#ff9e64"},   // orange

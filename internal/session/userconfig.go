@@ -274,13 +274,16 @@ type UISettings struct {
 	Footer string `toml:"footer"`
 
 	// NewSessionEnterAdvances controls what Enter does on the free-text
-	// Name/Branch fields of the new-session dialog (PR #1295). Default false
-	// preserves today's behavior: Enter from Name/Branch submits the form. When
-	// true, Enter advances focus to the next field instead (so typing a name and
-	// pressing Enter no longer silently creates a session with all defaults), and
-	// Ctrl+S becomes the explicit submit shortcut. Ctrl+S submits in BOTH modes —
-	// it is strictly additive and always available regardless of this toggle.
-	NewSessionEnterAdvances bool `toml:"new_session_enter_advances"`
+	// Name/Branch fields of the new-session dialog. As of the UX top-3 pass this
+	// is ON BY DEFAULT (the mechanism shipped opt-in in PR #1295): Enter advances
+	// focus to the next field, so typing a name and pressing Enter no longer
+	// silently creates a session with all defaults — the #1 reported new-session
+	// trap. Ctrl+S is the explicit submit shortcut and submits in BOTH modes;
+	// Enter still submits from non-text rows (tool/checkboxes). The pointer lets
+	// us distinguish "unset" (nil → default true) from an explicit opt-OUT
+	// (`new_session_enter_advances = false` → restores the legacy Enter-submits
+	// behavior). Set `= true` (or leave unset) to keep the new default.
+	NewSessionEnterAdvances *bool `toml:"new_session_enter_advances"`
 }
 
 // normalizeUIHiddenTools lowercases, dedupes, and drops unknown entries from
@@ -429,10 +432,15 @@ func (u UISettings) GetRemoteSessionRefreshSecs() int {
 
 // GetNewSessionEnterAdvances reports whether Enter on the new-session dialog's
 // free-text Name/Branch fields should advance focus (true) instead of
-// submitting the form (false). Default false preserves today's behavior
-// (Enter submits). Ctrl+S submits in both modes. See PR #1295.
+// submitting the form (false). Defaults to true when unset: Enter-advances is
+// the default so typing a name + Enter no longer silently submits with all
+// defaults. A literal `new_session_enter_advances = false` opts out and
+// restores the legacy Enter-submits behavior. Ctrl+S submits in both modes.
 func (u UISettings) GetNewSessionEnterAdvances() bool {
-	return u.NewSessionEnterAdvances
+	if u.NewSessionEnterAdvances == nil {
+		return true // Default: ON (Enter advances; Ctrl+S submits).
+	}
+	return *u.NewSessionEnterAdvances
 }
 
 // GetRemoteLatencyRefreshSecs returns the remote latency refresh interval
@@ -2122,6 +2130,18 @@ func (f ForkSettings) Resolve(parentSandboxed bool) ResolvedForkPlan {
 type StatusSettings struct {
 	// Reserved for future status detection settings.
 	// Control mode pipes are always enabled (no longer configurable).
+
+	// ShellRunningIndicator promotes "shell" tool sessions from idle to
+	// running when the pane's foreground command is a genuine non-interactive
+	// process (e.g. "node" from `yarn dev`, "java" from `mvn spring-boot:run`).
+	// Opt-in (default false): the interactive-program denylist is necessarily
+	// incomplete, so a shell sitting at a psql/REPL/fzf prompt would otherwise
+	// read "running" while the user is idle. Users who want dev-server
+	// detection accept that tradeoff explicitly:
+	//
+	//	[status]
+	//	shell_running_indicator = true
+	ShellRunningIndicator bool `toml:"shell_running_indicator"`
 }
 
 // MaintenanceSettings controls the automatic maintenance worker
@@ -2568,6 +2588,44 @@ func IsCodexCompatible(toolName string) bool {
 	}
 	if def := GetToolDef(toolName); def != nil {
 		return strings.EqualFold(strings.TrimSpace(def.CompatibleWith), "codex") || isCodexCommand(def.Command)
+	}
+	return false
+}
+
+// isShellBinary returns true if cmd is a known interactive shell process name.
+// Used to distinguish "shell at a prompt" from "shell running a foreground command"
+// (e.g. "node" from "yarn dev", "java" from "mvn spring-boot:run").
+func isShellBinary(cmd string) bool {
+	switch strings.ToLower(cmd) {
+	case "bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "nushell", "pwsh", "powershell":
+		return true
+	}
+	return false
+}
+
+// isInteractiveForegroundProgram returns true for foreground commands that are
+// interactive and effectively waiting for the user rather than doing background
+// work: editors, pagers, system monitors, remote shells, and terminal
+// multiplexers. A shell session sitting in one of these should NOT show a
+// "running" indicator (an idle ssh prompt or an open editor is not busy work).
+//
+// REPLs and interpreters (node, python, ruby, …) are deliberately NOT listed:
+// they share a process name with the long-running servers this feature targets
+// (`yarn dev` runs as "node", `python manage.py runserver` runs as "python"),
+// so denylisting them would defeat the primary use case. The rare REPL false
+// positive is the lesser evil versus failing to flag a running dev server.
+func isInteractiveForegroundProgram(cmd string) bool {
+	switch strings.ToLower(cmd) {
+	case
+		// remote shells / terminal multiplexers
+		"ssh", "mosh", "mosh-client", "et", "tmux", "screen", "zellij",
+		// editors
+		"vi", "vim", "nvim", "nano", "emacs", "emacsclient", "helix", "hx", "micro", "kak",
+		// pagers / viewers
+		"less", "more", "most", "man", "bat",
+		// system monitors
+		"top", "htop", "btop", "btm", "glances", "atop":
+		return true
 	}
 	return false
 }
@@ -3219,6 +3277,11 @@ func CreateExampleConfig() error {
 # restart = "R"
 # detach = "ctrl+d"   # PTY-attach detach key, default ctrl+q (issue #434).
                       # Alias [tmux].detach_key exists; [hotkeys].detach wins.
+# In-attach session switcher (cycle sessions without first detaching to the list):
+# switch_session = "ctrl+s"   # opens the switcher while attached. Tap again to cycle
+#                             # forward (Shift+Tab / Up to go back); it auto-attaches
+#                             # ~1s after you stop, Enter attaches now, Esc cancels.
+#                             # Must be a "ctrl+<letter>" chord.
 
 # Instance behavior (optional)
 # [instances]

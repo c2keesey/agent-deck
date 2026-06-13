@@ -37,7 +37,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.9.55" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.9.58" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -1660,7 +1660,7 @@ func handleAdd(profile string, args []string) {
 	groupTree = session.NewGroupTreeWithGroups(instances, groups)
 	// Ensure the session's group exists
 	if newInstance.GroupPath != "" {
-		groupTree.CreateGroup(newInstance.GroupPath)
+		groupTree.CreateGroupPath(newInstance.GroupPath)
 	}
 
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {

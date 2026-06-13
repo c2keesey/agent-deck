@@ -59,6 +59,17 @@ const (
 
 const wrapperPlaceholder = "{command}"
 
+// PinMode anchors a session to a fixed slot within its group, exempt from the
+// status/recency actionable sort (pin-sessions feature). The empty value is the
+// default so existing rows migrate cleanly through the `pin` column default.
+type PinMode string
+
+const (
+	PinNone   PinMode = ""       // default; not pinned, participates in the normal sort
+	PinTop    PinMode = "top"    // fixed at the top of the group's session list
+	PinBottom PinMode = "bottom" // fixed at the bottom of the group's session list
+)
+
 const (
 	hookFastPathWindow             = 2 * time.Minute
 	codexHookRunningFastPathWindow = 20 * time.Second
@@ -76,15 +87,18 @@ const (
 
 // Instance represents a single agent/shell session
 type Instance struct {
-	ID                 string `json:"id"`
-	Title              string `json:"title"`
-	ProjectPath        string `json:"project_path"`
-	GroupPath          string `json:"group_path"`                     // e.g., "projects/devops"
-	Order              int    `json:"order"`                          // Position within group (for reorder persistence)
-	ParentSessionID    string `json:"parent_session_id,omitempty"`    // Links to parent session (makes this a sub-session)
-	ParentProjectPath  string `json:"parent_project_path,omitempty"`  // Parent's project path (for --add-dir access)
-	IsConductor        bool   `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
-	NoTransitionNotify bool   `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch for this session
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	ProjectPath string `json:"project_path"`
+	GroupPath   string `json:"group_path"` // e.g., "projects/devops"
+	Order       int    `json:"order"`      // Position within group (for reorder persistence)
+	// Pin anchors this session to the top or bottom of its group, exempt from
+	// the status/recency sort (pin-sessions feature). PinNone is the default.
+	Pin                PinMode `json:"pin,omitempty"`
+	ParentSessionID    string  `json:"parent_session_id,omitempty"`    // Links to parent session (makes this a sub-session)
+	ParentProjectPath  string  `json:"parent_project_path,omitempty"`  // Parent's project path (for --add-dir access)
+	IsConductor        bool    `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
+	NoTransitionNotify bool    `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch for this session
 
 	// TitleLocked, when true, blocks Claude's session name from syncing into
 	// the agent-deck Title (issue #697). Conductors launch workers with a
@@ -122,6 +136,8 @@ type Instance struct {
 	Status         Status    `json:"status"`
 	CreatedAt      time.Time `json:"created_at"`
 	LastAccessedAt time.Time `json:"last_accessed_at,omitempty"` // When user last attached
+	// ArchivedAt is set when the user archives the session (non-zero = archived).
+	ArchivedAt time.Time `json:"archived_at,omitempty"`
 
 	// LastStartedAt is the wall-clock time of the most recent successful
 	// Start() / StartWithMessage() / Restart() call. Persisted so short-lived
@@ -1042,6 +1058,10 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 	// Plugin channels: subscribe the claude session to inbound messages from
 	// each listed plugin channel. Persisted on Instance.Channels and refreshed
 	// on every Start/Restart/resume because every command-build flows here.
+	// Heal first: a conductor whose persisted Channels lost the telegram
+	// entry (index wipe, record rebuild) is restored from conductor config
+	// so the wiring can't silently disappear (telegram_reliability.go).
+	reconcileConductorTelegramChannel(i)
 	if len(i.Channels) > 0 {
 		flags = append(flags, "--channels "+shellescape.Quote(strings.Join(i.Channels, ","))) // audit F1
 	}
@@ -3514,6 +3534,51 @@ func hookFastPathFreshnessForTool(tool, hookStatus string) time.Duration {
 	}
 }
 
+// shellForegroundRunning reports whether a "shell" tool session currently has a
+// genuine non-interactive foreground process running (e.g. "node" from
+// `yarn dev`, "java" from `mvn spring-boot:run`). It returns false for the
+// interactive shell itself and for interactive foreground programs (editors,
+// pagers, system monitors, remote shells, multiplexers) that are really waiting
+// for the user rather than doing background work — otherwise opening vim or
+// sitting at an ssh prompt would show a perpetual running indicator.
+//
+// It relies on the pane-info cache warmed once per tick by RefreshPaneInfoCache
+// (TUI backgroundStatusUpdate / Web refreshStatuses / CLI status refresh). When
+// the cache is cold the lookup misses and this returns false, preserving the
+// historical "shell maps to idle" behavior. Caller must hold i.mu.
+//
+// The feature is opt-in via [status] shell_running_indicator (default false):
+// the interactive-program denylist cannot be complete, so without the flag a
+// shell sitting at a psql/REPL/fzf prompt would flip everyone's historical
+// "shell → idle" default to running.
+//
+// Staleness guards — only fresh pane info may promote idle→running:
+//   - GetCachedPaneInfoSnapshot enforces the cache-wide 4s TTL (2 ticks).
+//   - A dead pane (#{pane_dead}) means the command already exited.
+//   - A snapshot taken before this instance's last start describes a previous
+//     same-name session (kill+recreate within the TTL), not this one.
+func (i *Instance) shellForegroundRunning() bool {
+	if i.tmuxSession == nil {
+		return false
+	}
+	cfg, _ := LoadUserConfig()
+	if cfg == nil || !cfg.Status.ShellRunningIndicator {
+		return false
+	}
+	paneInfo, snapshotAt, ok := tmux.GetCachedPaneInfoSnapshot(i.tmuxSession.Name)
+	if !ok || paneInfo.Dead || paneInfo.CurrentCommand == "" {
+		return false
+	}
+	if !i.lastStartTime.IsZero() && snapshotAt.Before(i.lastStartTime) {
+		return false
+	}
+	cmd := paneInfo.CurrentCommand
+	if isShellBinary(cmd) || isInteractiveForegroundProgram(cmd) {
+		return false
+	}
+	return true
+}
+
 // UpdateStatus updates the session status by checking tmux.
 // Thread-safe: acquires write lock to protect Status, Tool, and internal cache fields.
 func (i *Instance) UpdateStatus() error {
@@ -3711,13 +3776,26 @@ func (i *Instance) UpdateStatus() error {
 	case "active":
 		i.Status = StatusRunning
 	case "waiting":
+		// tmux reports a shell prompt ("waiting"), but a non-interactive foreground
+		// process may still be running (e.g. "yarn dev", "mvn spring-boot:run").
+		// shellForegroundRunning() inspects the cached pane command to tell them apart.
 		if i.Tool == "shell" {
-			i.Status = StatusIdle
+			if i.shellForegroundRunning() {
+				i.Status = StatusRunning
+			} else {
+				i.Status = StatusIdle
+			}
 		} else {
 			i.Status = StatusWaiting
 		}
 	case "idle":
-		i.Status = StatusIdle
+		// Acknowledged shell sessions can still have a foreground process running
+		// even after the user has attached; keep surfacing that as running.
+		if i.Tool == "shell" && i.shellForegroundRunning() {
+			i.Status = StatusRunning
+		} else {
+			i.Status = StatusIdle
+		}
 	case "starting":
 		i.Status = StatusStarting
 	case "inactive":
@@ -6519,6 +6597,17 @@ func (i *Instance) CreateForkedInstanceWithOptions(
 		forked.GroupPath = i.GroupPath
 	}
 	forked.Tool = "claude"
+
+	// #1407: persist the parent's ExtraArgs onto the fork record. The baked
+	// one-shot fork command below inherits them implicitly via the builder
+	// (which reads the PARENT's ExtraArgs), but without persisting them on
+	// the fork they silently drop on the fork's first restart
+	// (buildClaudeResumeCommand reads the fork's own ExtraArgs) and a
+	// fork-of-a-fork never sees them at all. Mirrors how ClaudeOptions are
+	// persisted via SetClaudeOptions further down. Copied, not aliased.
+	if len(i.ExtraArgs) > 0 {
+		forked.ExtraArgs = append([]string(nil), i.ExtraArgs...)
+	}
 
 	cmd, err := i.buildClaudeForkCommandForTarget(forked, opts)
 	if err != nil {

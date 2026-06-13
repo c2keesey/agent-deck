@@ -8,44 +8,54 @@ import (
 )
 
 const (
-	hotkeyQuit            = "quit"
-	hotkeyNewSession      = "new_session"
-	hotkeyQuickCreate     = "quick_create"
-	hotkeyRename          = "rename"
-	hotkeyRestart         = "restart"
-	hotkeyHardRestart     = "hard_restart"
-	hotkeyRestartFresh    = "restart_fresh"
-	hotkeyDelete          = "delete"
-	hotkeyCloseSession    = "close_session"
-	hotkeyUndoDelete      = "undo_delete"
-	hotkeyMoveToGroup     = "move_to_group"
-	hotkeyMCPManager      = "mcp_manager"
-	hotkeyPluginManager   = "plugin_manager"
-	hotkeySkillsManager   = "skills_manager"
-	hotkeyTogglePreview   = "toggle_preview"
-	hotkeyMarkUnread      = "mark_unread"
-	hotkeyQuickApprove    = "quick_approve"
-	hotkeyToggleYolo      = "toggle_yolo"
-	hotkeyQuickFork       = "quick_fork"
-	hotkeyForkWithOptions = "fork_with_options"
-	hotkeyCopyOutput      = "copy_output"
-	hotkeySendOutput      = "send_output"
-	hotkeyExecShell       = "exec_shell"
-	hotkeyEditNotes       = "edit_notes"
-	hotkeyEditPaths       = "edit_paths"
-	hotkeyWatcherPanel    = "watcher_panel"
-	hotkeyEditSession     = "edit_session"
-	hotkeyWorktreeFinish  = "worktree_finish"
-	hotkeyCreateGroup     = "create_group"
-	hotkeySearch          = "search"
-	hotkeyHelp            = "help"
-	hotkeySettings        = "settings"
-	hotkeyImport          = "import"
-	hotkeyReload          = "reload"
-	hotkeyDetach          = "detach"
-	hotkeyMRUCycle        = "mru_cycle"
-	hotkeyAttentionCycle  = "attention_cycle"
-	hotkeyTeardown        = "teardown"
+	hotkeyQuit             = "quit"
+	hotkeyNewSession       = "new_session"
+	hotkeyQuickCreate      = "quick_create"
+	hotkeyRename           = "rename"
+	hotkeyRestart          = "restart"
+	hotkeyHardRestart      = "hard_restart"
+	hotkeyRestartFresh     = "restart_fresh"
+	hotkeyDelete           = "delete"
+	hotkeyCloseSession     = "close_session"
+	hotkeyArchiveSession   = "archive_session"
+	hotkeyUnarchiveSession = "unarchive_session"
+	hotkeyViewArchived     = "view_archived"
+	hotkeyUndoDelete       = "undo_delete"
+	hotkeyMoveToGroup      = "move_to_group"
+	hotkeyMCPManager       = "mcp_manager"
+	hotkeyPluginManager    = "plugin_manager"
+	hotkeySkillsManager    = "skills_manager"
+	hotkeyTogglePreview    = "toggle_preview"
+	hotkeyCycleGroupView   = "cycle_group_view"
+	hotkeyMarkUnread       = "mark_unread"
+	hotkeyQuickApprove     = "quick_approve"
+	hotkeyToggleYolo       = "toggle_yolo"
+	hotkeyQuickFork        = "quick_fork"
+	hotkeyForkWithOptions  = "fork_with_options"
+	hotkeyCopyOutput       = "copy_output"
+	hotkeySendOutput       = "send_output"
+	hotkeyExecShell        = "exec_shell"
+	hotkeyEditNotes        = "edit_notes"
+	hotkeyEditPaths        = "edit_paths"
+	hotkeyEditSession      = "edit_session"
+	hotkeyWorktreeSetup    = "worktree_setup"
+	hotkeyWorktreeFinish   = "worktree_finish"
+	hotkeyCreateGroup      = "create_group"
+	hotkeySearch           = "search"
+	hotkeyHelp             = "help"
+	hotkeySettings         = "settings"
+	hotkeyImport           = "import"
+	hotkeyReload           = "reload"
+	hotkeyDetach           = "detach"
+	hotkeyWatcherPanel     = "watcher_panel"
+	// Local fork additions.
+	hotkeyMRUCycle       = "mru_cycle"
+	hotkeyAttentionCycle = "attention_cycle"
+	hotkeyTeardown       = "teardown"
+	// Session switcher. While attached it is intercepted in the tmux attach
+	// loop (see internal/tmux/pty.go AttachOptions); on the home screen it is
+	// dispatched like any other hotkey. Must resolve to a "ctrl+<letter>" chord.
+	hotkeySwitchSession = "switch_session" // Ctrl+S
 )
 
 var hotkeyActionOrder = []string{
@@ -58,12 +68,16 @@ var hotkeyActionOrder = []string{
 	hotkeyRestartFresh,
 	hotkeyDelete,
 	hotkeyCloseSession,
+	hotkeyArchiveSession,
+	hotkeyUnarchiveSession,
+	hotkeyViewArchived,
 	hotkeyUndoDelete,
 	hotkeyMoveToGroup,
 	hotkeyMCPManager,
 	hotkeyPluginManager,
 	hotkeySkillsManager,
 	hotkeyTogglePreview,
+	hotkeyCycleGroupView,
 	hotkeyMarkUnread,
 	hotkeyQuickApprove,
 	hotkeyToggleYolo,
@@ -75,6 +89,7 @@ var hotkeyActionOrder = []string{
 	hotkeyEditNotes,
 	hotkeyEditPaths,
 	hotkeyEditSession,
+	hotkeyWorktreeSetup,
 	hotkeyWorktreeFinish,
 	hotkeyCreateGroup,
 	hotkeySearch,
@@ -87,47 +102,62 @@ var hotkeyActionOrder = []string{
 	hotkeyAttentionCycle,
 	hotkeyWatcherPanel,
 	hotkeyTeardown,
+	hotkeySwitchSession,
 }
 
+// defaultHotkeyBindings keeps the local fork keymap as the source of truth
+// (the user relies on this muscle memory: teardown=y, attention=ctrl+e,
+// mru=ctrl+w, hard_restart=ctrl+t, restart=t, settings=p, …). Upstream's
+// v1.9.x keybinding overhaul (restart→R, close→D, move→M, settings→S,
+// toggle_yolo→y, etc.) is intentionally NOT adopted. Upstream's genuinely-new
+// actions are grafted onto free keys; the two whose upstream keys collide with
+// a local binding (cycle_group_view→t=restart, worktree_setup→b=exec_shell)
+// stay unbound and can be set via config.
 var defaultHotkeyBindings = map[string]string{
-	hotkeyQuit:            "q",
-	hotkeyNewSession:      "n",
-	hotkeyQuickCreate:     "a",
-	hotkeyRename:          "r",
-	hotkeyRestart:         "t",
-	hotkeyHardRestart:     "ctrl+t",
-	hotkeyRestartFresh:    "T",
-	hotkeyDelete:          "d",
-	hotkeyCloseSession:    "ctrl+x",
-	hotkeyUndoDelete:      "ctrl+z",
-	hotkeyMoveToGroup:     "o",
-	hotkeyMCPManager:      "m",
-	hotkeyPluginManager:   "L",
-	hotkeySkillsManager:   "s",
-	hotkeyTogglePreview:   "v",
-	hotkeyMarkUnread:      "u",
-	hotkeyQuickApprove:    "a",
-	hotkeyToggleYolo:      "",
-	hotkeyQuickFork:       "f",
-	hotkeyForkWithOptions: "z",
-	hotkeyCopyOutput:      "c",
-	hotkeySendOutput:      "x",
-	hotkeyExecShell:       "b",
-	hotkeyEditNotes:       "e",
-	hotkeyEditPaths:       "",
-	hotkeyEditSession:     "",
-	hotkeyWorktreeFinish:  "w",
-	hotkeyCreateGroup:     "g",
-	hotkeySearch:          "/",
-	hotkeyHelp:            "?",
-	hotkeySettings:        "p",
-	hotkeyImport:          "i",
-	hotkeyReload:          "ctrl+r",
-	hotkeyDetach:          "ctrl+q",
-	hotkeyMRUCycle:        "ctrl+w",
-	hotkeyAttentionCycle:  "ctrl+e",
-	hotkeyWatcherPanel:    "",
-	hotkeyTeardown:        "y",
+	hotkeyQuit:             "q",
+	hotkeyNewSession:       "n",
+	hotkeyQuickCreate:      "N", // was "a" in local, which shadowed quick_approve; freed for approve
+	hotkeyRename:           "r",
+	hotkeyRestart:          "t",
+	hotkeyHardRestart:      "ctrl+t",
+	hotkeyRestartFresh:     "T",
+	hotkeyDelete:           "d",
+	hotkeyCloseSession:     "ctrl+x",
+	hotkeyArchiveSession:   "A",
+	hotkeyUnarchiveSession: "shift+u",
+	hotkeyViewArchived:     "^",
+	hotkeyUndoDelete:       "ctrl+z",
+	hotkeyMoveToGroup:      "o",
+	hotkeyMCPManager:       "m",
+	hotkeyPluginManager:    "L",
+	hotkeySkillsManager:    "s",
+	hotkeyTogglePreview:    "v",
+	hotkeyCycleGroupView:   "V", // upstream "t" collides with local restart; use shift+v (View)
+	hotkeyMarkUnread:       "u",
+	hotkeyQuickApprove:     "a",
+	hotkeyToggleYolo:       "", // upstream "y" collides with local teardown
+	hotkeyQuickFork:        "f",
+	hotkeyForkWithOptions:  "z",
+	hotkeyCopyOutput:       "c",
+	hotkeySendOutput:       "x",
+	hotkeyExecShell:        "b",
+	hotkeyEditNotes:        "e",
+	hotkeyEditPaths:        "",
+	hotkeyEditSession:      "",
+	hotkeyWorktreeSetup:    "B", // upstream "b" collides with local exec_shell; use shift+b
+	hotkeyWorktreeFinish:   "w",
+	hotkeyCreateGroup:      "g",
+	hotkeySearch:           "/",
+	hotkeyHelp:             "?",
+	hotkeySettings:         "p",
+	hotkeyImport:           "i",
+	hotkeyReload:           "ctrl+r",
+	hotkeyDetach:           "ctrl+q",
+	hotkeyMRUCycle:         "ctrl+w",
+	hotkeyAttentionCycle:   "ctrl+e",
+	hotkeyWatcherPanel:     "",
+	hotkeyTeardown:         "y",
+	hotkeySwitchSession:    "ctrl+s",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{
@@ -400,4 +430,40 @@ func ResolvedDetachByte(overrides map[string]string) byte {
 		return 17 // default Ctrl+Q
 	}
 	return DetachByteFromBinding(key)
+}
+
+// ctrlByteFromBinding converts a "ctrl+<letter>" binding to its control byte, or
+// returns 0 when the binding is not a single-control-key chord. Unlike
+// DetachByteFromBinding it does not fall back to Ctrl+Q, so callers can treat 0
+// as "no portable byte for this key" (e.g. "ctrl+tab" / "ctrl+shift+tab", which
+// have no legacy control byte).
+func ctrlByteFromBinding(binding string) byte {
+	binding = strings.ToLower(strings.TrimSpace(binding))
+	if !strings.HasPrefix(binding, "ctrl+") {
+		return 0
+	}
+	ch := binding[len("ctrl+"):]
+	if len(ch) == 1 && ch[0] >= 'a' && ch[0] <= 'z' {
+		return ch[0] - 'a' + 1
+	}
+	switch ch {
+	case "\\":
+		return 0x1C
+	case "]":
+		return 0x1D
+	case "^":
+		return 0x1E
+	case "_":
+		return 0x1F
+	}
+	return 0
+}
+
+// ResolvedSwitchByte returns the control byte that opens the in-attach session
+// switcher for the current hotkey overrides, or 0 when it is unbound or not a
+// ctrl+<letter> chord. The switcher's forward/backward cycling and commit are
+// handled in the TUI, so only this single opener byte reaches the attach loop.
+func ResolvedSwitchByte(overrides map[string]string) byte {
+	bindings := resolveHotkeys(overrides)
+	return ctrlByteFromBinding(actionHotkey(bindings, hotkeySwitchSession))
 }

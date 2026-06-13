@@ -186,6 +186,7 @@ func (h *HelpOverlay) View() string {
 	pluginKey := h.key(hotkeyPluginManager, "L")
 	skillsKey := h.key(hotkeySkillsManager, "s")
 	previewKey := h.key(hotkeyTogglePreview, "v")
+	groupViewKey := h.key(hotkeyCycleGroupView, "t")
 	unreadKey := h.key(hotkeyMarkUnread, "u")
 	quickApproveKey := h.key(hotkeyQuickApprove, "a")
 	copyKey := h.key(hotkeyCopyOutput, "c")
@@ -197,6 +198,7 @@ func (h *HelpOverlay) View() string {
 	}
 	editPathsKey := h.key(hotkeyEditPaths, "p")
 	editSessionKey := h.key(hotkeyEditSession, "")
+	worktreeSetupKey := h.key(hotkeyWorktreeSetup, "")
 	worktreeKey := h.key(hotkeyWorktreeFinish, "w")
 	watcherPanelKey := h.key(hotkeyWatcherPanel, "w")
 	groupKey := h.key(hotkeyCreateGroup, "g")
@@ -275,6 +277,7 @@ func (h *HelpOverlay) View() string {
 		{
 			title: "WORKTREES",
 			items: [][2]string{
+				{worktreeSetupKey, "Re-run worktree setup script"},
 				{worktreeKey, "Finish worktree (merge + cleanup)"},
 				{"n → w", "Create session in worktree"},
 				{"F → w", "Fork session into worktree"},
@@ -302,6 +305,7 @@ func (h *HelpOverlay) View() string {
 				{"/waiting", "Filter waiting"},
 				{"/running", "Filter running"},
 				{"/idle", "Filter idle"},
+				{groupViewKey, "Cycle view: active-on-top / populated-on-top"},
 			},
 		},
 		{
@@ -311,6 +315,7 @@ func (h *HelpOverlay) View() string {
 				{reloadKey, "Reload from disk"},
 				{importKey, "Import tmux sessions"},
 				{"Ctrl+Q", "Detach from session"},
+				{"Ctrl+S", "Switch session (here or attached)"},
 				{quitKey, "Quit"},
 				{helpKey, "This help"},
 			},

@@ -449,7 +449,7 @@ func handleLaunch(profile string, args []string) {
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
 	if newInstance.GroupPath != "" {
-		groupTree.CreateGroup(newInstance.GroupPath)
+		groupTree.CreateGroupPath(newInstance.GroupPath)
 	}
 
 	// v1.9.x issue #1031: targeted single-row insert + verify, NOT the
@@ -551,7 +551,7 @@ func handleLaunch(profile string, args []string) {
 	// `DELETE FROM instances WHERE id NOT IN (...)` step.
 	postStartTree := session.NewGroupTreeWithGroups(instances, groups)
 	if newInstance.GroupPath != "" {
-		postStartTree.CreateGroup(newInstance.GroupPath)
+		postStartTree.CreateGroupPath(newInstance.GroupPath)
 	}
 	if err := storage.InsertSessionAndVerify(newInstance, postStartTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
