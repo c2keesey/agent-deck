@@ -246,7 +246,7 @@ func (h *HelpOverlay) View() string {
 				{restartKey, "Restart session"},
 				{hardRestartKey, "Hard restart (fresh session)"},
 				{restartFreshKey, "Restart with new session ID"},
-				{teardownKey, "Teardown (!gr + !make down, then delete)"},
+				{teardownKey, "Teardown (gr + make down, then delete)"},
 				{deleteKey, "Delete session"},
 				{closeKey, "Close session process"},
 				{undoKey, "Undo delete"},

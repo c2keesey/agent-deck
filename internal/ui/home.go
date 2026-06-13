@@ -885,7 +885,8 @@ type sendOutputResultMsg struct {
 type teardownResultMsg struct {
 	title string
 	id    string
-	err   error
+	warn  string // non-fatal cleanup failure (gr/make down) — still deletes
+	err   error  // setup failure (no working dir) — aborts deletion
 }
 
 // remoteSessionsFetchedMsg is sent when async remote sessions fetch completes.
@@ -1758,6 +1759,28 @@ func (h *Home) attentionNudgeText(attachedID string, instances []*session.Instan
 		return ""
 	}
 	return fmt.Sprintf("⚡ P%d %s ready — ^E", best.Priority, best.Title)
+}
+
+// styledNudgeBar wraps the plain attention nudge in tmux status-left format
+// codes so the higher-priority-ready alert reads as a bold, filled, color-tiered
+// bar instead of blending into the surrounding notification text. The tiers
+// mirror the dashboard priority chip — P1 red, P2 orange, P3 yellow — and the
+// trailing #[default] resets styling so the appended FormatBar text is
+// unaffected. Empty in → empty out. (local fork)
+func styledNudgeBar(plain string) string {
+	if plain == "" {
+		return ""
+	}
+	// Tier color keyed off the "P<n>" the plain text already carries. Default
+	// to the P3 tier for any unexpected shape so the alert still stands out.
+	style := "#[fg=#1a1b26,bg=#e0af68,bold]" // P3: dark on yellow
+	switch {
+	case strings.Contains(plain, " P1 "):
+		style = "#[fg=#ffffff,bg=#f7768e,bold]" // P1: white on red
+	case strings.Contains(plain, " P2 "):
+		style = "#[fg=#1a1b26,bg=#ff9e64,bold]" // P2: dark on orange
+	}
+	return style + " " + plain + " #[default]"
 }
 
 func (h *Home) captureSelectedItemIdentity() selectedItemIdentity {
@@ -3750,7 +3773,7 @@ func (h *Home) syncNotificationsBackground() {
 	// higher-priority session is ready to be picked back up. This is the piece
 	// that pulls the user off lower-priority work the moment the important
 	// thread is ready — Ctrl+E then jumps straight to it.
-	if nudge := h.attentionNudgeText(currentSessionID, instances); nudge != "" {
+	if nudge := styledNudgeBar(h.attentionNudgeText(currentSessionID, instances)); nudge != "" {
 		if barText == "" {
 			barText = nudge
 		} else {
@@ -5426,7 +5449,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case teardownResultMsg:
-		// The `!gr` + `!make down` sequence finished; delete the session.
+		// The `gr` + `make down` cleanup finished; delete the session. A setup
+		// failure (no working dir) aborts; a cleanup failure only warns.
 		if msg.err != nil {
 			h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
 			return h, nil
@@ -5440,7 +5464,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.setError(fmt.Errorf("teardown '%s': session no longer exists", msg.title))
 			return h, nil
 		}
-		h.setError(fmt.Errorf("Teardown done for '%s' — deleting", msg.title))
+		if msg.warn != "" {
+			h.setError(fmt.Errorf("Teardown '%s' cleanup warning (%s) — deleting anyway", msg.title, msg.warn))
+		} else {
+			h.setError(fmt.Errorf("Teardown done for '%s' — deleting", msg.title))
+		}
 		return h, h.deleteSession(inst)
 
 	case watcherEventMsg:
@@ -7517,12 +7545,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "y":
-		// Teardown: send `!gr` then `!make down` into the session, wait for each
-		// to finish responding, then delete the session.
+		// Teardown: run `gr` (reset worktree) + `make down` (stop docker) directly
+		// in the worktree, tool-agnostically, then delete the session.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
-				h.setError(fmt.Errorf("Tearing down '%s' (!gr + !make down)…", item.Session.Title))
+				h.setError(fmt.Errorf("Tearing down '%s' (gr + make down)…", item.Session.Title))
 				return h, h.teardownSession(item.Session)
 			}
 		}
@@ -9754,12 +9782,15 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		h.maiaWorkerPicker.Hide()
 		return h, nil
+	case "c", "tab":
+		// Toggle the active tool (Claude ⟷ Codex). The action keys below
+		// (Enter, r, ~) then create with whichever tool is active, so 'c'
+		// chains into any action instead of immediately creating.
+		h.maiaWorkerPicker.ToggleTool()
+		return h, nil
 	case "enter":
-		// Default tool (claude unless overridden in config.toml).
-		tool := session.GetDefaultTool()
-		if tool == "" {
-			tool = "claude"
-		}
+		// Create with the active tool in the highlighted worker.
+		tool := h.maiaWorkerPicker.ActiveTool()
 		selected, group := h.maiaWorkerPicker.Selected()
 		h.maiaWorkerPicker.Hide()
 		if selected == "" {
@@ -9768,7 +9799,7 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, h.createMaiaWorkerSession(selected, group, tool)
 	case "s":
 		// Raw shell: spawn a plain shell (empty command) in the highlighted
-		// worktree instead of the default tool. Mirrors the empty-command
+		// worktree, independent of the active tool. Mirrors the empty-command
 		// escape hatch the full NewDialog offered before this picker replaced it.
 		selected, group := h.maiaWorkerPicker.Selected()
 		h.maiaWorkerPicker.Hide()
@@ -9776,21 +9807,10 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return h, nil
 		}
 		return h, h.createMaiaWorkerSession(selected, group, "")
-	case "c":
-		// Codex, always in YOLO mode (see createMaiaWorkerSession).
-		selected, group := h.maiaWorkerPicker.Selected()
-		h.maiaWorkerPicker.Hide()
-		if selected == "" {
-			return h, nil
-		}
-		return h, h.createMaiaWorkerSession(selected, group, "codex")
 	case "r":
 		// Read-only dev: create a session in the shared MAIA.ro-dev worktree
-		// directly, bypassing the worker column.
-		tool := session.GetDefaultTool()
-		if tool == "" {
-			tool = "claude"
-		}
+		// directly with the active tool, bypassing the worker column.
+		tool := h.maiaWorkerPicker.ActiveTool()
 		selected, group := h.maiaWorkerPicker.RoDevSelected()
 		h.maiaWorkerPicker.Hide()
 		if selected == "" {
@@ -9798,15 +9818,15 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, h.createMaiaWorkerSession(selected, group, tool)
 	case "~":
-		// Spawn the default tool (claude) rooted at the home dir — a quick
-		// scratch session outside the MAIA worktrees. Group is derived from
-		// the path by quickCreateSessionAt.
+		// Spawn the active tool rooted at the home dir — a quick scratch
+		// session outside the MAIA worktrees. Group is derived from the path.
+		tool := h.maiaWorkerPicker.ActiveTool()
 		h.maiaWorkerPicker.Hide()
 		home, err := os.UserHomeDir()
 		if err != nil || home == "" {
 			return h, nil
 		}
-		return h, h.quickCreateSessionAt(home)
+		return h, h.quickCreateSessionAtWithTool(home, tool)
 	default:
 		h.maiaWorkerPicker, _ = h.maiaWorkerPicker.Update(msg)
 		return h, nil
@@ -9865,13 +9885,28 @@ func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.C
 // cursor-context tool inheritance so the zoxide flow always lands on the
 // user's chosen default (Claude, unless overridden in config.toml).
 func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
-	tool := session.GetDefaultTool()
+	return h.quickCreateSessionAtWithTool(projectPath, "")
+}
+
+// quickCreateSessionAtWithTool is quickCreateSessionAt with an explicit tool
+// override (e.g. the MAIA picker's tool switcher). An empty tool falls back to
+// the configured default. Codex always launches YOLO, matching the worker flow.
+func (h *Home) quickCreateSessionAtWithTool(projectPath, tool string) tea.Cmd {
+	if tool == "" {
+		tool = session.GetDefaultTool()
+	}
 	if tool == "" {
 		tool = "claude"
 	}
 	command := tool
 	if tool == "shell" {
 		command = ""
+	}
+
+	var toolOptionsJSON json.RawMessage
+	if tool == "codex" {
+		yolo := true
+		toolOptionsJSON, _ = session.MarshalToolOptions(&session.CodexOptions{YoloMode: &yolo})
 	}
 
 	preferred := deriveSessionNameFromPath(projectPath)
@@ -9883,7 +9918,7 @@ func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
 		name, projectPath, command,
 		"",         // empty group → creator derives from path via extractGroupPath
 		"", "", "", // no worktree
-		false, false, nil,
+		false, false, toolOptionsJSON,
 		nil, // no extra claude args
 		"",  // no claude startup query
 		"",  // no explicit model override
@@ -13724,6 +13759,32 @@ func (h *Home) renderCreatingSessionItem(
 	b.WriteString("\n")
 }
 
+// priorityBadge renders the conductor-assigned attention priority as a filled,
+// color-tiered chip — P1 red, P2 orange, P3 yellow — so the dashboard surfaces
+// at a glance which ready threads the Ctrl+E switcher will jump to first.
+// Returns "" for unset (0) so unprioritized rows stay clean. On the selected
+// row it reuses the selection-bar style so the chip stays legible inside the
+// highlight. (local fork)
+func priorityBadge(prio int, selected bool) string {
+	if prio <= 0 {
+		return ""
+	}
+	if selected {
+		return SessionStatusSelStyle.Render(fmt.Sprintf(" P%d", prio))
+	}
+	var bg lipgloss.Color
+	switch prio {
+	case 1:
+		bg = ColorRed
+	case 2:
+		bg = ColorOrange
+	default:
+		bg = ColorYellow
+	}
+	chip := lipgloss.NewStyle().Foreground(ColorBg).Background(bg).Bold(true)
+	return " " + chip.Render(fmt.Sprintf(" P%d ", prio))
+}
+
 // renderSessionItem renders a single session row into b, including the tree
 // connector, status badge, tool label, and the dim tmux pane-title suffix.
 // The pane-title suffix appears on the selected row, or on every row when
@@ -14004,18 +14065,27 @@ func (h *Home) renderSessionItem(
 		windowChevron = chevronStyle.Render(chevronChar)
 	}
 
-	// Build row: [baseIndent][selection][tree][chevron][status] [primary] [tool] [worktree] [other badges] · [trailer]
+	// Conductor-assigned attention priority chip (local fork). Placed right
+	// after the identity label so the tier the Ctrl+E switcher cares about is
+	// visible at a glance; empty for unset sessions so unprioritized rows are
+	// untouched. Sits before the tool/worktree badges, mirroring their
+	// variable-width append (primary is padded to its column, so the chip
+	// doesn't disturb name alignment).
+	priorityChip := priorityBadge(inst.Priority, selected)
+
+	// Build row: [baseIndent][selection][tree][chevron][status] [primary] [P chip] [tool] [worktree] [other badges] · [trailer]
 	// Personal-fork layout: one dynamically-chosen identity label, then the
 	// color-coded worktree chip, then the live activity trailer. The primary
 	// label carries its own leading space, so no literal separator here.
 	row := fmt.Sprintf(
-		"%s%s%s%s%s%s%s%s%s%s%s",
+		"%s%s%s%s%s%s%s%s%s%s%s%s",
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
 		windowChevron,
 		status,
 		primary,
+		priorityChip,
 		tool,
 		yoloBadge,
 		worktreeBadge,
@@ -16391,74 +16461,45 @@ func (h *Home) sendOutputToSession(source, target *session.Instance) tea.Cmd {
 	}
 }
 
-// teardownSession sends `!gr` (reset the worktree) then `!make down` (stop the
-// docker stack) into the live session, waiting for each command to finish
-// responding before moving on, then signals the UI to delete the session. The
-// waits are best-effort: each command has a settle window plus a poll-until-idle
-// loop with a timeout, with a fixed gap between commands.
+// teardownSession resets the worktree (`gr`) and brings the docker stack down
+// (`make down`), then signals the UI to delete the session. The commands run
+// directly in the worktree via an interactive zsh — NOT typed into the agent —
+// so teardown works the same for any tool (Claude's `!` shell-escape doesn't
+// exist in Codex). `-i` loads ~/.zshrc so the `gr` shell function resolves.
 func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
 	id, title := s.ID, s.Title
+	dir := s.EffectiveWorkingDir()
 	return func() tea.Msg {
-		// Resolve the live instance by ID at execution time so a storage reload
-		// that swapped the captured pointer doesn't leave us sending into / polling
-		// a stale instance (mirrors restartSession).
-		resolve := func() *session.Instance {
-			h.instancesMu.RLock()
-			defer h.instancesMu.RUnlock()
-			if cur := h.instanceByID[id]; cur != nil {
-				return cur
-			}
-			return s
+		if dir == "" {
+			return teardownResultMsg{title: title, err: fmt.Errorf("no working dir")}
 		}
-
-		// 1. Reset the worktree.
-		cur := resolve()
-		tmuxSession := cur.GetTmuxSession()
-		if tmuxSession == nil {
-			return teardownResultMsg{title: title, err: fmt.Errorf("no tmux pane")}
+		// `gr` derives the branch from cwd and resets it to origin/dev; `make
+		// down` stops the worktree's docker stack. Chained so a failed reset
+		// still doesn't leave the stack up only if reset succeeds — but we want
+		// the stack down regardless, so run them independently.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "zsh", "-ic", "gr; make down")
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// Cleanup is best-effort — a missing docker stack (e.g. ro-dev) or a
+			// failed reset shouldn't strand the session. Warn but still delete.
+			return teardownResultMsg{title: title, id: id, warn: fmt.Sprintf("%v: %s", err, lastLine(string(out)))}
 		}
-		if err := tmuxSession.SendKeysAndEnter("!gr"); err != nil {
-			return teardownResultMsg{title: title, err: fmt.Errorf("send !gr: %w", err)}
-		}
-		waitForResponse(cur, 4*time.Second, 60*time.Second)
-		time.Sleep(2 * time.Second)
-
-		// 2. Bring the docker stack down.
-		cur = resolve()
-		tmuxSession = cur.GetTmuxSession()
-		if tmuxSession == nil {
-			return teardownResultMsg{title: title, err: fmt.Errorf("no tmux pane")}
-		}
-		if err := tmuxSession.SendKeysAndEnter("!make down"); err != nil {
-			return teardownResultMsg{title: title, err: fmt.Errorf("send !make down: %w", err)}
-		}
-		waitForResponse(cur, 4*time.Second, 180*time.Second)
-		time.Sleep(2 * time.Second)
-
 		return teardownResultMsg{title: title, id: id}
 	}
 }
 
-// waitForResponse blocks until the session has finished responding to the input
-// just sent. It first waits up to settle for the status to flip to running (so
-// we don't read a stale idle), then polls up to timeout for it to return to a
-// terminal state. Best-effort — a timeout simply lets teardown proceed.
-func waitForResponse(s *session.Instance, settle, timeout time.Duration) {
-	start := time.Now()
-	for time.Since(start) < settle {
-		if s.GetStatusThreadSafe() == session.StatusRunning {
-			break
+// lastLine returns the last non-blank line of s, trimmed — used to surface the
+// most relevant line of a failed command's combined output in a one-line toast.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
 		}
-		time.Sleep(300 * time.Millisecond)
 	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		switch s.GetStatusThreadSafe() {
-		case session.StatusWaiting, session.StatusIdle, session.StatusError, session.StatusStopped:
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
+	return ""
 }
 
 // handleSessionPickerDialogKey handles key events when the session picker is visible.

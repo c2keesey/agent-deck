@@ -37,6 +37,7 @@ type MaiaWorkerPicker struct {
 	roDevs       []string        // ro-dev worktree paths
 	occupied     map[string]bool // worktree path -> already hosts a session
 	workerCursor int
+	tool         string // active tool the action keys create with ("claude" | "codex")
 	width        int
 	height       int
 	scanErr      string
@@ -52,8 +53,33 @@ func NewMaiaWorkerPicker() *MaiaWorkerPicker { return &MaiaWorkerPicker{} }
 func (m *MaiaWorkerPicker) Show(occupied map[string]bool) {
 	m.visible = true
 	m.occupied = occupied
+	m.tool = maiaToolClaude // default to Claude on every open
 	m.refreshWorktrees()
 	m.workerCursor = m.nextOpenWorker()
+}
+
+// Tools the picker can create with. Codex always launches YOLO in the MAIA
+// flow (see createMaiaWorkerSession); Claude is the default.
+const (
+	maiaToolClaude = "claude"
+	maiaToolCodex  = "codex"
+)
+
+// ActiveTool returns the tool the action keys (Enter, r, ~) will create with.
+func (m *MaiaWorkerPicker) ActiveTool() string {
+	if m.tool == "" {
+		return maiaToolClaude
+	}
+	return m.tool
+}
+
+// ToggleTool flips the active tool between Claude and Codex.
+func (m *MaiaWorkerPicker) ToggleTool() {
+	if m.ActiveTool() == maiaToolCodex {
+		m.tool = maiaToolClaude
+	} else {
+		m.tool = maiaToolCodex
+	}
 }
 
 // Hide closes the picker.
@@ -167,6 +193,8 @@ func (m *MaiaWorkerPicker) View() string {
 
 	title := DialogTitleStyle.Render("New MAIA Session")
 
+	toolBar := m.renderToolSwitcher()
+
 	var body string
 	if m.scanErr != "" {
 		body = lipgloss.NewStyle().Foreground(ColorRed).Render("⚠ " + m.scanErr)
@@ -175,11 +203,29 @@ func (m *MaiaWorkerPicker) View() string {
 	}
 
 	hint := lipgloss.NewStyle().Foreground(ColorComment).
-		Render("↑/↓ pick · r ro-dev · Enter create · c codex · s shell · ~ home · Esc cancel")
+		Render("↑/↓ pick · c/Tab tool · Enter worker · r ro-dev · s shell · ~ home · Esc")
 
-	content := lipgloss.JoinVertical(lipgloss.Left, title, "", body, "", hint)
+	content := lipgloss.JoinVertical(lipgloss.Left, title, "", toolBar, "", body, "", hint)
 	dialog := DialogBoxStyle.Render(content)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+}
+
+// renderToolSwitcher renders the "Tool:  Claude  Codex" selector with the
+// active tool highlighted, so the user can see (and toggle with c/Tab) which
+// tool the action keys will create with.
+func (m *MaiaWorkerPicker) renderToolSwitcher() string {
+	labelStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+	active := lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent).Bold(true)
+	inactive := lipgloss.NewStyle().Foreground(ColorTextDim)
+
+	claude, codex := inactive, inactive
+	if m.ActiveTool() == maiaToolCodex {
+		codex = active
+	} else {
+		claude = active
+	}
+	return labelStyle.Render("Tool: ") +
+		claude.Render(" Claude ") + "  " + codex.Render(" Codex ")
 }
 
 // renderColumn renders one bordered column. The focused column gets an

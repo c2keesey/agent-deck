@@ -18,11 +18,32 @@ func TestMaiaWorkerPicker_ShellHint(t *testing.T) {
 	if !strings.Contains(view, "s shell") {
 		t.Errorf("picker hint should advertise the raw-shell option; got:\n%s", view)
 	}
-	if !strings.Contains(view, "c codex") {
-		t.Errorf("picker hint should advertise the codex option; got:\n%s", view)
+	if !strings.Contains(view, "tool") {
+		t.Errorf("picker hint should advertise the tool switcher; got:\n%s", view)
 	}
 	if !strings.Contains(view, "~ home") {
 		t.Errorf("picker hint should advertise the home-root option; got:\n%s", view)
+	}
+	// The tool switcher names both tools.
+	if !strings.Contains(view, "Claude") || !strings.Contains(view, "Codex") {
+		t.Errorf("picker should render a Claude/Codex tool switcher; got:\n%s", view)
+	}
+}
+
+func TestMaiaWorkerPicker_ToggleTool(t *testing.T) {
+	p := &MaiaWorkerPicker{}
+	// Defaults to Claude.
+	if got := p.ActiveTool(); got != maiaToolClaude {
+		t.Fatalf("default ActiveTool = %q, want %q", got, maiaToolClaude)
+	}
+	// Toggle to Codex, then back to Claude.
+	p.ToggleTool()
+	if got := p.ActiveTool(); got != maiaToolCodex {
+		t.Fatalf("after toggle, ActiveTool = %q, want %q", got, maiaToolCodex)
+	}
+	p.ToggleTool()
+	if got := p.ActiveTool(); got != maiaToolClaude {
+		t.Fatalf("after second toggle, ActiveTool = %q, want %q", got, maiaToolClaude)
 	}
 }
 
