@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,5 +165,55 @@ func TestAttentionSortedSessions_EmptyWhenNothingReady(t *testing.T) {
 	}
 	if got := h.attentionSortedSessions(); len(got) != 0 {
 		t.Fatalf("expected no ready sessions, got %d", len(got))
+	}
+}
+
+func TestStyledNudgeBar_EmptyPassesThrough(t *testing.T) {
+	if got := styledNudgeBar(""); got != "" {
+		t.Fatalf("empty nudge should stay empty, got %q", got)
+	}
+}
+
+func TestStyledNudgeBar_TierColorsAndReset(t *testing.T) {
+	cases := []struct {
+		plain   string
+		wantBg  string
+	}{
+		{"⚡ P1 urgent ready — ^E", "bg=#f7768e"}, // red
+		{"⚡ P2 soon ready — ^E", "bg=#ff9e64"},   // orange
+		{"⚡ P3 later ready — ^E", "bg=#e0af68"},  // yellow
+	}
+	for _, tc := range cases {
+		got := styledNudgeBar(tc.plain)
+		if !strings.Contains(got, tc.wantBg) {
+			t.Errorf("styledNudgeBar(%q) = %q, want bg %q", tc.plain, got, tc.wantBg)
+		}
+		if !strings.HasPrefix(got, "#[") {
+			t.Errorf("styledNudgeBar(%q) should start with a tmux style code, got %q", tc.plain, got)
+		}
+		if !strings.HasSuffix(got, "#[default]") {
+			t.Errorf("styledNudgeBar(%q) should reset styling with #[default], got %q", tc.plain, got)
+		}
+		if !strings.Contains(got, tc.plain) {
+			t.Errorf("styledNudgeBar(%q) should preserve the plain text, got %q", tc.plain, got)
+		}
+	}
+}
+
+func TestPriorityBadge_UnsetIsEmpty(t *testing.T) {
+	if got := priorityBadge(0, false); got != "" {
+		t.Fatalf("unset priority should render no badge, got %q", got)
+	}
+}
+
+func TestPriorityBadge_RendersTier(t *testing.T) {
+	for _, prio := range []int{1, 2, 3} {
+		got := priorityBadge(prio, false)
+		if got == "" {
+			t.Fatalf("priority %d should render a badge", prio)
+		}
+		if !strings.Contains(got, fmt.Sprintf("P%d", prio)) {
+			t.Errorf("priorityBadge(%d) = %q, want it to contain P%d", prio, got, prio)
+		}
 	}
 }
