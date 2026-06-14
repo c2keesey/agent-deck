@@ -181,9 +181,14 @@ func TestResolvedDetachByte(t *testing.T) {
 }
 
 func TestMRUCycleDefaultBinding(t *testing.T) {
+	// Local fork: the blind MRU cursor-cycle is unbound — Ctrl+W now opens the
+	// MRU-ordered session switcher (switch_session) instead.
 	bindings := resolveHotkeys(nil)
-	if got := bindings[hotkeyMRUCycle]; got != "ctrl+w" {
-		t.Fatalf("mru_cycle default binding = %q, want ctrl+w", got)
+	if got := bindings[hotkeyMRUCycle]; got != "" {
+		t.Fatalf("mru_cycle default binding = %q, want \"\" (replaced by switcher on ctrl+w)", got)
+	}
+	if got := bindings[hotkeySwitchSession]; got != "ctrl+w" {
+		t.Fatalf("switch_session default binding = %q, want ctrl+w", got)
 	}
 }
 

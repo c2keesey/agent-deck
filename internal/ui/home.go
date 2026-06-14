@@ -8344,24 +8344,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.rebuildFlatItems()
 
 	case "ctrl+w":
-		// MRU cycle: jump through sessions sorted by most-recently-accessed.
-		// Freeze the MRU snapshot on first press so MarkAccessed doesn't re-sort.
-		// Reset if stale (>3s since last press).
-		stale := !h.mruCycleLastSwitch.IsZero() && time.Since(h.mruCycleLastSwitch) > 3*time.Second
-		if h.mruCycleSnapshot == nil || stale {
-			h.mruCycleSnapshot = h.mruSortedSessions()
-			h.mruCycleIndex = 0
+		// Open the MRU-ordered session switcher (upstream feature, remapped to
+		// Ctrl+W in the local fork — replaces the old blind MRU cursor-cycle).
+		// Pre-highlight the session under the cursor; tap Ctrl+W again to advance.
+		fromID := ""
+		if sel := h.getSelectedSession(); sel != nil {
+			fromID = sel.ID
 		}
-		h.mruCycleLastSwitch = time.Now()
-		if len(h.mruCycleSnapshot) < 2 {
-			return h, nil
-		}
-		h.mruCycleIndex = (h.mruCycleIndex + 1) % len(h.mruCycleSnapshot)
-		// Skip index 0 (the session where cycling started)
-		if h.mruCycleIndex == 0 {
-			h.mruCycleIndex = 1
-		}
-		h.moveCursorToSession(h.mruCycleSnapshot[h.mruCycleIndex].ID)
+		h.openSessionSwitcher(fromID, false)
 		return h, nil
 
 	case "ctrl+e":
@@ -17460,7 +17450,9 @@ func (h *Home) handleSessionSwitcherKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Detach key: leave the switcher (and any session), landing in the overview.
 		h.sessionSwitcher.Hide()
 		return h, nil
-	case "ctrl+s":
+	case "ctrl+s", "ctrl+w":
+		// ctrl+w is the local open key, so it also advances (tap-to-cycle, MRU-like);
+		// ctrl+s kept as the upstream alias.
 		h.sessionSwitcher.cycle(true, time.Now())
 		return h, h.armSwitcherCommit()
 	case "ctrl+a":

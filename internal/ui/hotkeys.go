@@ -154,17 +154,18 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyImport:           "i",
 	hotkeyReload:           "ctrl+r",
 	hotkeyDetach:           "ctrl+q",
-	hotkeyMRUCycle:         "ctrl+w",
-	hotkeyAttentionCycle:   "ctrl+e",
-	hotkeyWatcherPanel:     "",
-	hotkeyTeardown:         "y",
-	// switch_session (upstream session switcher) intentionally UNBOUND: Ctrl+S is
-	// XOFF and is commonly what terminals/tmux send for Cmd+Right, so it kept
-	// triggering the switcher. Unbinding makes ResolvedSwitchByte() return 0,
-	// which disables the in-attach switch detection. The overview Ctrl+S handler
-	// is also removed in handleMainKey. The feature code is kept (not deleted) to
-	// avoid re-conflicting with upstream on every sync.
-	hotkeySwitchSession: "",
+	// mru_cycle is UNBOUND: the local blind MRU cursor-cycle is superseded by
+	// upstream's MRU-ordered session switcher, bound to ctrl+w below.
+	hotkeyMRUCycle:       "",
+	hotkeyAttentionCycle: "ctrl+e",
+	hotkeyWatcherPanel:   "",
+	hotkeyTeardown:       "y",
+	// switch_session = ctrl+w (local remap). Upstream defaults this to Ctrl+S,
+	// but Ctrl+S is XOFF / what some terminals send for Cmd+Right, so it kept
+	// triggering unexpectedly. Ctrl+W is the user's old MRU key and the switcher
+	// is MRU-ordered, so it cleanly replaces the local MRU cursor-cycle. The old
+	// overview Ctrl+S handler stays removed from handleMainKey.
+	hotkeySwitchSession: "ctrl+w",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{

@@ -3,11 +3,11 @@ package ui
 import "testing"
 
 func TestResolvedSwitchByte_Default(t *testing.T) {
-	// Local fork: switch_session is unbound by default (upstream's Ctrl+S session
-	// switcher is disabled — Ctrl+S is XOFF and is what some terminals send for
-	// Cmd+Right). So the default switch byte is 0 (in-attach switch detection off).
-	if got := ResolvedSwitchByte(nil); got != 0 {
-		t.Errorf("default switch byte = %#x, want 0 (switcher disabled in fork)", got)
+	// Local fork: switch_session is remapped to Ctrl+W (upstream defaults it to
+	// Ctrl+S, which is XOFF / what some terminals send for Cmd+Right). The
+	// MRU-ordered switcher replaces the old blind MRU cursor-cycle on Ctrl+W.
+	if got := ResolvedSwitchByte(nil); got != 'w'-'a'+1 {
+		t.Errorf("default switch byte = %#x, want Ctrl+W (0x17)", got)
 	}
 }
 
