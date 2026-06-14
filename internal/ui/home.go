@@ -17359,10 +17359,27 @@ func (h *Home) openSessionSwitcher(fromID string, reattachOnCancel bool) {
 		}
 	}
 
+	// Identity labels: reuse the dashboard's computed primary labels (name /
+	// branch / worktree folder / live broadcast) so the switcher shows the same
+	// names + colors as the list. Fall back to a fresh computation for any
+	// session not in the last render snapshot.
+	labels := make(map[string]primaryLabel, len(instances))
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		if lbl, ok := h.primaryLabels[inst.ID]; ok && lbl.kind != primaryNone {
+			labels[inst.ID] = lbl
+			continue
+		}
+		labels[inst.ID] = primaryLabelFor(inst, h.getSessionRenderState(inst), nil)
+	}
+
 	h.sessionSwitcher.SetSize(h.width, h.height)
 	if !h.sessionSwitcher.Show(fromID, instances, subtitles) {
 		return
 	}
+	h.sessionSwitcher.labels = labels
 	h.sessionSwitcher.reattachOnCancel = reattachOnCancel
 	// Treat the opening Ctrl+S as the first advance so key-repeat that arrives
 	// right after the attach->TUI handoff is throttled instead of spinning.

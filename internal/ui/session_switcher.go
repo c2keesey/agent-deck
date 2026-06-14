@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -34,9 +33,10 @@ type SessionSwitcher struct {
 	width, height    int
 	sessions         []*session.Instance // active sessions, MRU-ordered
 	cursor           int
-	fromID           string            // session the picker was opened from
-	subtitles        map[string]string // sessionID -> dim conversation/pane title (matches the overview)
-	reattachOnCancel bool              // Esc re-attaches to fromID (opened while attached) vs. just closing (opened from the overview)
+	fromID           string                  // session the picker was opened from
+	subtitles        map[string]string       // sessionID -> dim conversation/pane title (matches the overview)
+	labels           map[string]primaryLabel // sessionID -> dashboard primary label (name/branch/folder/broadcast); set by openSessionSwitcher
+	reattachOnCancel bool                    // Esc re-attaches to fromID (opened while attached) vs. just closing (opened from the overview)
 	// commitGen is bumped on every open/cycle/cancel so a stale idle-commit
 	// timer (scheduled before a later keypress) is ignored when it fires. It is
 	// intentionally monotonic — never reset — so a timer from a previous
@@ -132,6 +132,7 @@ func (s *SessionSwitcher) Hide() {
 	s.sessions = nil
 	s.fromID = ""
 	s.subtitles = nil
+	s.labels = nil
 	s.reattachOnCancel = false
 	s.lastCycleAt = time.Time{}
 }
@@ -165,6 +166,26 @@ func (s *SessionSwitcher) prev() {
 	}
 }
 
+// primaryLabelStyle styles a switcher row's identity label by the same rules the
+// dashboard row render uses, so the switcher matches the list: a real name uses
+// the plain text color, a distinguishing branch is purple, a worktree folder
+// takes its own worktree color, and a live broadcast / auto name fades to dim.
+// The selected row gets the accent highlight bar.
+func primaryLabelStyle(lbl primaryLabel, selected bool) lipgloss.Style {
+	switch {
+	case selected:
+		return SessionTitleSelStyle
+	case lbl.kind == primaryBranch:
+		return lipgloss.NewStyle().Foreground(ColorPurple).Bold(true)
+	case lbl.kind == primaryFolder:
+		return lipgloss.NewStyle().Foreground(worktreeColor(lbl.text)).Bold(true)
+	case lbl.kind == primaryBroadcast, lbl.kind == primaryAuto:
+		return lipgloss.NewStyle().Foreground(ColorTextDim)
+	default: // primaryName
+		return lipgloss.NewStyle().Foreground(ColorText)
+	}
+}
+
 // View renders the centered switcher box.
 func (s *SessionSwitcher) View() string {
 	if !s.visible {
@@ -174,11 +195,6 @@ func (s *SessionSwitcher) View() string {
 	titleStyle := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(ColorAccent)
-	selectedStyle := lipgloss.NewStyle().
-		Foreground(ColorAccent).
-		Bold(true)
-	normalStyle := lipgloss.NewStyle().
-		Foreground(ColorText)
 	footerStyle := lipgloss.NewStyle().
 		Foreground(ColorComment).
 		Italic(true)
@@ -203,24 +219,36 @@ func (s *SessionSwitcher) View() string {
 
 	for i, inst := range s.sessions {
 		indicator := statusIndicator(inst.GetStatusThreadSafe())
-		tool := ""
-		if inst.Tool != "" {
-			tool = fmt.Sprintf(" (%s)", inst.Tool)
+		selected := i == s.cursor
+
+		// Identity label: reuse the dashboard's primary-label engine (name >
+		// distinguishing branch > worktree folder > live broadcast > auto) so
+		// the switcher shows the same names + colors as the list. Fall back to
+		// the raw title when no precomputed label exists (e.g. in tests).
+		lbl, ok := s.labels[inst.ID]
+		if !ok || lbl.text == "" {
+			lbl = primaryLabel{text: inst.Title, kind: primaryName}
 		}
-		title := inst.Title + tool
+		name := primaryLabelStyle(lbl, selected).Render(lbl.text)
+
+		// Tool chip — hidden for the default "claude" (matches the dashboard);
+		// other tools surface in their tool color.
+		tool := ""
+		if inst.Tool != "" && inst.Tool != "claude" {
+			tool = GetToolStyle(inst.Tool).Render(" " + inst.Tool)
+		}
 
 		marker := "  "
-		labelStyle := normalStyle
-		if i == s.cursor {
+		if selected {
 			marker = "> "
-			labelStyle = selectedStyle
 		}
-		line := marker + indicator + " " + labelStyle.Render(title)
+		line := marker + indicator + " " + name + tool
 
-		// Append the dim conversation/pane title (same text the overview shows
-		// next to an entry), truncated to the space left on the row.
-		if sub := s.subtitles[inst.ID]; sub != "" {
-			used := 2 + 1 + 1 + cellWidth(title) // marker + indicator + space + title
+		// Append the dim conversation/pane title (the live broadcast the overview
+		// shows). Skip it when the broadcast already won the identity label, so we
+		// don't render the same text twice — same de-dup the dashboard trailer does.
+		if sub := s.subtitles[inst.ID]; sub != "" && lbl.kind != primaryBroadcast {
+			used := 2 + 1 + 1 + cellWidth(lbl.text) + cellWidth(tool) // marker + indicator + space + name + tool
 			if remaining := contentWidth - used - 1; remaining >= 6 {
 				line += " " + DimStyle.Render(cellTruncate(sub, remaining, "…"))
 			}
@@ -229,7 +257,7 @@ func (s *SessionSwitcher) View() string {
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, footerStyle.Render("Ctrl+S next · Ctrl+A prev"))
+	lines = append(lines, footerStyle.Render("Ctrl+W next · Ctrl+A prev"))
 	lines = append(lines, footerStyle.Render("↑/↓ browse · Enter attach · Esc back"))
 
 	content := strings.Join(lines, "\n")
