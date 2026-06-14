@@ -3,8 +3,11 @@ package ui
 import "testing"
 
 func TestResolvedSwitchByte_Default(t *testing.T) {
-	if got := ResolvedSwitchByte(nil); got != 0x13 {
-		t.Errorf("default switch byte = %#x, want Ctrl+S (0x13)", got)
+	// Local fork: switch_session is unbound by default (upstream's Ctrl+S session
+	// switcher is disabled — Ctrl+S is XOFF and is what some terminals send for
+	// Cmd+Right). So the default switch byte is 0 (in-attach switch detection off).
+	if got := ResolvedSwitchByte(nil); got != 0 {
+		t.Errorf("default switch byte = %#x, want 0 (switcher disabled in fork)", got)
 	}
 }
 

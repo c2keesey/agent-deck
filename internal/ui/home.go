@@ -8239,17 +8239,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		return h, cmd
 
-	case "ctrl+s":
-		// Open the session switcher from the overview too, with the same key
-		// used while attached. Pre-highlight the session under the cursor (if
-		// any) so it lines up with what the user is already looking at; Esc just
-		// closes (we're not attached, so there is nothing to re-attach to).
-		fromID := ""
-		if sel := h.getSelectedSession(); sel != nil {
-			fromID = sel.ID
-		}
-		h.openSessionSwitcher(fromID, false)
-		return h, nil
+	// NOTE: upstream's overview Ctrl+S session-switcher handler is intentionally
+	// omitted (local fork). Ctrl+S is XOFF and is what some terminals/tmux send
+	// for Cmd+Right, so it kept opening the switcher unexpectedly. switch_session
+	// is unbound in defaultHotkeyBindings; the switcher code is kept (still
+	// reachable in principle via openSessionSwitcher) to avoid re-conflicting
+	// with upstream every sync. Re-add this case if you ever rebind it.
 
 	case "F":
 		// Open feedback dialog on demand (per D-11: bypasses ShouldShow -- user-initiated).

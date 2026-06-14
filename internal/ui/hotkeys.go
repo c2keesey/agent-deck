@@ -158,7 +158,13 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyAttentionCycle:   "ctrl+e",
 	hotkeyWatcherPanel:     "",
 	hotkeyTeardown:         "y",
-	hotkeySwitchSession:    "ctrl+s",
+	// switch_session (upstream session switcher) intentionally UNBOUND: Ctrl+S is
+	// XOFF and is commonly what terminals/tmux send for Cmd+Right, so it kept
+	// triggering the switcher. Unbinding makes ResolvedSwitchByte() return 0,
+	// which disables the in-attach switch detection. The overview Ctrl+S handler
+	// is also removed in handleMainKey. The feature code is kept (not deleted) to
+	// avoid re-conflicting with upstream on every sync.
+	hotkeySwitchSession: "",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{
