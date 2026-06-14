@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -186,85 +187,190 @@ func primaryLabelStyle(lbl primaryLabel, selected bool) lipgloss.Style {
 	}
 }
 
+// switcherMaxVisibleRows caps how many session rows render at once; when there
+// are more, a window centered on the cursor scrolls with "↑/↓ N more" markers.
+const switcherMaxVisibleRows = 12
+
 // View renders the centered switcher box.
 func (s *SessionSwitcher) View() string {
 	if !s.visible {
 		return ""
 	}
 
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(ColorAccent)
-	footerStyle := lipgloss.NewStyle().
-		Foreground(ColorComment).
-		Italic(true)
-
-	dialogWidth := 56
-	if s.width > 0 && s.width < dialogWidth+10 {
-		dialogWidth = s.width - 10
-		if dialogWidth < 30 {
-			dialogWidth = 30
-		}
+	dialogWidth := 70
+	if s.width > 0 && s.width < dialogWidth+8 {
+		dialogWidth = s.width - 8
+	}
+	if dialogWidth < 40 {
+		dialogWidth = 40
 	}
 	// Content area inside the rounded border + Padding(1,2): horizontal padding
-	// eats 4 cells. Truncating rows to this keeps long subtitles from wrapping.
+	// eats 4 cells.
 	contentWidth := dialogWidth - 4
-	if contentWidth < 10 {
-		contentWidth = 10
+	if contentWidth < 24 {
+		contentWidth = 24
 	}
 
-	var lines []string
-	lines = append(lines, titleStyle.Render("Switch session"))
-	lines = append(lines, "")
+	total := len(s.sessions)
 
-	for i, inst := range s.sessions {
-		indicator := statusIndicator(inst.GetStatusThreadSafe())
+	// Name column width: the widest label, clamped so the live-activity subtitle
+	// always keeps room. Aligns tools + subtitles into clean columns.
+	nameCol := 0
+	for _, inst := range s.sessions {
+		if w := cellWidth(s.labelText(inst)); w > nameCol {
+			nameCol = w
+		}
+	}
+	// Cap so one long label (often a live-broadcast activity sentence) can't push
+	// the subtitle column off the row; 24 keeps names compact yet readable.
+	nameCol = max(min(nameCol, min(24, contentWidth/2)), 10)
+
+	// --- header: title on the left, position on the right, then a rule ---
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+	head := titleStyle.Render("⇄  Switch Session")
+	pos := DimStyle.Render(fmt.Sprintf("%d/%d", s.cursor+1, total))
+	gap := max(contentWidth-cellWidth(head)-cellWidth(pos), 1)
+
+	var lines []string
+	lines = append(lines, head+strings.Repeat(" ", gap)+pos)
+	lines = append(lines, lipgloss.NewStyle().Foreground(ColorBorder).Render(strings.Repeat("─", contentWidth)))
+
+	// --- scroll window centered on the cursor ---
+	start, end := 0, total
+	if total > switcherMaxVisibleRows {
+		start = max(s.cursor-switcherMaxVisibleRows/2, 0)
+		end = start + switcherMaxVisibleRows
+		if end > total {
+			end = total
+			start = end - switcherMaxVisibleRows
+		}
+	}
+	if start > 0 {
+		lines = append(lines, DimStyle.Render(fmt.Sprintf("  ↑ %d more", start)))
+	}
+
+	selBar := lipgloss.NewStyle().Background(ColorAccent).Foreground(ColorBg).Bold(true)
+
+	for i := start; i < end; i++ {
+		inst := s.sessions[i]
 		selected := i == s.cursor
+		status := inst.GetStatusThreadSafe()
 
 		// Identity label: reuse the dashboard's primary-label engine (name >
 		// distinguishing branch > worktree folder > live broadcast > auto) so
-		// the switcher shows the same names + colors as the list. Fall back to
-		// the raw title when no precomputed label exists (e.g. in tests).
+		// the switcher shows the same names + colors as the list.
 		lbl, ok := s.labels[inst.ID]
 		if !ok || lbl.text == "" {
 			lbl = primaryLabel{text: inst.Title, kind: primaryName}
 		}
-		name := primaryLabelStyle(lbl, selected).Render(lbl.text)
+		name := lbl.text
+		if cellWidth(name) > nameCol {
+			name = cellTruncate(name, nameCol, "…")
+		}
 
-		// Tool chip — hidden for the default "claude" (matches the dashboard);
-		// other tools surface in their tool color.
-		tool := ""
+		// Tool name — hidden for the default "claude" (matches the dashboard).
+		toolName := ""
 		if inst.Tool != "" && inst.Tool != "claude" {
-			tool = GetToolStyle(inst.Tool).Render(" " + inst.Tool)
+			toolName = inst.Tool
 		}
 
-		marker := "  "
+		// Live-activity subtitle, unless the broadcast already won the label.
+		sub := ""
+		if lbl.kind != primaryBroadcast {
+			sub = s.subtitles[inst.ID]
+		}
+
 		if selected {
-			marker = "> "
+			// One uniform accent bar: build the row as plain text (so the bar's
+			// background paints evenly) and pad it to the full content width.
+			row := "▸ " + statusGlyph(status) + " " + padCells(name, nameCol)
+			used := 2 + 1 + 1 + nameCol
+			if toolName != "" {
+				row += " " + toolName
+				used += 1 + cellWidth(toolName)
+			}
+			if sub != "" {
+				if rem := contentWidth - used - 2; rem >= 6 {
+					row += "  " + cellTruncate(sub, rem, "…")
+				}
+			}
+			lines = append(lines, selBar.Render(padCells(row, contentWidth)))
+			continue
 		}
-		line := marker + indicator + " " + name + tool
 
-		// Append the dim conversation/pane title (the live broadcast the overview
-		// shows). Skip it when the broadcast already won the identity label, so we
-		// don't render the same text twice — same de-dup the dashboard trailer does.
-		if sub := s.subtitles[inst.ID]; sub != "" && lbl.kind != primaryBroadcast {
-			used := 2 + 1 + 1 + cellWidth(lbl.text) + cellWidth(tool) // marker + indicator + space + name + tool
-			if remaining := contentWidth - used - 1; remaining >= 6 {
-				line += " " + DimStyle.Render(cellTruncate(sub, remaining, "…"))
+		// Non-selected: per-kind colors, columns aligned.
+		row := "  " + statusIndicator(status) + " " +
+			primaryLabelStyle(lbl, false).Render(name) + strings.Repeat(" ", max(0, nameCol-cellWidth(name)))
+		used := 2 + 1 + 1 + nameCol
+		if toolName != "" {
+			row += GetToolStyle(toolName).Render(" " + toolName)
+			used += 1 + cellWidth(toolName)
+		}
+		if sub != "" {
+			if rem := contentWidth - used - 2; rem >= 6 {
+				row += "  " + DimStyle.Render(cellTruncate(sub, rem, "…"))
 			}
 		}
-		lines = append(lines, line)
+		lines = append(lines, row)
 	}
 
+	if end < total {
+		lines = append(lines, DimStyle.Render(fmt.Sprintf("  ↓ %d more", total-end)))
+	}
+
+	// --- footer: keycap hints ---
 	lines = append(lines, "")
-	lines = append(lines, footerStyle.Render("Ctrl+W next · Ctrl+A prev"))
-	lines = append(lines, footerStyle.Render("↑/↓ browse · Enter attach · Esc back"))
+	lines = append(lines, switcherFooter())
 
 	content := strings.Join(lines, "\n")
-
-	box := DialogBoxStyle.
-		Width(dialogWidth).
-		Render(content)
-
+	box := DialogBoxStyle.Width(dialogWidth).Render(content)
 	return centerInScreen(box, s.width, s.height)
+}
+
+// labelText returns the precomputed primary-label text for inst, or its raw
+// title as a fallback (e.g. before openSessionSwitcher set the labels, or in tests).
+func (s *SessionSwitcher) labelText(inst *session.Instance) string {
+	if lbl, ok := s.labels[inst.ID]; ok && lbl.text != "" {
+		return lbl.text
+	}
+	return inst.Title
+}
+
+// statusGlyph is the uncolored status bullet, for the selected row's accent bar
+// where a single background style paints the whole line.
+func statusGlyph(st session.Status) string {
+	switch st {
+	case session.StatusRunning:
+		return "●"
+	case session.StatusWaiting:
+		return "◐"
+	case session.StatusIdle:
+		return "○"
+	default:
+		return "✕"
+	}
+}
+
+// padCells right-pads s with spaces to exactly target display cells, truncating
+// with an ellipsis if it is longer. Keeps switcher columns aligned.
+func padCells(s string, target int) string {
+	if w := cellWidth(s); w < target {
+		return s + strings.Repeat(" ", target-w)
+	}
+	return cellTruncate(s, target, "…")
+}
+
+// switcherFooter renders the key hints as keycaps (bright keys, dim labels).
+func switcherFooter() string {
+	key := lipgloss.NewStyle().Foreground(ColorText).Bold(true)
+	desc := lipgloss.NewStyle().Foreground(ColorComment)
+	sep := desc.Render("   ")
+	parts := []string{
+		key.Render("Ctrl+W") + desc.Render(" next"),
+		key.Render("Ctrl+A") + desc.Render(" prev"),
+		key.Render("↑↓") + desc.Render(" browse"),
+		key.Render("⏎") + desc.Render(" attach"),
+		key.Render("esc") + desc.Render(" back"),
+	}
+	return strings.Join(parts, sep)
 }

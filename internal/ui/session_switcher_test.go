@@ -232,7 +232,7 @@ func TestSessionSwitcher_ViewRendersTitlesAndFooter(t *testing.T) {
 	sw.Show("a", mruThree(), subtitles)
 
 	view := sw.View()
-	for _, want := range []string{"Switch session", "alpha", "bravo", "charlie", "attach"} {
+	for _, want := range []string{"Switch Session", "alpha", "bravo", "charlie", "attach"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q", want)
 		}
