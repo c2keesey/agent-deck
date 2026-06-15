@@ -355,6 +355,9 @@ func main() {
 		case "inbox":
 			handleInbox(args[1:])
 			return
+		case "idea":
+			handleIdea(profile, args[1:])
+			return
 		case "feedback":
 			handleFeedback(args[1:])
 			return
@@ -3009,6 +3012,7 @@ func printHelp() {
 	fmt.Println("  add <path>       Add a new session")
 	fmt.Println("  launch [path]    Add, start, and optionally send a message in one step")
 	fmt.Println("  try <name>       Quick experiment (create/find dated folder + session)")
+	fmt.Println("  idea [text]      Capture an idea to the backlog (Ctrl+Alt+I inside a session)")
 	fmt.Println("  list, ls         List all sessions")
 	fmt.Println("  remove, rm       Remove a session")
 	fmt.Println("  rename, mv       Rename a session")
