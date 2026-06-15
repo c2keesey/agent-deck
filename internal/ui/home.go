@@ -241,6 +241,7 @@ type Home struct {
 	feedbackDialog       *FeedbackDialog       // For in-app feedback popup (Phase 2)
 	zoxidePicker         *ZoxidePicker         // Quick-open picker backed by the zoxide DB
 	maiaWorkerPicker     *MaiaWorkerPicker     // Simple new-session picker scoped to MAIA worktrees (replaces 'n' dialog)
+	personalPicker       *PersonalPicker       // 'n' picker for the personal profile (~/Projects, home, optiplex ssh)
 	feedbackState        *feedback.State       // Loaded at first show, avoids repeated disk I/O
 	feedbackSender       *feedback.Sender      // Sender constructed once in NewHome (Phase 3, per D-05)
 	watcherPanel         *WatcherPanel         // For showing watcher status and events
@@ -1108,6 +1109,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		feedbackDialog:       NewFeedbackDialog(),
 		zoxidePicker:         NewZoxidePicker(),
 		maiaWorkerPicker:     NewMaiaWorkerPicker(),
+		personalPicker:       NewPersonalPicker(),
 		feedbackSender:       feedback.NewSender(),
 		watcherPanel:         NewWatcherPanel(),
 		toolVisibilityPanel:  NewToolVisibilityPanel(),
@@ -6219,6 +6221,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h.handleMaiaWorkerPickerKey(msg)
 		}
 
+		if h.personalPicker.IsVisible() {
+			return h.handlePersonalPickerKey(msg)
+		}
+
 		if h.showCostDashboard {
 			keyStr := msg.String()
 			if keyStr == "q" || keyStr == "$" || keyStr == "esc" {
@@ -7887,9 +7893,9 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return h, nil
 			}
 		}
-		// Mark which worktrees already host a session so the picker can park
-		// on the next open worker. Occupied = any session, regardless of
-		// status, keyed by absolute worktree path.
+		// Mark which worktrees/projects already host a session so the picker can
+		// park on the next open worker / tag busy rows. Occupied = any session,
+		// regardless of status, keyed by absolute project path.
 		occupied := make(map[string]bool)
 		h.instancesMu.RLock()
 		for _, inst := range h.instances {
@@ -7898,6 +7904,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		h.instancesMu.RUnlock()
+		// Personal profile gets its own picker (~/Projects + home + optiplex ssh)
+		// instead of the MAIA worker picker.
+		if h.profile == "personal" {
+			h.personalPicker.SetSize(h.width, h.height)
+			h.personalPicker.Show(occupied)
+			return h, nil
+		}
 		h.maiaWorkerPicker.SetSize(h.width, h.height)
 		h.maiaWorkerPicker.Show(occupied)
 		return h, nil
@@ -10451,6 +10464,76 @@ func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.C
 	)
 }
 
+// handlePersonalPickerKey routes keys for the personal new-session picker.
+// Enter creates a session at the highlighted target with the active tool, Tab
+// cycles the tool, Esc cancels; everything else (navigation + filter typing)
+// goes through the picker's Update.
+func (h *Home) handlePersonalPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		h.personalPicker.Hide()
+		return h, nil
+	case "tab":
+		h.personalPicker.ToggleTool()
+		return h, nil
+	case "enter":
+		target, ok := h.personalPicker.Selected()
+		tool := h.personalPicker.ActiveTool()
+		h.personalPicker.Hide()
+		if !ok {
+			return h, nil
+		}
+		switch target.kind {
+		case personalKindSSH:
+			return h, h.createSSHSession(optiplexLabel, target.command)
+		case personalKindHome:
+			home, err := os.UserHomeDir()
+			if err != nil || home == "" {
+				return h, nil
+			}
+			return h, h.quickCreateSessionAtWithTool(home, tool)
+		default: // personalKindProject
+			if target.path == "" {
+				return h, nil
+			}
+			return h, h.quickCreateSessionAtWithTool(target.path, tool)
+		}
+	default:
+		h.personalPicker, _ = h.personalPicker.Update(msg)
+		return h, nil
+	}
+}
+
+// createSSHSession creates a plain shell session rooted at the home dir that
+// runs the given command (e.g. an ssh login). createSessionTool maps the
+// unknown command to the "shell" tool and runs it verbatim in the pane.
+func (h *Home) createSSHSession(label, command string) tea.Cmd {
+	if command == "" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	h.instancesMu.RLock()
+	name := ensureUniqueSessionTitle(label, h.instances)
+	h.instancesMu.RUnlock()
+
+	return h.createSessionInGroupWithWorktreeAndOptions(
+		name, home, command,
+		"",         // empty group → derived from path
+		"", "", "", // no worktree
+		false, false, nil,
+		nil, // no extra claude args
+		"",  // no claude startup query
+		"",  // no explicit model override
+		false, nil,
+		"", "",
+		"",
+		false,
+	)
+}
+
 // quickCreateSessionAt creates a session rooted at the given path with an
 // auto-generated name and the user's configured default tool, bypassing
 // cursor-context tool inheritance so the zoxide flow always lands on the
@@ -12166,6 +12249,9 @@ func (h *Home) View() string {
 	}
 	if h.maiaWorkerPicker.IsVisible() {
 		return h.maiaWorkerPicker.View()
+	}
+	if h.personalPicker.IsVisible() {
+		return h.personalPicker.View()
 	}
 	if h.showCostDashboard {
 		return h.costDashboard.View()
