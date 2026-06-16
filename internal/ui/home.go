@@ -14771,26 +14771,7 @@ func (h *Home) renderSessionItem(
 	}
 	primary := " " + padToCells(primaryStyle.Render(primaryText), cellWidth(primaryText), h.primaryColCells)
 
-	// Personal fork: hide the tool word when it's "claude" — the user's
-	// default, repeated on nearly every row. Other tools (shell, gemini,
-	// codex, custom commands) still surface so the row isn't ambiguous.
-	tool := ""
-	if instTool != "claude" {
-		tool = toolStyle.Render(" " + instTool)
-	}
-
-	// Supervisor badge for the maestro row.
-	maestroBadge := ""
-	if isMaestro {
-		mStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
-		if selected {
-			mStyle = SessionStatusSelStyle
-		}
-		maestroBadge = mStyle.Render(" [SUPERVISOR]")
-	}
-
-	// YOLO badge for Gemini/Codex sessions with YOLO mode enabled
-	yoloBadge := ""
+	// YOLO (auto-approve / dangerous) mode for gemini/codex/hermes sessions.
 	showYolo := false
 	if instTool == "gemini" && inst.GeminiYoloMode != nil && *inst.GeminiYoloMode {
 		showYolo = true
@@ -14809,12 +14790,38 @@ func (h *Home) renderSessionItem(
 			showYolo = true
 		}
 	}
-	if showYolo {
-		yoloStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
-		if selected {
-			yoloStyle = SessionStatusSelStyle
+
+	// Personal fork: hide the tool word when it's "claude" — the user's
+	// default, repeated on nearly every row. Other tools (shell, gemini,
+	// codex, custom commands) still surface so the row isn't ambiguous.
+	//
+	// YOLO mode folds INTO the tool word rather than a separate badge: the word
+	// is recolored to a danger style (yellow bold) with a trailing "!", e.g.
+	// "codex!". gemini/codex/hermes always show their tool word (they're never
+	// "claude"), so this adds at most one cell — keeping worker-N rows aligned
+	// instead of the old 7-cell " [YOLO]" badge that ragged every trailing
+	// column whenever some workers had YOLO and others didn't.
+	tool := ""
+	if instTool != "claude" {
+		if showYolo {
+			yoloStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
+			if selected {
+				yoloStyle = SessionStatusSelStyle
+			}
+			tool = yoloStyle.Render(" " + instTool + "!")
+		} else {
+			tool = toolStyle.Render(" " + instTool)
 		}
-		yoloBadge = yoloStyle.Render(" [YOLO]")
+	}
+
+	// Supervisor badge for the maestro row.
+	maestroBadge := ""
+	if isMaestro {
+		mStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
+		if selected {
+			mStyle = SessionStatusSelStyle
+		}
+		maestroBadge = mStyle.Render(" [SUPERVISOR]")
 	}
 
 	// Worktree badge: shown for every session whose project path or
@@ -14912,9 +14919,11 @@ func (h *Home) renderSessionItem(
 	// color-coded worktree chip, then the live activity trailer. The primary
 	// label carries its own leading space, so no literal separator here. The
 	// leading gutter (leftGutterWidth, upstream) keeps sessions aligned with
-	// group rows, which reserve the same gutter for root hotkey numbers.
+	// group rows, which reserve the same gutter for root hotkey numbers. YOLO
+	// mode is folded into the tool word (see above), so there is no separate
+	// badge slot for it.
 	row := fmt.Sprintf(
-		"%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+		"%s%s%s%s%s%s%s%s%s%s%s%s%s",
 		strings.Repeat(" ", leftGutterWidth),
 		baseIndent,
 		selectionPrefix,
@@ -14925,7 +14934,6 @@ func (h *Home) renderSessionItem(
 		priorityChip,
 		tool,
 		maestroBadge,
-		yoloBadge,
 		worktreeBadge,
 		sandboxBadge,
 		multiRepoBadge,
