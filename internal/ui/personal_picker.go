@@ -14,6 +14,11 @@ import (
 // Personal fork customization (mirrors maiaReposDir for the work picker).
 const personalProjectsDir = "/Users/c2k/Projects"
 
+// agentDeckDir is the agent-deck repo itself, pinned in the picker so a session
+// on the fork's own source is always one keystroke away (it lives under ~/repos,
+// not ~/Projects, so the scan below would never surface it otherwise).
+const agentDeckDir = "/Users/c2k/repos/agent-deck"
+
 // optiplexSSHCommand launches an interactive shell on the personal OptiPlex box
 // (hostname c2k-optiplex, reached over Tailscale). Mirrors the `sshc` shell alias.
 const (
@@ -182,6 +187,7 @@ func (m *PersonalPicker) refreshTargets() {
 	m.scanErr = ""
 	m.targets = []personalTarget{
 		{label: "~  (home / root dir)", kind: personalKindHome},
+		{label: "agent-deck  (" + agentDeckDir + ")", kind: personalKindProject, path: agentDeckDir},
 		{label: optiplexLabel + "  (" + optiplexSSHCommand + ")", kind: personalKindSSH, command: optiplexSSHCommand},
 	}
 

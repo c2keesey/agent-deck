@@ -128,6 +128,30 @@ func TestPersonalPicker_View(t *testing.T) {
 	}
 }
 
+func TestPersonalPicker_AgentDeckPinned(t *testing.T) {
+	p := NewPersonalPicker()
+	// refreshTargets always adds the pinned rows before scanning ~/Projects, so
+	// the agent-deck shortcut is present even if the scan errors.
+	p.refreshTargets()
+
+	var found *personalTarget
+	for i := range p.targets {
+		if p.targets[i].path == agentDeckDir {
+			found = &p.targets[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("agent-deck shortcut missing from picker targets: %v", labels(p.targets))
+	}
+	if found.kind != personalKindProject {
+		t.Errorf("agent-deck row kind = %q, want %q (so Enter creates a session at the repo with the active tool)", found.kind, personalKindProject)
+	}
+	if !strings.Contains(found.label, "agent-deck") {
+		t.Errorf("agent-deck row label = %q, want it to contain \"agent-deck\" so it's filterable", found.label)
+	}
+}
+
 func labels(ts []personalTarget) []string {
 	out := make([]string, len(ts))
 	for i, t := range ts {
