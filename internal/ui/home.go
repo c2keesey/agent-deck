@@ -35,6 +35,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/docker"
 	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/ideas"
 	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/safego"
@@ -232,6 +233,8 @@ type Home struct {
 	editPathsDialog      *EditPathsDialog      // For editing multi-repo paths
 	editSessionDialog    *EditSessionDialog    // For editing session settings (title/color/notes/command/...)
 	skillDialog          *SkillDialog          // For managing project skills
+	ideaDialog           *IdeaDialog           // Capture a "by the way" idea from the dashboard (local fork)
+	ideaCaptureSessionID string                // session whose context the open idea dialog will attach (local fork)
 	setupWizard          *SetupWizard          // For first-run setup
 	settingsPanel        *SettingsPanel        // For editing settings
 	analyticsPanel       *AnalyticsPanel       // For displaying session analytics
@@ -1100,6 +1103,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		editPathsDialog:      NewEditPathsDialog(),
 		editSessionDialog:    NewEditSessionDialog(),
 		skillDialog:          NewSkillDialog(),
+		ideaDialog:           NewIdeaDialog(),
 		setupWizard:          NewSetupWizard(),
 		settingsPanel:        NewSettingsPanel(),
 		analyticsPanel:       NewAnalyticsPanel(),
@@ -4344,6 +4348,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.toolVisibilityPanel.SetSize(msg.Width, msg.Height)
 		}
 		h.geminiModelDialog.SetSize(msg.Width, msg.Height)
+		h.ideaDialog.SetSize(msg.Width, msg.Height)
 		// Issue #1366: a resize can reveal the preview pane (single -> stacked/dual).
 		// fetchSelectedPreview self-guards to nil in single-column, so this only
 		// fetches when a preview pane is actually visible.
@@ -6195,6 +6200,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.skillDialog.IsVisible() {
 			return h.handleSkillDialogKey(msg)
 		}
+		if h.ideaDialog.IsVisible() {
+			return h.handleIdeaDialogKey(msg)
+		}
 		if h.geminiModelDialog.IsVisible() {
 			d, cmd := h.geminiModelDialog.Update(msg)
 			h.geminiModelDialog = d
@@ -6919,6 +6927,7 @@ func (h *Home) hasModalVisible() bool {
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
 		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
+		h.ideaDialog.IsVisible() ||
 		h.geminiModelDialog.IsVisible() || h.sessionPickerDialog.IsVisible() ||
 		h.sessionSwitcher.IsVisible() ||
 		h.worktreeFinishDialog.IsVisible() || h.editPathsDialog.IsVisible() ||
@@ -8007,6 +8016,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "i":
 		return h, h.importSessions
+
+	case "alt+i":
+		// Capture a "by the way" idea from the dashboard — the in-view twin of
+		// the Ctrl+Alt+I popup bound inside sessions. (Bubble Tea can't deliver
+		// ctrl+alt+i as a distinct key, so the dashboard uses Alt+I.) Snapshots
+		// the selected session (if any) as context; an idea can still be
+		// captured with no session selected (cursor on a group or empty row).
+		// (local fork)
+		h.ideaCaptureSessionID = ""
+		label := ""
+		if sel := h.getSelectedSession(); sel != nil {
+			h.ideaCaptureSessionID = sel.ID
+			label = sel.Title
+		}
+		h.ideaDialog.SetSize(h.width, h.height)
+		h.ideaDialog.Show(label)
+		return h, nil
 
 	case "I":
 		// Enter insert mode (#1069 feature 1): subsequent keystrokes are
@@ -9489,6 +9515,63 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	h.groupDialog, cmd = h.groupDialog.Update(msg)
 	return h, cmd
+}
+
+// handleIdeaDialogKey handles input for the dashboard idea-capture dialog:
+// Enter saves the idea (with the snapshotted session context) to the global
+// backlog, Esc cancels, everything else types into the field. (local fork)
+func (h *Home) handleIdeaDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		if text := h.ideaDialog.Value(); text != "" {
+			h.appendDashboardIdea(text)
+		}
+		h.ideaDialog.Hide()
+		return h, nil
+	case "esc":
+		h.ideaDialog.Hide()
+		return h, nil
+	}
+	var cmd tea.Cmd
+	h.ideaDialog, cmd = h.ideaDialog.Update(msg)
+	return h, cmd
+}
+
+// buildIdeaEntry snapshots the captured session's context into an idea entry.
+// A blank ideaCaptureSessionID (no session selected) yields a bare entry with
+// no session context. Pure (modulo the LastClaudeChatAnchor read) so it can be
+// unit-tested without touching the backlog. (local fork)
+func (h *Home) buildIdeaEntry(text string, now time.Time) ideas.IdeaEntry {
+	entry := ideas.IdeaEntry{Text: text, At: now}
+	inst := h.getInstanceByID(h.ideaCaptureSessionID)
+	if inst == nil {
+		return entry
+	}
+	if ts := inst.GetTmuxSession(); ts != nil && ts.Name != "" {
+		entry.Session = ts.Name
+	} else {
+		entry.Session = inst.Title
+	}
+	entry.Project = inst.ProjectPath
+	entry.Tool = inst.Tool
+	entry.ClaudeSessionID = inst.ClaudeSessionID
+	if inst.ClaudeSessionID != "" {
+		if anchor, _ := session.LastClaudeChatAnchor(inst.ClaudeSessionID, inst.ProjectPath); anchor != "" {
+			entry.LastMessageLine = anchor
+		}
+	}
+	return entry
+}
+
+// appendDashboardIdea appends the captured idea to the global backlog
+// (~/.agent-deck/ideas.md), mirroring the CLI `agent-deck idea` capture.
+// (local fork)
+func (h *Home) appendDashboardIdea(text string) {
+	if err := appendIdeaFunc(h.buildIdeaEntry(text, time.Now())); err != nil {
+		h.setError(fmt.Errorf("idea capture failed: %w", err))
+		return
+	}
+	h.maintenanceMsg = "💡 Idea captured to ideas.md"
 }
 
 // handleForkDialogKey handles keyboard input for the fork dialog
@@ -12247,6 +12330,9 @@ func (h *Home) View() string {
 	}
 	if h.skillDialog.IsVisible() {
 		return h.skillDialog.View()
+	}
+	if h.ideaDialog.IsVisible() {
+		return h.ideaDialog.View()
 	}
 	if h.geminiModelDialog.IsVisible() {
 		return h.geminiModelDialog.View()
