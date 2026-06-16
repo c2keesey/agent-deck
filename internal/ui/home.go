@@ -8370,21 +8370,39 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "ctrl+e":
 		// Attention cycle (local fork): move the cursor through READY sessions
-		// (waiting/idle) ordered by priority, then longest-waiting. Freeze the
-		// snapshot on first press; reset if stale (>3s). First press lands on
-		// the top-priority ready session; repeats cycle down the list.
-		stale := !h.attentionCycleLastSwitch.IsZero() && time.Since(h.attentionCycleLastSwitch) > 3*time.Second
-		if h.attentionCycleSnapshot == nil || stale {
-			h.attentionCycleSnapshot = h.attentionSortedSessions()
-			h.attentionCycleIndex = -1
-		}
-		h.attentionCycleLastSwitch = time.Now()
-		if len(h.attentionCycleSnapshot) == 0 {
+		// (waiting/idle, never running) ordered by priority, then longest-waiting.
+		//
+		// The ready set is recomputed on EVERY press rather than frozen on the
+		// first, so the cycle always reflects reality: a session that just went
+		// busy drops out and a higher-priority one that just became ready drops
+		// in immediately. (The old frozen snapshot meant Ctrl+E could keep
+		// landing on a stale session and never reach the now-most-important one.)
+		//
+		// Cycle position is tracked by the cursor's current session: the first
+		// press of a burst lands on the top-priority ready session, and each
+		// repeat advances to the next one and wraps. Any other key zeroes
+		// attentionCycleLastSwitch (above), so a fresh burst — or one resumed
+		// after a >3s lull — restarts from the top.
+		ready := h.attentionSortedSessions()
+		if len(ready) == 0 {
 			h.maintenanceMsg = "No sessions ready to pick up (Ctrl+E)"
 			return h, nil
 		}
-		h.attentionCycleIndex = (h.attentionCycleIndex + 1) % len(h.attentionCycleSnapshot)
-		h.moveCursorToSession(h.attentionCycleSnapshot[h.attentionCycleIndex].ID)
+		firstPress := h.attentionCycleLastSwitch.IsZero()
+		stale := !firstPress && time.Since(h.attentionCycleLastSwitch) > 3*time.Second
+		next := 0
+		if !firstPress && !stale {
+			if cur := h.getSelectedSession(); cur != nil {
+				for i, s := range ready {
+					if s.ID == cur.ID {
+						next = (i + 1) % len(ready)
+						break
+					}
+				}
+			}
+		}
+		h.attentionCycleLastSwitch = time.Now()
+		h.moveCursorToSession(ready[next].ID)
 		return h, nil
 
 	case FilterKeyArchived, "shift+6":

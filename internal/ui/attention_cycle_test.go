@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -50,6 +52,54 @@ func readyInstance(id string, status session.Status, prio int, created time.Time
 	inst.Priority = prio
 	inst.CreatedAt = created
 	return inst
+}
+
+// pressCtrlE drives the live Ctrl+E handler the way the TUI does and returns
+// the session the cursor lands on (or "" if none).
+func pressCtrlE(t *testing.T, h *Home) string {
+	t.Helper()
+	model, _ := h.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlE})
+	hh := model.(*Home)
+	if sel := hh.getSelectedSession(); sel != nil {
+		return sel.ID
+	}
+	return ""
+}
+
+// TestAttentionCycle_RecomputesWhenHigherBecomesReady pins the fix for "ctrl+e
+// doesn't cycle to P2 — should go to the next most important when the higher one
+// is busy". The ready set must be recomputed on EVERY press, not frozen on the
+// first one: a session that just went busy must drop out, and one that just
+// became ready must drop in, immediately. With the old frozen-snapshot handler
+// the third press below stayed on the stale P2 instead of reaching the freshly
+// ready P1.
+func TestAttentionCycle_RecomputesWhenHigherBecomesReady(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	p1 := readyInstance("p1", session.StatusRunning, 1, base) // busy → excluded at first
+	p2 := readyInstance("p2", session.StatusWaiting, 2, base)
+	p3 := readyInstance("p3", session.StatusIdle, 3, base)
+	items := []session.Item{
+		{Type: session.ItemTypeSession, Session: p1, Level: 0},
+		{Type: session.ItemTypeSession, Session: p2, Level: 0},
+		{Type: session.ItemTypeSession, Session: p3, Level: 0},
+	}
+	h := newTestHomeWithItems(100, 30, items)
+	h.instances = []*session.Instance{p1, p2, p3}
+
+	// P1 is running (busy): first press lands on the top-priority READY session.
+	if got := pressCtrlE(t, h); got != "p2" {
+		t.Fatalf("first Ctrl+E with P1 busy landed on %q, want p2 (next most important ready)", got)
+	}
+	// Repeat press advances to the next ready session.
+	if got := pressCtrlE(t, h); got != "p3" {
+		t.Fatalf("second Ctrl+E landed on %q, want p3", got)
+	}
+	// P1 finishes and becomes ready — now the highest priority ready session.
+	p1.Status = session.StatusWaiting
+	if got := pressCtrlE(t, h); got != "p1" {
+		t.Fatalf("third Ctrl+E after P1 became ready landed on %q, want p1 "+
+			"(ready set must be recomputed, not frozen)", got)
+	}
 }
 
 func TestAttentionSortedSessions_PriorityOrderAndReadyFilter(t *testing.T) {
