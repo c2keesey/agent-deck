@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -17375,8 +17376,7 @@ func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
 		// the stack down regardless, so run them independently.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "zsh", "-ic", "gr; make down")
-		cmd.Dir = dir
+		cmd := teardownCommand(ctx, dir)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			// Cleanup is best-effort — a missing docker stack (e.g. ro-dev) or a
 			// failed reset shouldn't strand the session. Warn but still delete.
@@ -17384,6 +17384,24 @@ func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
 		}
 		return teardownResultMsg{title: title, id: id}
 	}
+}
+
+// teardownCommand builds the `gr; make down` cleanup command for dir. It uses an
+// interactive zsh (-i) so the user's `gr` shell function (defined in ~/.zshrc,
+// only sourced for interactive shells) is in scope. Crucially it starts the
+// child in its own session (Setsid) so it has NO controlling terminal: an
+// interactive shell otherwise enables job control and tcsetpgrp()s its
+// controlling terminal to the foreground. Inheriting agent-deck's terminal, it
+// stole the foreground process group, and agent-deck's next input read raised
+// SIGTTIN and stopped the TUI — the `y` hotkey "crash". Setpgid is not enough
+// (it keeps the controlling terminal); Setsid severs it. stdout/stderr are
+// captured by the caller's CombinedOutput and stdin defaults to /dev/null, so
+// nothing reaches the real terminal.
+func teardownCommand(ctx context.Context, dir string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "zsh", "-ic", "gr; make down")
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd
 }
 
 // lastLine returns the last non-blank line of s, trimmed — used to surface the
