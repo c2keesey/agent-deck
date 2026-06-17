@@ -234,7 +234,6 @@ type Home struct {
 	editSessionDialog    *EditSessionDialog    // For editing session settings (title/color/notes/command/...)
 	skillDialog          *SkillDialog          // For managing project skills
 	ideaDialog           *IdeaDialog           // Capture a "by the way" idea from the dashboard (local fork)
-	ideaCaptureSessionID string                // session whose context the open idea dialog will attach (local fork)
 	setupWizard          *SetupWizard          // For first-run setup
 	settingsPanel        *SettingsPanel        // For editing settings
 	analyticsPanel       *AnalyticsPanel       // For displaying session analytics
@@ -8019,19 +8018,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "alt+i":
 		// Capture a "by the way" idea from the dashboard — the in-view twin of
-		// the Ctrl+Alt+I popup bound inside sessions. (Bubble Tea can't deliver
-		// ctrl+alt+i as a distinct key, so the dashboard uses Alt+I.) Snapshots
-		// the selected session (if any) as context; an idea can still be
-		// captured with no session selected (cursor on a group or empty row).
-		// (local fork)
-		h.ideaCaptureSessionID = ""
-		label := ""
-		if sel := h.getSelectedSession(); sel != nil {
-			h.ideaCaptureSessionID = sel.ID
-			label = sel.Title
-		}
+		// the Ctrl+Alt+I popup bound inside sessions. (Bubble Tea v1 can't
+		// deliver ctrl+alt+i as a distinct key, so the dashboard uses Alt+I.)
+		// Dashboard capture is contextless: it records just the idea text, not
+		// whichever session the cursor happens to be on. (local fork)
 		h.ideaDialog.SetSize(h.width, h.height)
-		h.ideaDialog.Show(label)
+		h.ideaDialog.Show()
 		return h, nil
 
 	case "I":
@@ -9537,30 +9529,11 @@ func (h *Home) handleIdeaDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return h, cmd
 }
 
-// buildIdeaEntry snapshots the captured session's context into an idea entry.
-// A blank ideaCaptureSessionID (no session selected) yields a bare entry with
-// no session context. Pure (modulo the LastClaudeChatAnchor read) so it can be
-// unit-tested without touching the backlog. (local fork)
+// buildIdeaEntry builds a contextless idea entry — just the text and capture
+// time. Dashboard capture deliberately omits session context (unlike the
+// in-session Ctrl+Alt+I popup, which snapshots its own session). (local fork)
 func (h *Home) buildIdeaEntry(text string, now time.Time) ideas.IdeaEntry {
-	entry := ideas.IdeaEntry{Text: text, At: now}
-	inst := h.getInstanceByID(h.ideaCaptureSessionID)
-	if inst == nil {
-		return entry
-	}
-	if ts := inst.GetTmuxSession(); ts != nil && ts.Name != "" {
-		entry.Session = ts.Name
-	} else {
-		entry.Session = inst.Title
-	}
-	entry.Project = inst.ProjectPath
-	entry.Tool = inst.Tool
-	entry.ClaudeSessionID = inst.ClaudeSessionID
-	if inst.ClaudeSessionID != "" {
-		if anchor, _ := session.LastClaudeChatAnchor(inst.ClaudeSessionID, inst.ProjectPath); anchor != "" {
-			entry.LastMessageLine = anchor
-		}
-	}
-	return entry
+	return ideas.IdeaEntry{Text: text, At: now}
 }
 
 // appendDashboardIdea appends the captured idea to the global backlog

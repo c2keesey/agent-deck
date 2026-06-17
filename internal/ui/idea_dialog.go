@@ -16,14 +16,13 @@ var appendIdeaFunc = ideas.AppendIdea
 
 // IdeaDialog is a minimal one-line prompt for capturing a "by the way" idea
 // straight from the dashboard — the in-view twin of the Ctrl+Alt+I popup that
-// fires from inside a session. It holds only the text input plus a label for
-// the session the idea is being attached to; the Home model owns persistence
-// (ideas.AppendIdea) and context snapshotting, so this stays a dumb view.
-// (local fork)
+// fires from inside a session. Dashboard capture is intentionally CONTEXTLESS:
+// it records just the idea text, not whichever session the cursor is on (an
+// idea jotted at the dashboard is usually a general thought, not about the
+// hovered row). The Home model owns persistence (ideas.AppendIdea). (local fork)
 type IdeaDialog struct {
 	visible       bool
 	input         textinput.Model
-	sessionLabel  string // context shown in the hint ("" when no session selected)
 	width, height int
 }
 
@@ -36,10 +35,8 @@ func NewIdeaDialog() *IdeaDialog {
 	return &IdeaDialog{input: ti}
 }
 
-// Show opens the dialog for the given session label (may be empty), clearing any
-// previous text and focusing the input.
-func (d *IdeaDialog) Show(sessionLabel string) {
-	d.sessionLabel = sessionLabel
+// Show opens the dialog, clearing any previous text and focusing the input.
+func (d *IdeaDialog) Show() {
 	d.input.SetValue("")
 	d.input.CursorEnd()
 	d.input.Focus()
@@ -88,16 +85,11 @@ func (d *IdeaDialog) View() string {
 	titleStyle := DialogTitleStyle.Width(titleWidth)
 	hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
 
-	context := ""
-	if d.sessionLabel != "" {
-		context = lipgloss.NewStyle().Foreground(ColorCyan).Render("from: "+d.sessionLabel) + "\n\n"
-	}
-
 	dialogContent := lipgloss.JoinVertical(
 		lipgloss.Center,
 		titleStyle.Render("Capture Idea"),
 		"",
-		context+d.input.View(),
+		d.input.View(),
 		"",
 		hintStyle.Render("Enter save │ Esc cancel"),
 	)

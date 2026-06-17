@@ -10,9 +10,10 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
-// TestIdeaDialog_HotkeyOpensWithSelectedContext verifies Alt+I opens the
-// capture dialog from the dashboard and snapshots the selected session.
-func TestIdeaDialog_HotkeyOpensWithSelectedContext(t *testing.T) {
+// TestIdeaDialog_HotkeyOpens verifies Alt+I opens the capture dialog from the
+// dashboard. Dashboard capture is intentionally CONTEXTLESS — it does not
+// snapshot whichever session the cursor happens to be on.
+func TestIdeaDialog_HotkeyOpens(t *testing.T) {
 	inst := &session.Instance{ID: "s1", Title: "worker-2", ProjectPath: "/tmp/p", Tool: "claude"}
 	items := []session.Item{{Type: session.ItemTypeSession, Session: inst, Level: 0}}
 	h := newTestHomeWithItems(100, 30, items)
@@ -26,28 +27,25 @@ func TestIdeaDialog_HotkeyOpensWithSelectedContext(t *testing.T) {
 	model, _ := h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}, Alt: true})
 	h2 := model.(*Home)
 	if !h2.ideaDialog.IsVisible() {
-		t.Fatalf("Ctrl+Alt+I should open the idea dialog")
-	}
-	if h2.ideaCaptureSessionID != "s1" {
-		t.Errorf("idea capture should snapshot the selected session, got %q", h2.ideaCaptureSessionID)
+		t.Fatalf("Alt+I should open the idea dialog")
 	}
 }
 
-// TestIdeaDialog_EnterSavesEntryWithContext drives the full flow and asserts the
-// idea is persisted with the selected session's context. appendIdeaFunc is
-// stubbed so the real backlog file is never touched.
-func TestIdeaDialog_EnterSavesEntryWithContext(t *testing.T) {
+// TestIdeaDialog_EnterSavesContextlessEntry drives the full flow and asserts the
+// idea is persisted as TEXT ONLY — no session/project/tool — even though a
+// session is selected. appendIdeaFunc is stubbed so the backlog is never touched.
+func TestIdeaDialog_EnterSavesContextlessEntry(t *testing.T) {
 	var saved *ideas.IdeaEntry
 	orig := appendIdeaFunc
 	appendIdeaFunc = func(e ideas.IdeaEntry) error { saved = &e; return nil }
 	t.Cleanup(func() { appendIdeaFunc = orig })
 
+	// A session is selected, but the dashboard capture must ignore it.
 	inst := &session.Instance{ID: "s1", Title: "worker-2", ProjectPath: "/tmp/p", Tool: "codex"}
 	h := &Home{instanceByID: map[string]*session.Instance{"s1": inst}}
 	h.instances = []*session.Instance{inst}
-	h.ideaCaptureSessionID = "s1"
 	h.ideaDialog = NewIdeaDialog()
-	h.ideaDialog.Show("worker-2")
+	h.ideaDialog.Show()
 
 	// Type the idea, then Enter.
 	for _, r := range "fix the flaky test" {
@@ -64,8 +62,8 @@ func TestIdeaDialog_EnterSavesEntryWithContext(t *testing.T) {
 	if saved.Text != "fix the flaky test" {
 		t.Errorf("saved idea text = %q", saved.Text)
 	}
-	if saved.Project != "/tmp/p" || saved.Tool != "codex" || saved.Session != "worker-2" {
-		t.Errorf("saved idea context = %+v, want project/tool/session from selected instance", *saved)
+	if saved.Session != "" || saved.Project != "" || saved.Tool != "" || saved.ClaudeSessionID != "" {
+		t.Errorf("dashboard idea must be contextless, got %+v", *saved)
 	}
 }
 
@@ -78,7 +76,7 @@ func TestIdeaDialog_EscCancelsWithoutSaving(t *testing.T) {
 
 	h := &Home{}
 	h.ideaDialog = NewIdeaDialog()
-	h.ideaDialog.Show("")
+	h.ideaDialog.Show()
 	h.ideaDialog, _ = h.ideaDialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
 	h.handleIdeaDialogKey(tea.KeyMsg{Type: tea.KeyEsc})
 
@@ -90,13 +88,12 @@ func TestIdeaDialog_EscCancelsWithoutSaving(t *testing.T) {
 	}
 }
 
-// TestIdeaDialog_BuildEntryNoSession records a bare idea when nothing is selected.
-func TestIdeaDialog_BuildEntryNoSession(t *testing.T) {
-	h := &Home{instanceByID: map[string]*session.Instance{}}
-	h.ideaCaptureSessionID = ""
+// TestIdeaDialog_BuildEntryIsBare records a bare idea (text + timestamp only).
+func TestIdeaDialog_BuildEntryIsBare(t *testing.T) {
+	h := &Home{}
 	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 	entry := h.buildIdeaEntry("a stray thought", now)
-	if entry.Text != "a stray thought" || entry.Session != "" || entry.Project != "" {
-		t.Errorf("bare idea entry = %+v, want text only", entry)
+	if entry.Text != "a stray thought" || entry.At != now || entry.Session != "" || entry.Project != "" {
+		t.Errorf("bare idea entry = %+v, want text + timestamp only", entry)
 	}
 }
